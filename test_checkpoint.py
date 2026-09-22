@@ -177,14 +177,15 @@ def test_model_1_dataset(
     step = max(1, total_chunks // num_eval)
     sample_indices = [i * step for i in range(num_eval)]
 
-    print("\n" + "=" * 76)
+    print("\n" + "=" * 84)
     print(f" 📊 TESTING MODEL 1 ON {num_eval} DATASET SAMPLES")
-    print("=" * 76)
-    print(f"{'CHUNK':<6} | {'TRUE BPM':<10} | {'PRED BPM':<10} | {'BPM ERR':<8} | {'TRUE OFF':<10} | {'PRED OFF':<10}")
-    print("-" * 76)
+    print("=" * 84)
+    print(f"{'CHUNK':<6} | {'TRUE BPM':<9} | {'PRED BPM':<9} | {'BPM ERR':<8} | {'TRUE OFF':<9} | {'PRED OFF':<9} | {'PHASE ERR':<9}")
+    print("-" * 84)
 
     total_bpm_err = 0.0
     total_off_err = 0.0
+    total_phase_err = 0.0
 
     for idx in sample_indices:
         item = dataset[idx]
@@ -199,15 +200,23 @@ def test_model_1_dataset(
 
         bpm_err = abs(pred_bpm - true_bpm)
         off_err = abs(pred_off - true_off)
+
+        # Downbeat phase error modulo beat duration
+        beat_len = 60000.0 / (true_bpm + 1e-5)
+        phase_diff = abs(pred_off - true_off) % beat_len
+        phase_err = min(phase_diff, beat_len - phase_diff)
+
         total_bpm_err += bpm_err
         total_off_err += off_err
+        total_phase_err += phase_err
 
-        print(f"#{idx:<5} | {true_bpm:<10.1f} | {pred_bpm:<10.1f} | {bpm_err:<8.2f} | {true_off:<10.0f} | {pred_off:<10.0f}")
+        print(f"#{idx:<5} | {true_bpm:<9.1f} | {pred_bpm:<9.1f} | {bpm_err:<8.2f} | {true_off:<9.0f} | {pred_off:<9.0f} | {phase_err:<9.1f}ms")
 
-    print("-" * 76)
-    print(f"Average BPM Absolute Error (MAE):   {total_bpm_err / num_eval:.2f} BPM")
-    print(f"Average Offset Absolute Error (MAE): {total_off_err / num_eval:.1f} ms")
-    print("=" * 76 + "\n")
+    print("-" * 84)
+    print(f"Average BPM Absolute Error (MAE):     {total_bpm_err / num_eval:.2f} BPM")
+    print(f"Average Downbeat Phase Error (MAE):   {total_phase_err / num_eval:.1f} ms (True musical alignment)")
+    print(f"Raw Scalar Offset Error (MAE):        {total_off_err / num_eval:.1f} ms (Whole-beat integer offsets)")
+    print("=" * 84 + "\n")
 
 
 # ==============================================================================

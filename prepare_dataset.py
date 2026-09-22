@@ -91,6 +91,7 @@ def process_archives(
 
     print(f"[Preprocessor] Found {len(osz_files)} .osz archives in '{in_path}'.")
     chunks_list: List[Dict[str, torch.Tensor]] = []
+    song_sync_list: List[Dict[str, Any]] = []
     metadata_records: List[Dict[str, Any]] = []
 
     total_diffs = 0
@@ -196,15 +197,29 @@ def process_archives(
                         "chunks_extracted": chunk_count,
                     })
 
+                # Record first 1024 frames of the song for Model 1 (Sync BPM / Offset)
+                if matched_diffs > 0 and len(osu_entries) > 0 and 'details' in locals() and details is not None:
+                    song_sync_list.append({
+                        "audio_mel": mel[:1024].clone(),
+                        "bpm": torch.tensor([details.bpm], dtype=torch.float32),
+                        "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                        "archive": osz.name,
+                    })
+
         except Exception as err:
             print(f"  [Error] Failed processing archive '{osz.name}': {err}")
 
     # Stack or save dataset
     dataset_file = out_path / "train_data.pt"
+    song_sync_file = out_path / "song_sync_data.pt"
     meta_file = out_path / "metadata.json"
 
     print(f"\n[Packaging] Saving {len(chunks_list)} training chunks to '{dataset_file}'...")
     torch.save(chunks_list, dataset_file)
+
+    if song_sync_list:
+        print(f"[Packaging] Saving {len(song_sync_list)} song-level sync profiles to '{song_sync_file}'...")
+        torch.save(song_sync_list, song_sync_file)
 
     summary = {
         "total_archives": len(osz_files),

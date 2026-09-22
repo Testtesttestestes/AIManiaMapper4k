@@ -221,78 +221,156 @@ def train_model_1_sync(
     epochs: int,
     lr: float,
     checkpoint_dir: Path,
+    is_song_level: bool = False,
+    augment: bool = True,
 ) -> Dict[str, Any]:
-    """Trains Model 1: SyncBPMOffsetModel (Audio tempo and beat synchronization)."""
+    """
+    Trains Model 1: SyncBPMOffsetModel (Audio tempo and beat synchronization).
+    Features high-efficiency small-dataset training:
+    - Pitch-invariant Speed/Tempo perturbation (alpha in [0.75, 1.35])
+    - SpecAugment frequency band masking
+    - Soft-Argmax Gaussian smoothed CrossEntropy over 301 BPM bins + Smooth L1
+    - Cyclic Phase loss for downbeat offset (modulo beat length)
+    """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 1: SyncBPMOffsetModel (BPM & Offset Sync)")
+    print(f"  Mode: {'Song-Level (First 16s audio)' if is_song_level else 'Musical Chunks'}")
+    print(f"  Augmentation: {'Speed Perturbation [0.75..1.35x] + SpecAugment' if augment else 'Disabled'}")
     print("=" * 60)
 
     model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     best_val_loss = float("inf")
+    best_val_mae = float("inf")
     history = []
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss, total_bpm_err = 0.0, 0.0
+        total_loss, total_bpm_err, total_phase_err = 0.0, 0.0, 0.0
         start_t = time.time()
 
         for batch in train_loader:
             audio_mel = batch["audio_mel"].to(device)
-            target_bpm = batch["bpm"].to(device)
-            target_offset = batch["offset_ms"].to(device)
+            target_bpm = batch["bpm"].to(device).squeeze(-1)
+            target_offset = batch["offset_ms"].to(device).squeeze(-1)
+
+            if augment:
+                # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.75, 1.35]
+                alpha = float(torch.empty(1).uniform_(0.75, 1.35).item())
+                # Resample along time axis: [B, T, 80] -> [B, 80, T]
+                mel_t = audio_mel.transpose(1, 2)
+                orig_T = mel_t.shape[-1]
+                new_T = max(32, int(round(orig_T * alpha)))
+                mel_aug = F.interpolate(mel_t, size=new_T, mode="linear", align_corners=False).transpose(1, 2)
+                if new_T >= orig_T:
+                    audio_mel = mel_aug[:, :orig_T, :]
+                else:
+                    pad = torch.zeros(audio_mel.shape[0], orig_T - new_T, audio_mel.shape[2], device=device)
+                    audio_mel = torch.cat([mel_aug, pad], dim=1)
+
+                target_bpm = target_bpm * alpha
+                target_offset = target_offset / alpha
+
+                # 2. SpecAugment frequency masking
+                if torch.rand(1).item() > 0.35 and audio_mel.shape[-1] > 16:
+                    f_start = int(torch.randint(0, audio_mel.shape[-1] - 8, (1,)).item())
+                    audio_mel[:, :, f_start:f_start + 8] = 0.0
 
             optimizer.zero_grad()
-            pred_bpm, pred_offset = model(audio_mel)
+            pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
+            pred_bpm = pred_bpm.squeeze(-1)
+            pred_offset = pred_offset.squeeze(-1)
 
-            loss_bpm = F.mse_loss(pred_bpm, target_bpm)
-            loss_offset = F.mse_loss(pred_offset, target_offset)
-            loss = loss_bpm + 0.001 * loss_offset
+            # 3. Soft Gaussian smoothed Cross-Entropy loss over 301 BPM bins
+            bins = model.bpm_bins.unsqueeze(0)  # [1, 301]
+            sigma = 1.0
+            target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
+            target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
+            loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
 
+            # 4. Smooth L1 regression loss on continuous BPM
+            loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
+
+            # 5. Beat-Periodic Phase offset loss (modulo beat length)
+            beat_len_true = 60000.0 / (target_bpm + 1e-5)
+            phase_diff = (pred_offset - target_offset).abs() % beat_len_true
+            phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
+            loss_phase = (phase_dist / beat_len_true).mean()
+            loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
+
+            loss = loss_ce + 0.5 * loss_reg + 1.0 * loss_offset
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
 
             B = audio_mel.shape[0]
             total_loss += loss.item() * B
             total_bpm_err += torch.abs(pred_bpm - target_bpm).sum().item()
+            total_phase_err += phase_dist.sum().item()
 
+        scheduler.step()
         elapsed = time.time() - start_t
         train_loss = total_loss / len(train_loader.dataset)
         bpm_mae = total_bpm_err / len(train_loader.dataset)
+        phase_mae = total_phase_err / len(train_loader.dataset)
 
-        # Validation
+        # Validation (Evaluated on clean real data without speed perturbation)
         model.eval()
-        val_loss, val_bpm_err = 0.0, 0.0
+        val_loss, val_bpm_err, val_phase_err = 0.0, 0.0, 0.0
         with torch.no_grad():
             for batch in val_loader:
                 audio_mel = batch["audio_mel"].to(device)
-                target_bpm = batch["bpm"].to(device)
-                target_offset = batch["offset_ms"].to(device)
-                pred_bpm, pred_offset = model(audio_mel)
-                loss_bpm = F.mse_loss(pred_bpm, target_bpm)
-                loss_offset = F.mse_loss(pred_offset, target_offset)
+                target_bpm = batch["bpm"].to(device).squeeze(-1)
+                target_offset = batch["offset_ms"].to(device).squeeze(-1)
+                pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
+                pred_bpm = pred_bpm.squeeze(-1)
+                pred_offset = pred_offset.squeeze(-1)
+
+                bins = model.bpm_bins.unsqueeze(0)
+                sigma = 1.0
+                target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
+                target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
+                loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
+                loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
+
+                beat_len_true = 60000.0 / (target_bpm + 1e-5)
+                phase_diff = (pred_offset - target_offset).abs() % beat_len_true
+                phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
+                loss_phase = (phase_dist / beat_len_true).mean()
+                loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
+
                 B = audio_mel.shape[0]
-                val_loss += (loss_bpm + 0.001 * loss_offset).item() * B
+                val_loss += (loss_ce + 0.5 * loss_reg + 1.0 * loss_offset).item() * B
                 val_bpm_err += torch.abs(pred_bpm - target_bpm).sum().item()
+                val_phase_err += phase_dist.sum().item()
 
         val_loss /= len(val_loader.dataset)
         val_mae = val_bpm_err / len(val_loader.dataset)
+        val_phase_mae = val_phase_err / len(val_loader.dataset)
 
         print(
             f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s] "
-            f"Train Loss: {train_loss:.2f} (BPM MAE: {bpm_mae:.1f}) | "
-            f"Val Loss: {val_loss:.2f} (BPM MAE: {val_mae:.1f})"
+            f"Train Loss: {train_loss:.2f} (BPM MAE: {bpm_mae:.2f}, Phase: {phase_mae:.1f}ms) | "
+            f"Val Loss: {val_loss:.2f} (BPM MAE: {val_mae:.2f}, Phase: {val_phase_mae:.1f}ms)"
         )
 
-        history.append({"epoch": epoch, "val_loss": val_loss, "val_bpm_mae": val_mae})
-        if val_loss < best_val_loss:
+        history.append({"epoch": epoch, "val_loss": val_loss, "val_bpm_mae": val_mae, "val_phase_mae": val_phase_mae})
+        if val_mae < best_val_mae or val_loss < best_val_loss:
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
             best_val_loss = val_loss
             ckpt_path = checkpoint_dir / "model_1_sync_best.pt"
-            torch.save({"epoch": epoch, "model_state": model.state_dict()}, ckpt_path)
-            print(f"  ⭐ Saved best checkpoint to '{ckpt_path}'")
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "val_bpm_mae": val_mae,
+                "val_phase_mae": val_phase_mae,
+            }, ckpt_path)
+            print(f"  ⭐ Saved best checkpoint to '{ckpt_path}' (BPM MAE: {val_mae:.2f}, Phase MAE: {val_phase_mae:.1f}ms)")
 
-    return {"model": "model_1_sync", "best_val_loss": best_val_loss, "history": history}
+    return {"model": "model_1_sync", "best_val_loss": best_val_loss, "best_val_mae": best_val_mae, "history": history}
 
 
 def train_model_2_dynamics(
@@ -479,7 +557,21 @@ def main():
 
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
-        train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
+        song_sync_file = Path(args.dataset).parent / "song_sync_data.pt"
+        if song_sync_file.exists():
+            print(f"\n[Model 1] Dedicated song-level sync dataset detected: '{song_sync_file}'")
+            sync_full = ManiaDataset(song_sync_file)
+            s_val = max(1, int(len(sync_full) * args.val_split))
+            s_train = len(sync_full) - s_val
+            s_train_set, s_val_set = random_split(
+                sync_full, [s_train, s_val], generator=torch.Generator().manual_seed(42)
+            )
+            s_batch = max(1, min(args.batch_size, 8))
+            s_train_loader = DataLoader(s_train_set, batch_size=s_batch, shuffle=True)
+            s_val_loader = DataLoader(s_val_set, batch_size=s_batch, shuffle=False)
+            train_model_1_sync(s_train_loader, s_val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=True)
+        else:
+            train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=False)
     if target in ("2", "dynamics", "all"):
         train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
     if target in ("3", "transformer", "pattern", "all"):
