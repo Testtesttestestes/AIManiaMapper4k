@@ -961,6 +961,67 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Training Data Source Strategy Selector & Diagram */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-pink-400" />
+                      Model 2 & 3 Training Data Source Strategy
+                    </h4>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Configure whether Models 2 (Dynamics) and 3 (Transformer) train on pristine .osu map ground truth or Model 1 predictions.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5 p-1 bg-slate-900 rounded-lg border border-slate-800 text-xs shrink-0">
+                    <span className="px-2.5 py-1 bg-pink-500/20 text-pink-300 font-semibold rounded-md border border-pink-500/30">
+                      🎯 Ground Truth (.osu)
+                    </span>
+                    <span className="px-2.5 py-1 text-slate-400">
+                      ⚡ Cascaded (Model 1)
+                    </span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                  <div className="p-3.5 rounded-lg bg-slate-900/80 border border-pink-500/30 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-pink-300">Option 1: Original Beatmap Data (Ground Truth)</span>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">DEFAULT / RECOMMENDED</span>
+                    </div>
+                    <p className="text-[11px] text-slate-300">
+                      BPM, Offset, Slider Velocity (green lines), and HitObjects are extracted <strong>directly from the original .osu file</strong>.
+                    </p>
+                    <ul className="text-[11px] text-slate-400 space-y-1 list-disc list-inside">
+                      <li>Zero error propagation from Model 1</li>
+                      <li>Teacher Forcing ensures high-fidelity rhythmic learning</li>
+                      <li>Exact alignment with musical downbeats and measures</li>
+                    </ul>
+                    <div className="p-2 rounded bg-slate-950 font-mono text-[11px] text-pink-300 border border-slate-800 mt-2">
+                      python train.py --model 3 --timing_source map
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 rounded-lg bg-slate-900/80 border border-slate-800 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-200">Option 2: Cascaded AI Sync (Model 1 Predictions)</span>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">EXPERIMENTAL</span>
+                    </div>
+                    <p className="text-[11px] text-slate-300">
+                      Model 1 (<code className="text-indigo-400">SyncBPMOffsetModel</code>) infers BPM & Offset from the audio spectrogram before slicing.
+                    </p>
+                    <ul className="text-[11px] text-slate-400 space-y-1 list-disc list-inside">
+                      <li>Tests model robustness under minor timing offsets</li>
+                      <li>Simulates end-to-end full inference pipeline conditions</li>
+                      <li>Requires a trained Model 1 checkpoint</li>
+                    </ul>
+                    <div className="p-2 rounded bg-slate-950 font-mono text-[11px] text-indigo-300 border border-slate-800 mt-2">
+                      python train.py --model 3 --timing_source model1
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               {/* Source Code Snippet */}
               <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 font-mono text-xs text-slate-300 overflow-x-auto">
                 <span className="text-slate-500">// osu_mapper/models/transformer.py</span>

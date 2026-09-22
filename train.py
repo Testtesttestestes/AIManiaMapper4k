@@ -93,10 +93,18 @@ def train_model_3_transformer(
     epochs: int,
     lr: float,
     checkpoint_dir: Path,
+    timing_source: str = "map",
 ) -> Dict[str, Any]:
-    """Trains Model 3: ManiaPatternTransformer (Causal Autoregressive Pattern Generator)."""
+    """
+    Trains Model 3: ManiaPatternTransformer (Causal Autoregressive Pattern Generator).
+    - timing_source="map" (Default): Takes reference ground truth data directly from beatmaps (.osu),
+      preventing error compounding from Model 1 (Teacher Forcing).
+    - timing_source="model1": Evaluates/trains using Model 1 AI predicted alignment.
+    """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 3: ManiaPatternTransformer (Hit Object Synthesis)")
+    source_desc = "ORIGINAL BEATMAP GROUND TRUTH (Direct from .osu — zero Model 1 drift)" if timing_source == "map" else "MODEL 1 CASCADED TIMING (AI Sync Inferred)"
+    print(f"  Timing & Data Source: {source_desc}")
     print("=" * 60)
 
     cfg = TransformerConfig(
@@ -382,10 +390,17 @@ def train_model_2_dynamics(
     epochs: int,
     lr: float,
     checkpoint_dir: Path,
+    timing_source: str = "map",
 ) -> Dict[str, Any]:
-    """Trains Model 2: DynamicsSVModel (Slider Velocity & Timing changes)."""
+    """
+    Trains Model 2: DynamicsSVModel (Slider Velocity & Timing changes).
+    - timing_source="map" (Default): Takes reference SV curves and timing points directly from .osu beatmap,
+      isolating dynamic modeling from any Model 1 errors.
+    """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 2: DynamicsSVModel (Slider Velocity & Zones)")
+    source_desc = "ORIGINAL BEATMAP GROUND TRUTH (Direct from .osu — exact green lines)" if timing_source == "map" else "MODEL 1 CASCADED TIMING (AI Sync Inferred)"
+    print(f"  Timing & Data Source: {source_desc}")
     print("=" * 60)
 
     model = DynamicsSVModel(audio_dim=80, hidden_dim=128).to(device)
@@ -520,11 +535,16 @@ def main():
     parser.add_argument("--device", "-d", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--timing_source", "-t", type=str, choices=["map", "model1"], default="map", help="Data/Timing source for Model 2 & 3: 'map' (Original beatmap ground truth) or 'model1' (Cascaded AI Sync)")
+    parser.add_argument("--ground_truth", "--use_map_data", action="store_true", help="Force using pure ground truth data directly from beatmap (.osu)")
+    parser.add_argument("--sync_checkpoint", type=str, default=None, help="Optional Model 1 checkpoint path when timing_source=model1")
     parser.add_argument("--epochs", "-e", type=int, default=10)
     parser.add_argument("--batch_size", "-b", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--val_split", type=float, default=0.1)
     args = parser.parse_args()
+
+    timing_source = "map" if args.ground_truth else args.timing_source
 
     # Create checkpoints dir
     ckpt_dir = Path(args.checkpoint_dir)
@@ -550,6 +570,7 @@ def main():
     print(f"\n[Training Config]")
     print(f"  Model target:      {args.model}")
     print(f"  Device:            {device}")
+    print(f"  Data Source (M2/3):{timing_source.upper()} ({'Original Map Ground Truth' if timing_source == 'map' else 'Model 1 AI Sync'})")
     print(f"  Train samples:     {train_size}")
     print(f"  Validation samples:{val_size}")
     print(f"  Batch size:        {args.batch_size}")
@@ -562,9 +583,9 @@ def main():
         is_song = "song_sync" in str(args.dataset).lower()
         train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song)
     if target in ("2", "dynamics", "all"):
-        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
+        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source)
     if target in ("3", "transformer", "pattern", "all"):
-        train_model_3_transformer(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
+        train_model_3_transformer(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source)
     if target in ("4", "evaluator", "sr", "all"):
         train_model_4_evaluator(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
 

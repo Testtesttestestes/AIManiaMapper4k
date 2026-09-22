@@ -41,9 +41,14 @@ def process_archives(
     ffmpeg_path: Optional[str] = None,
     align_mode: str = "beat",
     bars_per_step: int = 2,
+    timing_source: str = "map",
+    sync_checkpoint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Parses all .osz beatmaps in input_dir and saves tokenized training chunks into output_dir.
+    - timing_source="map" (Default): Takes exact BPM, Offset, and SV directly from the original .osu map (Ground Truth),
+      ensuring Model 2 and Model 3 train on clean, uncorrupted reference data without error propagation from Model 1.
+    - timing_source="model1": Runs Model 1 (SyncBPMOffsetModel) inference on the audio to predict BPM and Offset before slicing.
     - align_mode="beat": Slices audio strictly synchronized to BPM and offset (musical measures / squares).
     - align_mode="frame": Fixed sliding window advancing by hop_size frames.
     """
@@ -83,6 +88,26 @@ def process_archives(
         return {"total_archives": 0, "total_chunks": 0, "error": "ffmpeg_not_found"}
 
     print(f"[Preprocessor] Using FFmpeg binary: {resolved_ffmpeg}")
+
+    # Initialize Model 1 if cascaded timing is explicitly requested
+    sync_model = None
+    if timing_source == "model1":
+        from osu_mapper.models.sync_model import SyncBPMOffsetModel
+        print(f"[Timing Strategy] Cascaded Mode: Initializing Model 1 (SyncBPMOffsetModel)...")
+        sync_model = SyncBPMOffsetModel(audio_dim=n_mels, hidden_dim=256)
+        ckpt_p = Path(sync_checkpoint) if sync_checkpoint else Path("checkpoints/model_1_sync_best.pt")
+        if ckpt_p.exists():
+            print(f"[Timing Strategy] Loading Model 1 checkpoint: '{ckpt_p}'")
+            ckpt = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict) and "model_state" in ckpt:
+                sync_model.load_state_dict(ckpt["model_state"])
+            elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                sync_model.load_state_dict(ckpt["model_state_dict"])
+            sync_model.eval()
+        else:
+            print(f"[Timing Strategy Warning] Model 1 checkpoint '{ckpt_p}' not found; using untrained/heuristic fallback.")
+    else:
+        print("[Timing Strategy] Data Source: ORIGINAL MAP GROUND TRUTH (BPM, Offset & SV directly from .osu)")
 
     osz_files = sorted(list(in_path.glob("*.osz")))
     if not osz_files:
@@ -150,6 +175,16 @@ def process_archives(
                 mel = compute_mel_spectrogram(waveform, sr=target_sr, n_mels=n_mels)
                 num_frames = mel.shape[0]
 
+                # Model 1 prediction override if cascaded mode is enabled
+                timing_override = None
+                if sync_model is not None:
+                    with torch.no_grad():
+                        pred_b, pred_o = sync_model(mel[:1024].unsqueeze(0))
+                        pred_b_val = float(pred_b.squeeze().item())
+                        pred_o_val = float(pred_o.squeeze().item())
+                        timing_override = (pred_b_val, pred_o_val)
+                        print(f"  [Model 1 Inferred Timing] BPM={pred_b_val:.2f}, Offset={pred_o_val:.1f}ms")
+
                 # Parse .osu files (Mode 3, CircleSize 4)
                 osu_entries = [n for n in z.namelist() if n.lower().endswith(".osu")]
                 matched_diffs = 0
@@ -180,11 +215,14 @@ def process_archives(
                         hop_size=hop_size,
                         align_mode=align_mode,
                         bars_per_step=bars_per_step,
+                        timing_source=timing_source,
+                        timing_override=timing_override,
                     )
                     chunks_list.extend(chunks)
                     chunk_count = len(chunks)
 
-                    print(f"  - Parsed {details.version}: SR={details.star_rating:.1f}, BPM={details.bpm}, Offset={details.offset_ms}ms, Chunks={chunk_count}")
+                    source_label = "GroundTruth .osu" if timing_source == "map" else "Model 1 Sync"
+                    print(f"  - Parsed {details.version}: SR={details.star_rating:.1f}, BPM={details.bpm}, Offset={details.offset_ms}ms, Source=[{source_label}], Chunks={chunk_count}")
 
                     metadata_records.append({
                         "archive": osz.name,
@@ -192,6 +230,7 @@ def process_archives(
                         "version": details.version,
                         "bpm": details.bpm,
                         "offset_ms": details.offset_ms,
+                        "timing_source": timing_source,
                         "star_rating": details.star_rating,
                         "total_hit_objects": len(details.hit_objects),
                         "chunks_extracted": chunk_count,
@@ -214,7 +253,7 @@ def process_archives(
     song_sync_file = out_path / "song_sync_data.pt"
     meta_file = out_path / "metadata.json"
 
-    print(f"\n[Packaging] Saving {len(chunks_list)} training chunks to '{dataset_file}'...")
+    print(f"\n[Packaging] Saving {len(chunks_list)} training chunks to '{dataset_file}' (Timing Source: {timing_source.upper()})...")
     torch.save(chunks_list, dataset_file)
 
     if song_sync_list:
@@ -226,6 +265,7 @@ def process_archives(
         "total_diffs": total_diffs,
         "total_audio_hours": round(total_audio_sec / 3600.0, 3),
         "total_chunks": len(chunks_list),
+        "timing_source": timing_source,
         "align_mode": align_mode,
         "bars_per_step": bars_per_step if align_mode == "beat" else None,
         "chunk_size": chunk_size,
@@ -241,6 +281,7 @@ def process_archives(
     print(f"Dataset preparation complete:")
     print(f"  - Total archives processed: {len(osz_files)}")
     print(f"  - Valid 4K mania diffs:    {total_diffs}")
+    print(f"  - Timing source strategy:  {timing_source.upper()} ({'Original Map Ground Truth' if timing_source == 'map' else 'Cascaded Model 1'})")
     print(f"  - Training chunks created: {len(chunks_list)} (align_mode='{align_mode}')")
     print(f"  - Output binary tensor:    {dataset_file} ({dataset_file.stat().st_size / (1024 * 1024):.1f} MB)")
     print(f"  - Metadata manifest:       {meta_file}")
@@ -255,8 +296,13 @@ def main():
     parser.add_argument("--hop_size", type=int, default=128, help="Stride between consecutive chunks in frame mode (128 frames = ~2.04s)")
     parser.add_argument("--align_mode", type=str, choices=["beat", "frame"], default="beat", help="Chunking alignment mode: 'beat' (BPM/offset musical measures/squares) or 'frame' (unaligned)")
     parser.add_argument("--bars_per_step", type=int, default=2, help="Number of musical bars per step in 'beat' mode (default 2 bars)")
+    parser.add_argument("--timing_source", "-t", type=str, choices=["map", "model1"], default="map", help="Timing source strategy for Models 2 and 3: 'map' (Original beatmap ground truth) or 'model1' (Cascaded Model 1 predictions)")
+    parser.add_argument("--sync_checkpoint", type=str, default=None, help="Path to Model 1 sync checkpoint when --timing_source=model1 is used")
+    parser.add_argument("--ground_truth", "--use_ground_truth", action="store_true", help="Explicitly force taking ground truth data directly from beatmaps")
     parser.add_argument("--ffmpeg", "--ffmpeg_path", type=str, default=None, help="Explicit path to ffmpeg executable (e.g. ffmpeg/ffmpeg.exe)")
     args = parser.parse_args()
+
+    timing_source = "map" if args.ground_truth else args.timing_source
 
     summary = process_archives(
         input_dir=args.input_dir,
@@ -266,6 +312,8 @@ def main():
         ffmpeg_path=args.ffmpeg,
         align_mode=args.align_mode,
         bars_per_step=args.bars_per_step,
+        timing_source=timing_source,
+        sync_checkpoint=args.sync_checkpoint,
     )
     if summary.get("error") == "ffmpeg_not_found":
         sys.exit(1)

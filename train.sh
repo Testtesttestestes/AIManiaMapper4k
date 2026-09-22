@@ -31,6 +31,7 @@ DEVICE="${2:-auto}"
 EPOCHS="${3:-15}"
 BATCH_SIZE="${4:-16}"
 LR="${5:-0.0002}"
+TIMING_SOURCE="${6:-map}"
 DATASET="dataset_processed/train_data.pt"
 
 if [ ! -f "$DATASET" ]; then
@@ -45,6 +46,7 @@ echo "======================================================================"
 echo " Python Binary:   $PYTHON_BIN"
 echo " Target Model:    $MODEL (1=Sync, 2=Dynamics, 3=Transformer, 4=Evaluator, all)"
 echo " Target Device:   $DEVICE (cpu / cuda / mps / auto)"
+echo " Data Source:     $TIMING_SOURCE (map = Ground Truth .osu, model1 = Cascaded Sync)"
 echo " Epochs:          $EPOCHS"
 echo " Batch Size:      $BATCH_SIZE"
 echo " Learning Rate:   $LR"
@@ -56,6 +58,7 @@ echo "======================================================================"
     --device "$DEVICE" \
     --dataset "$DATASET" \
     --checkpoint_dir "checkpoints" \
+    --timing_source "$TIMING_SOURCE" \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --lr "$LR"
