@@ -108,21 +108,11 @@ def extract_template_osz(osz_path: str | Path, work_dir: Path) -> Tuple[str, dic
 
         for tp in parsed.timing_points:
             t_ms, val, uninh = tp
-            if uninh:
-                extracted_timing_points.append(TimingPoint(
-                    time_ms=t_ms,
-                    beat_length=val,
-                    slider_velocity=1.0,
-                    uninherited=True,
-                ))
-            else:
-                sv = max(0.1, min(10.0, -100.0 / val)) if val < 0 else 1.0
-                extracted_timing_points.append(TimingPoint(
-                    time_ms=t_ms,
-                    beat_length=-100.0 / sv,
-                    slider_velocity=sv,
-                    uninherited=False,
-                ))
+            extracted_timing_points.append(TimingPoint(
+                time=float(t_ms),
+                beat_length=float(val),
+                uninherited=1 if uninh else 0,
+            ))
 
     # Parse Title & Artist from [Metadata]
     for line in osu_text.splitlines():
