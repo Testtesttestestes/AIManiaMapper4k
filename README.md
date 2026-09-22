@@ -118,6 +118,21 @@ python3 generate_beatmap.py --synthetic --duration 30 --sr 3.8 -o output_beatmap
 python3 generate_beatmap.py song.wav --bpm 175.0 --offset 48 --sr 5.2
 ```
 
+#### Обучение и бенчмаркинг ИИ-моделей (Training & Benchmark)
+Подробное пошаговое руководство доступно в документе [TRAINING_GUIDE.md](TRAINING_GUIDE.md).
+
+```bash
+# 1. Разбор .osz архивов на спектрограммы и 16-аккордовые токены:
+./prepare_dataset.sh "sample beatmaps" "dataset_processed"
+
+# 2. Бенчмарк производительности CPU vs GPU:
+./benchmark.sh 3 16 20
+
+# 3. Обучение выбранной модели (1: Sync, 2: Dynamics, 3: Transformer, 4: Evaluator, all):
+./train.sh 3 gpu 20 16   # Модель 3 на GPU, 20 эпох
+./train.sh 1 cpu 10 32   # Модель 1 на CPU, 10 эпох
+```
+
 #### Запуск набора автоматических тестов
 ```bash
 python3 -m unittest discover tests/ -v
