@@ -1,0 +1,7 @@
+opencv-python-headless>=4.13.0
+numpy>=2.4.0
+pytesseract>=0.3.13
+
+optuna>=4.3.0
+
+torch>=2.0.0
