@@ -7,7 +7,7 @@ Four distinct AI architectures:
 4. DifficultyEvaluatorModel (Model 4: Star Rating and density validation)
 """
 
-from .sync_model import SyncBPMOffsetModel, snap_offset_to_audio_transients
+from .sync_model import SyncBPMOffsetModel
 from .dynamics_model import DynamicsSVModel
 from .transformer import (
     ManiaPatternTransformer,
@@ -19,7 +19,6 @@ from .evaluator_model import DifficultyEvaluatorModel
 
 __all__ = [
     "SyncBPMOffsetModel",
-    "snap_offset_to_audio_transients",
     "DynamicsSVModel",
     "ManiaPatternTransformer",
     "TransformerConfig",

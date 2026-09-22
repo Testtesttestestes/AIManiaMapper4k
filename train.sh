@@ -28,7 +28,7 @@ fi
 
 MODEL="${1:-3}"
 DEVICE="${2:-auto}"
-EPOCHS="${3:-50}"
+EPOCHS="${3:-15}"
 BATCH_SIZE="${4:-16}"
 LR="${5:-0.0002}"
 DATASET="dataset_processed/train_data.pt"
