@@ -108,7 +108,7 @@ def test_model_1_audio(
     from osu_mapper.pipeline.audio import analyze_audio_rhythm
 
     print(f"\n[Model 1 Tester] Loading checkpoint: {checkpoint_path}")
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256)
+    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=128)
     meta = load_model_checkpoint(checkpoint_path, model, device)
 
     epoch_info = f" (Epoch {meta['epoch']})" if "epoch" in meta else ""
@@ -171,7 +171,7 @@ def test_model_1_dataset(
     from osu_mapper.models.sync_model import SyncBPMOffsetModel, snap_offset_to_audio_transients
 
     print(f"\n[Model 1 Tester] Loading checkpoint: {checkpoint_path}")
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256)
+    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=128)
     meta = load_model_checkpoint(checkpoint_path, model, device)
 
     # For Model 1, prefer the dedicated whole-song sync dataset if available
