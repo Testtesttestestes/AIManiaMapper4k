@@ -583,11 +583,11 @@ def main():
     )
     parser.add_argument("--device", "-d", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--checkpoint_dir", "--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", "-e", type=int, default=50)
-    parser.add_argument("--batch_size", "-b", type=int, default=16)
+    parser.add_argument("--batch_size", "--batch-size", "-b", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--val_split", type=float, default=0.1)
+    parser.add_argument("--val_split", "--val-split", type=float, default=0.1)
     args = parser.parse_args()
 
     # Create checkpoints dir
