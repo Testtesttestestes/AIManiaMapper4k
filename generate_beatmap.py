@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--creator", type=str, default="AIManiaMapper", help="Beatmap creator name")
     parser.add_argument("--bpm", type=float, default=None, help="Manual BPM override")
     parser.add_argument("--offset", type=int, default=None, help="Manual offset in ms override")
+    parser.add_argument("--sync_checkpoint", "--sync_model", type=str, default=None, help="Path to Model 1 (SyncBPMOffsetModel) .pt checkpoint")
     parser.add_argument("--output", "-o", type=str, default="output_beatmaps/generated_map.osz", help="Output .osz file path")
     parser.add_argument("--synthetic", action="store_true", help="Generate a synthetic rhythm track if no audio provided")
     parser.add_argument("--duration", type=float, default=30.0, help="Duration in seconds for synthetic audio")
@@ -46,9 +47,10 @@ def main():
 
     print(f"==================================================")
     print(f"osu!mania 4K AI Beatmap Generator")
-    print(f"Audio:       {audio_path}")
-    print(f"Star Rating: {args.star_rating:.1f}*")
-    print(f"Output:      {args.output}")
+    print(f"Audio:           {audio_path}")
+    print(f"Star Rating:     {args.star_rating:.1f}*")
+    print(f"Sync Checkpoint: {args.sync_checkpoint or 'Auto-detected'}")
+    print(f"Output:          {args.output}")
     print(f"==================================================")
 
     osu_str, osz_path, analysis = generate_beatmap_pipeline(
@@ -61,6 +63,7 @@ def main():
         creator=args.creator,
         manual_bpm=args.bpm,
         manual_offset=args.offset,
+        sync_model_checkpoint=args.sync_checkpoint,
         seed=args.seed,
     )
 
