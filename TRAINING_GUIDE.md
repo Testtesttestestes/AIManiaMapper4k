@@ -140,7 +140,7 @@ python prepare_dataset.py \
 ```
 Или через Python:
 ```bash
-python3 benchmark_train.py --model 3 --batch_size 16 --steps 20
+python benchmark_train.py --model 3 --batch_size 16 --steps 20
 ```
 
 ### Пример результатов бенчмарка:
@@ -166,7 +166,8 @@ NVIDIA RTX 4090 / A100           | 12.8 ms    | 1250.0      | 0.7 min
 
 ## 6. Шаг 4: Запуск тренировки выбранного ИИ
 
-Обучение запускается с помощью скрипта `train.sh` или команды `python3 train.py`.
+Обучение запускается с помощью скрипта `train.sh` (в Git Bash / Linux / macOS), `train.bat` / `train.ps1` (в Windows CMD / PowerShell) или напрямую командой `python train.py` (или `python3 train.py`).
+Все `.sh` скрипты автоматически определяют, какая команда доступна в вашей системе (`python3`, `python` или `py`).
 
 ### 6.1. Быстрый запуск через bash-скрипт:
 Синтаксис:
@@ -207,7 +208,7 @@ NVIDIA RTX 4090 / A100           | 12.8 ms    | 1250.0      | 0.7 min
 Для тонкой настройки параметров используйте аргументы командной строки:
 
 ```bash
-python3 train.py \
+python train.py \
     --model 3 \
     --device cuda \
     --dataset dataset_processed/train_data.pt \
