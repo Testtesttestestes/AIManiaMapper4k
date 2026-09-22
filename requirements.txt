@@ -1,7 +1,7 @@
-opencv-python-headless>=4.13.0
-numpy>=2.4.0
-pytesseract>=0.3.13
-
-optuna>=4.3.0
-
+# osu!mania 4K AI Auto-Mapper Dependencies
 torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+librosa>=0.10.0
+soundfile>=0.12.1
