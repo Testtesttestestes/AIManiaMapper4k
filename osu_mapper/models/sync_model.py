@@ -176,13 +176,25 @@ class SyncBPMOffsetModel(nn.Module):
         fused = torch.cat([h, ac_emb], dim=-1)
         latent = self.fc(fused)
 
-        # 4. Soft-Argmax BPM expectation
+        # 4. Sharp Peak-Centered BPM Prediction
         bpm_logits = self.bpm_classifier(latent)  # [B, 301]
-        probs = F.softmax(bpm_logits, dim=-1)
-        expected_bpm = (probs * self.bpm_bins.unsqueeze(0)).sum(dim=-1, keepdim=True)
-        residual = torch.tanh(self.bpm_residual(latent)) * 1.5
+
+        # Find peak bin index (mode of distribution)
+        peak_idx = bpm_logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+
+        # Focus expectation strictly on local neighborhood [-3, +3] around the top peak
+        # This completely prevents distant uniform tails from dragging the prediction towards the middle (210 BPM)
+        offsets = torch.arange(-3, 4, device=audio_mel.device).view(1, 7)  # [1, 7]
+        local_bins_idx = torch.clamp(peak_idx + offsets, 0, self.num_bins - 1)  # [B, 7]
+
+        local_logits = torch.gather(bpm_logits, dim=-1, index=local_bins_idx)  # [B, 7]
+        local_probs = F.softmax(local_logits / 0.2, dim=-1)  # sharp temperature
+        local_bpm_values = self.bpm_bins[local_bins_idx]  # [B, 7]
+        expected_bpm = (local_probs * local_bpm_values).sum(dim=-1, keepdim=True)  # [B, 1]
+
+        residual = torch.tanh(self.bpm_residual(latent)) * 0.5
         pred_bpm = expected_bpm + residual
-        pred_bpm = torch.clamp(pred_bpm, min=45.0, max=380.0)
+        pred_bpm = torch.clamp(pred_bpm, min=50.0, max=360.0)
 
         # 5. Beat-Periodic Offset computation
         phase_raw = self.offset_phase_head(latent)

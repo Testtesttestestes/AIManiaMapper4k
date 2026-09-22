@@ -71,7 +71,10 @@ def load_model_checkpoint(checkpoint_path: Path, model: torch.nn.Module, device:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict):
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
@@ -169,7 +172,10 @@ def test_model_1_dataset(
     meta = load_model_checkpoint(checkpoint_path, model, device)
 
     print(f"[Dataset] Loading dataset: {dataset_path}")
-    dataset: List[Dict[str, Any]] = torch.load(dataset_path, map_location="cpu")
+    try:
+        dataset: List[Dict[str, Any]] = torch.load(dataset_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        dataset = torch.load(dataset_path, map_location="cpu")
     total_chunks = len(dataset)
     print(f"[Dataset] Total chunks in dataset: {total_chunks}")
 

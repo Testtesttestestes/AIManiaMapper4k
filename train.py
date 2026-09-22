@@ -257,8 +257,10 @@ def train_model_1_sync(
             target_offset = batch["offset_ms"].to(device).squeeze(-1)
 
             if augment:
-                # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.75, 1.35]
-                alpha = float(torch.empty(1).uniform_(0.75, 1.35).item())
+                # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.80, 1.25]
+                # Stretching audio in time (alpha > 1) makes music SLOWER, so BPM decreases (BPM / alpha).
+                # Compressing audio in time (alpha < 1) makes music FASTER, so BPM increases (BPM / alpha).
+                alpha = float(torch.empty(1).uniform_(0.80, 1.25).item())
                 # Resample along time axis: [B, T, 80] -> [B, 80, T]
                 mel_t = audio_mel.transpose(1, 2)
                 orig_T = mel_t.shape[-1]
@@ -270,8 +272,8 @@ def train_model_1_sync(
                     pad = torch.zeros(audio_mel.shape[0], orig_T - new_T, audio_mel.shape[2], device=device)
                     audio_mel = torch.cat([mel_aug, pad], dim=1)
 
-                target_bpm = target_bpm * alpha
-                target_offset = target_offset / alpha
+                target_bpm = torch.clamp(target_bpm / alpha, min=60.0, max=360.0)
+                target_offset = target_offset * alpha
 
                 # 2. SpecAugment frequency masking
                 if torch.rand(1).item() > 0.35 and audio_mel.shape[-1] > 16:
@@ -557,21 +559,8 @@ def main():
 
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
-        song_sync_file = Path(args.dataset).parent / "song_sync_data.pt"
-        if song_sync_file.exists():
-            print(f"\n[Model 1] Dedicated song-level sync dataset detected: '{song_sync_file}'")
-            sync_full = ManiaDataset(song_sync_file)
-            s_val = max(1, int(len(sync_full) * args.val_split))
-            s_train = len(sync_full) - s_val
-            s_train_set, s_val_set = random_split(
-                sync_full, [s_train, s_val], generator=torch.Generator().manual_seed(42)
-            )
-            s_batch = max(1, min(args.batch_size, 8))
-            s_train_loader = DataLoader(s_train_set, batch_size=s_batch, shuffle=True)
-            s_val_loader = DataLoader(s_val_set, batch_size=s_batch, shuffle=False)
-            train_model_1_sync(s_train_loader, s_val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=True)
-        else:
-            train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=False)
+        is_song = "song_sync" in str(args.dataset).lower()
+        train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song)
     if target in ("2", "dynamics", "all"):
         train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
     if target in ("3", "transformer", "pattern", "all"):
