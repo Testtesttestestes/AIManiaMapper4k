@@ -35,6 +35,7 @@ from osu_mapper.models import (
     ManiaPatternTransformer,
     SyncBPMOffsetModel,
     TransformerConfig,
+    snap_offset_to_audio_transients,
 )
 
 
@@ -295,12 +296,20 @@ def train_model_1_sync(
             # 4. Smooth L1 regression loss on continuous BPM
             loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
-            # 5. Beat-Periodic Phase offset loss (modulo beat length)
+            # 5. Pure High-Precision Cyclic Phase Loss (Modulo beat length, zero whole-beat penalty)
             beat_len_true = 60000.0 / (target_bpm + 1e-5)
-            phase_diff = (pred_offset - target_offset).abs() % beat_len_true
-            phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
-            loss_phase = (phase_dist / beat_len_true).mean()
-            loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
+            pred_phase = pred_offset % beat_len_true
+            true_phase = target_offset % beat_len_true
+            phase_diff = (pred_phase - true_phase).abs() % beat_len_true
+            phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)  # in milliseconds
+
+            # SmoothL1 on milliseconds with beta=2.0 ms
+            loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
+            # Circular Cosine phase loss for global phase angle gradient
+            phase_rad = (phase_dist / beat_len_true) * (2.0 * math.pi)
+            loss_phase_cos = (1.0 - torch.cos(phase_rad)).mean()
+
+            loss_offset = 0.15 * loss_phase_ms + 2.0 * loss_phase_cos
 
             loss = loss_ce + 0.5 * loss_reg + 1.0 * loss_offset
             loss.backward()
@@ -313,6 +322,7 @@ def train_model_1_sync(
             total_phase_err += phase_dist.sum().item()
 
         scheduler.step()
+        cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - start_t
         train_loss = total_loss / len(train_loader.dataset)
         bpm_mae = total_bpm_err / len(train_loader.dataset)
@@ -320,7 +330,7 @@ def train_model_1_sync(
 
         # Validation (Evaluated on clean real data without speed perturbation)
         model.eval()
-        val_loss, val_bpm_err, val_phase_err = 0.0, 0.0, 0.0
+        val_loss, val_bpm_err, val_phase_err, val_snapped_err = 0.0, 0.0, 0.0, 0.0
         with torch.no_grad():
             for batch in val_loader:
                 audio_mel = batch["audio_mel"].to(device)
@@ -338,24 +348,39 @@ def train_model_1_sync(
                 loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
                 beat_len_true = 60000.0 / (target_bpm + 1e-5)
-                phase_diff = (pred_offset - target_offset).abs() % beat_len_true
+                pred_phase = pred_offset % beat_len_true
+                true_phase = target_offset % beat_len_true
+                phase_diff = (pred_phase - true_phase).abs() % beat_len_true
                 phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
-                loss_phase = (phase_dist / beat_len_true).mean()
-                loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
+
+                loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
+                phase_rad = (phase_dist / beat_len_true) * (2.0 * math.pi)
+                loss_phase_cos = (1.0 - torch.cos(phase_rad)).mean()
+                loss_offset = 0.15 * loss_phase_ms + 2.0 * loss_phase_cos
+
+                # Micro-transient snapped phase error
+                snapped_offset = snap_offset_to_audio_transients(
+                    audio_mel, pred_offset.unsqueeze(-1), pred_bpm.unsqueeze(-1)
+                ).squeeze(-1)
+                snapped_phase = snapped_offset % beat_len_true
+                snapped_diff = (snapped_phase - true_phase).abs() % beat_len_true
+                snapped_dist = torch.min(snapped_diff, beat_len_true - snapped_diff)
 
                 B = audio_mel.shape[0]
                 val_loss += (loss_ce + 0.5 * loss_reg + 1.0 * loss_offset).item() * B
                 val_bpm_err += torch.abs(pred_bpm - target_bpm).sum().item()
                 val_phase_err += phase_dist.sum().item()
+                val_snapped_err += snapped_dist.sum().item()
 
         val_loss /= len(val_loader.dataset)
         val_mae = val_bpm_err / len(val_loader.dataset)
         val_phase_mae = val_phase_err / len(val_loader.dataset)
+        val_snapped_mae = val_snapped_err / len(val_loader.dataset)
 
         print(
-            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s] "
-            f"Train Loss: {train_loss:.2f} (BPM MAE: {bpm_mae:.2f}, Phase: {phase_mae:.1f}ms) | "
-            f"Val Loss: {val_loss:.2f} (BPM MAE: {val_mae:.2f}, Phase: {val_phase_mae:.1f}ms)"
+            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s | lr: {cur_lr:.6f}] "
+            f"Train: BPM MAE {bpm_mae:.2f}, Phase {phase_mae:.1f}ms | "
+            f"Val: BPM MAE {val_mae:.2f}, Phase {val_phase_mae:.1f}ms (Snapped: {val_snapped_mae:.1f}ms)"
         )
 
         history.append({"epoch": epoch, "val_loss": val_loss, "val_bpm_mae": val_mae, "val_phase_mae": val_phase_mae})
@@ -520,7 +545,7 @@ def main():
     parser.add_argument("--device", "-d", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--epochs", "-e", type=int, default=10)
+    parser.add_argument("--epochs", "-e", type=int, default=50)
     parser.add_argument("--batch_size", "-b", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--val_split", type=float, default=0.1)

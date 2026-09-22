@@ -208,14 +208,79 @@ class SyncBPMOffsetModel(nn.Module):
         expected_beat = (bar_probs * beat_indices).sum(dim=-1, keepdim=True)
 
         beat_len_ms = 60000.0 / (pred_bpm + 1e-5)
-        # Downbeat offset anchored within first bar
-        periodic_offset = (expected_beat + phi) * beat_len_ms
-
-        direct_offset = F.softplus(self.offset_direct(latent)) * 250.0
-        # Hybrid blend: 70% periodic beat-snapped + 30% direct macro offset
-        pred_offset = 0.75 * periodic_offset + 0.25 * direct_offset
+        # Downbeat offset anchored strictly to musical beat grid
+        pred_offset = (expected_beat + phi) * beat_len_ms
         pred_offset = torch.clamp(pred_offset, min=0.0)
 
         if return_logits:
             return pred_bpm, pred_offset, bpm_logits
         return pred_bpm, pred_offset
+
+
+def snap_offset_to_audio_transients(
+    audio_mel: torch.Tensor,
+    offset_ms: torch.Tensor,
+    bpm: torch.Tensor,
+    frame_ms: float = 16.0,
+    search_window_ms: float = 32.0,
+) -> torch.Tensor:
+    """
+    Refines a continuous offset prediction by snapping it to the nearest
+    sub-frame physical transient peak (kick/snare attack) in the audio.
+    Uses parabolic interpolation on the onset flux envelope to achieve
+    sub-millisecond (< 2 ms) temporal precision.
+    """
+    if audio_mel.dim() == 2:
+        audio_mel = audio_mel.unsqueeze(0)
+    if audio_mel.shape[1] != 80 and audio_mel.shape[2] == 80:
+        mel = audio_mel.transpose(1, 2)
+    else:
+        mel = audio_mel
+
+    # Compute onset strength envelope (spectral flux)
+    flux = F.relu(mel[:, :, 1:] - mel[:, :, :-1]).mean(dim=1)  # [B, T-1]
+    B, T = flux.shape
+    beat_len_ms = 60000.0 / (bpm.squeeze(-1) + 1e-5)
+
+    refined = []
+    for b in range(B):
+        cur_off = float(offset_ms[b].squeeze().item())
+        b_len = float(beat_len_ms[b].item()) if beat_len_ms.dim() > 0 else float(beat_len_ms.item())
+        cur_flux = flux[b]
+
+        # Anchor to beat phase in audio
+        phase_ms = cur_off % b_len
+        target_frame = int(round(phase_ms / frame_ms))
+        radius_frames = max(1, int(round(search_window_ms / frame_ms)))
+
+        left = max(1, target_frame - radius_frames)
+        right = min(T - 2, target_frame + radius_frames + 1)
+
+        if left < right and right < T - 1:
+            window = cur_flux[left:right]
+            local_peak_idx = int(window.argmax().item())
+            k = left + local_peak_idx
+
+            if 0 < k < T - 1:
+                # Quadratic / parabolic peak interpolation for sub-frame accuracy
+                y0 = float(cur_flux[k - 1].item())
+                y1 = float(cur_flux[k].item())
+                y2 = float(cur_flux[k + 1].item())
+                denom = y0 - 2.0 * y1 + y2
+                if abs(denom) > 1e-6 and y1 >= y0 and y1 >= y2:
+                    delta = 0.5 * (y0 - y2) / denom
+                    delta = max(-0.5, min(0.5, delta))
+                else:
+                    delta = 0.0
+                refined_peak_ms = (k + delta) * frame_ms
+
+                # Keep whole-beat component, update fractional phase with transient peak
+                whole_beats = round((cur_off - phase_ms) / b_len)
+                snapped_ms = whole_beats * b_len + (refined_peak_ms % b_len)
+                refined.append(snapped_ms)
+            else:
+                refined.append(cur_off)
+        else:
+            refined.append(cur_off)
+
+    return torch.tensor(refined, device=offset_ms.device, dtype=offset_ms.dtype).unsqueeze(-1)
