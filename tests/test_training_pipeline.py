@@ -92,5 +92,54 @@ class TestTrainingPipeline(unittest.TestCase):
         self.assertEqual(pred_sr.shape, (B, 1))
 
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
+    def test_slice_beatmap_timing_sources(self):
+        """Test slice_beatmap_into_musical_chunks with both 'map' (ground truth) and 'model1' (override)."""
+        from osu_mapper.dataset.feature_extractor import (
+            ParsedBeatmapDetails,
+            slice_beatmap_into_musical_chunks,
+        )
+
+        dummy_details = ParsedBeatmapDetails(
+            osu_file_name="test.osu",
+            version="4K Insane",
+            mode=3,
+            circle_size=4.0,
+            overall_difficulty=8.0,
+            audio_filename="audio.mp3",
+            bpm=150.0,
+            offset_ms=100.0,
+            star_rating=5.0,
+            timing_points=[(100.0, 400.0, True)],
+            hit_objects=[(0, 100, 100, False), (1, 500, 500, False)],
+        )
+
+        mel = torch.randn(1000, 80)
+        tokens = torch.zeros(1000, dtype=torch.int64)
+        ln_active = torch.zeros(1000, 4, dtype=torch.float32)
+        sv_curve = torch.ones(1000, dtype=torch.float32)
+
+        # 1. Ground Truth from Map (.osu)
+        map_chunks = slice_beatmap_into_musical_chunks(
+            mel, tokens, ln_active, sv_curve, dummy_details,
+            chunk_size=256, align_mode="beat", timing_source="map"
+        )
+        self.assertGreater(len(map_chunks), 0)
+        self.assertEqual(map_chunks[0]["timing_source"], "map")
+        self.assertEqual(float(map_chunks[0]["bpm"].item()), 150.0)
+        self.assertEqual(float(map_chunks[0]["offset_ms"].item()), 100.0)
+
+        # 2. Inferred from Model 1 (AI timing override)
+        model1_chunks = slice_beatmap_into_musical_chunks(
+            mel, tokens, ln_active, sv_curve, dummy_details,
+            chunk_size=256, align_mode="beat", timing_source="model1",
+            timing_override=(175.0, 30.0)
+        )
+        self.assertGreater(len(model1_chunks), 0)
+        self.assertEqual(model1_chunks[0]["timing_source"], "model1")
+        self.assertEqual(float(model1_chunks[0]["bpm"].item()), 175.0)
+        self.assertEqual(float(model1_chunks[0]["offset_ms"].item()), 30.0)
+
+
 if __name__ == "__main__":
     unittest.main()

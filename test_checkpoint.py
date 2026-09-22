@@ -103,12 +103,12 @@ def test_model_1_audio(
     device: torch.device,
     compare_heuristic: bool = True,
 ):
-    from osu_mapper.models.sync_model import SyncBPMOffsetModel
+    from osu_mapper.models.sync_model import SyncBPMOffsetModel, snap_offset_to_audio_transients
     from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
     from osu_mapper.pipeline.audio import analyze_audio_rhythm
 
     print(f"\n[Model 1 Tester] Loading checkpoint: {checkpoint_path}")
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256)
+    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=128)
     meta = load_model_checkpoint(checkpoint_path, model, device)
 
     epoch_info = f" (Epoch {meta['epoch']})" if "epoch" in meta else ""
@@ -127,21 +127,24 @@ def test_model_1_audio(
         bpm_out, offset_out = model(inp)
         pred_bpm = float(bpm_out.squeeze().item())
         pred_offset = int(round(float(offset_out.squeeze().item())))
+        snapped_offset = int(round(float(snap_offset_to_audio_transients(inp, offset_out, bpm_out).squeeze().item())))
 
     pred_bpm = max(45.0, min(360.0, pred_bpm))
     pred_offset = max(0, pred_offset)
+    snapped_offset = max(0, snapped_offset)
 
     beat_len_ms = 60000.0 / pred_bpm
     bar_len_ms = 4.0 * beat_len_ms
 
     # First 8 beat timestamps
-    first_beats = [int(round(pred_offset + i * beat_len_ms)) for i in range(8)]
+    first_beats = [int(round(snapped_offset + i * beat_len_ms)) for i in range(8)]
 
     print("\n" + "=" * 65)
     print(" 🎯 MODEL 1 (SYNC BPM & OFFSET) INFERENCE RESULTS")
     print("=" * 65)
     print(f"  • Predicted BPM:          {pred_bpm:.2f} BPM")
-    print(f"  • Predicted Beat Offset:  {pred_offset} ms")
+    print(f"  • Model Raw Offset:       {pred_offset} ms")
+    print(f"  • Transient-Snapped Off:  {snapped_offset} ms (Micro-transient locked)")
     print(f"  • Beat Duration (1/1):    {beat_len_ms:.2f} ms")
     print(f"  • Measure Length (4/4):   {bar_len_ms:.2f} ms")
     print(f"  • Half-beat Snap (1/2):   {beat_len_ms / 2.0:.2f} ms")
@@ -165,11 +168,19 @@ def test_model_1_dataset(
     device: torch.device,
     num_samples: int = 5,
 ):
-    from osu_mapper.models.sync_model import SyncBPMOffsetModel
+    from osu_mapper.models.sync_model import SyncBPMOffsetModel, snap_offset_to_audio_transients
 
     print(f"\n[Model 1 Tester] Loading checkpoint: {checkpoint_path}")
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256)
+    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=128)
     meta = load_model_checkpoint(checkpoint_path, model, device)
+
+    # For Model 1, prefer the dedicated whole-song sync dataset if available
+    dataset_p = Path(dataset_path)
+    sync_cand = dataset_p.parent / "song_sync_data.pt"
+    if "song_sync" not in str(dataset_path).lower() and sync_cand.exists():
+        print(f"💡 [Model 1 Auto-Select] Dedicated whole-song sync dataset detected: '{sync_cand}'")
+        print("   Testing Model 1 against whole-song 16s audio tracks.")
+        dataset_path = sync_cand
 
     print(f"[Dataset] Loading dataset: {dataset_path}")
     try:
@@ -177,21 +188,22 @@ def test_model_1_dataset(
     except TypeError:
         dataset = torch.load(dataset_path, map_location="cpu")
     total_chunks = len(dataset)
-    print(f"[Dataset] Total chunks in dataset: {total_chunks}")
+    print(f"[Dataset] Total samples in dataset: {total_chunks}")
 
     num_eval = min(num_samples, total_chunks)
     step = max(1, total_chunks // num_eval)
     sample_indices = [i * step for i in range(num_eval)]
 
-    print("\n" + "=" * 84)
+    print("\n" + "=" * 98)
     print(f" 📊 TESTING MODEL 1 ON {num_eval} DATASET SAMPLES")
-    print("=" * 84)
-    print(f"{'CHUNK':<6} | {'TRUE BPM':<9} | {'PRED BPM':<9} | {'BPM ERR':<8} | {'TRUE OFF':<9} | {'PRED OFF':<9} | {'PHASE ERR':<9}")
-    print("-" * 84)
+    print("=" * 98)
+    print(f"{'CHUNK':<6} | {'TRUE BPM':<8} | {'PRED BPM':<8} | {'BPM ERR':<7} | {'TRUE OFF':<8} | {'PRED OFF':<8} | {'PHASE ERR':<9} | {'MICRO (SNAP)':<12}")
+    print("-" * 98)
 
     total_bpm_err = 0.0
     total_off_err = 0.0
     total_phase_err = 0.0
+    total_snapped_err = 0.0
 
     for idx in sample_indices:
         item = dataset[idx]
@@ -199,30 +211,41 @@ def test_model_1_dataset(
         true_bpm = float(item["bpm"].squeeze().item())
         true_off = float(item["offset_ms"].squeeze().item())
 
+        # Downbeat phase modulo beat duration
+        beat_len = 60000.0 / (true_bpm + 1e-5)
+        # If evaluating a mid-song chunk (from train_data.pt), calibrate target offset to chunk start
+        if "start_ms" in item:
+            chunk_start = float(item["start_ms"])
+            true_off = (true_off - chunk_start) % beat_len
+
         with torch.no_grad():
             bpm_out, off_out = model(mel)
             pred_bpm = float(bpm_out.squeeze().item())
             pred_off = float(off_out.squeeze().item())
+            snapped_off = float(snap_offset_to_audio_transients(mel, off_out, bpm_out).squeeze().item())
 
         bpm_err = abs(pred_bpm - true_bpm)
         off_err = abs(pred_off - true_off)
 
-        # Downbeat phase error modulo beat duration
-        beat_len = 60000.0 / (true_bpm + 1e-5)
         phase_diff = abs(pred_off - true_off) % beat_len
         phase_err = min(phase_diff, beat_len - phase_diff)
+
+        snapped_diff = abs(snapped_off - true_off) % beat_len
+        snapped_err = min(snapped_diff, beat_len - snapped_diff)
 
         total_bpm_err += bpm_err
         total_off_err += off_err
         total_phase_err += phase_err
+        total_snapped_err += snapped_err
 
-        print(f"#{idx:<5} | {true_bpm:<9.1f} | {pred_bpm:<9.1f} | {bpm_err:<8.2f} | {true_off:<9.0f} | {pred_off:<9.0f} | {phase_err:<9.1f}ms")
+        print(f"#{idx:<5} | {true_bpm:<8.1f} | {pred_bpm:<8.1f} | {bpm_err:<7.2f} | {true_off:<8.0f} | {pred_off:<8.0f} | {phase_err:<9.1f}ms | {snapped_err:<12.1f}ms")
 
-    print("-" * 84)
-    print(f"Average BPM Absolute Error (MAE):     {total_bpm_err / num_eval:.2f} BPM")
-    print(f"Average Downbeat Phase Error (MAE):   {total_phase_err / num_eval:.1f} ms (True musical alignment)")
-    print(f"Raw Scalar Offset Error (MAE):        {total_off_err / num_eval:.1f} ms (Whole-beat integer offsets)")
-    print("=" * 84 + "\n")
+    print("-" * 98)
+    print(f"Average BPM Absolute Error (MAE):           {total_bpm_err / num_eval:.2f} BPM")
+    print(f"Average Model Phase Error (MAE):            {total_phase_err / num_eval:.1f} ms")
+    print(f"Average Transient-Snapped Phase Error (MAE): {total_snapped_err / num_eval:.1f} ms  (Target: +/- 2 ms)")
+    print(f"Raw Scalar Offset Error (MAE):              {total_off_err / num_eval:.1f} ms  (Whole-beat integer offsets)")
+    print("=" * 98 + "\n")
 
 
 # ==============================================================================
@@ -317,8 +340,8 @@ def main():
     parser.add_argument("--checkpoint", "-c", type=str, default=None, help="Path to .pt checkpoint file (defaults to checkpoints/model_X_..._best.pt)")
     parser.add_argument("--audio", "-a", type=str, default=None, help="Path to audio file (.wav, .mp3, .ogg, .flac)")
     parser.add_argument("--dataset", "-d", type=str, default=None, help="Path to train_data.pt dataset for evaluation")
-    parser.add_argument("--num_samples", "-n", type=int, default=5, help="Number of dataset samples to evaluate")
-    parser.add_argument("--sr", "--star_rating", type=float, default=4.0, help="Star rating conditioning for Model 3")
+    parser.add_argument("--num_samples", "--num-samples", "-n", type=int, default=5, help="Number of dataset samples to evaluate")
+    parser.add_argument("--sr", "--star_rating", "--star-rating", type=float, default=4.0, help="Star rating conditioning for Model 3")
     parser.add_argument("--device", type=str, default="auto", help="Execution device: auto, cpu, cuda, gpu, mps")
 
     args = parser.parse_args()

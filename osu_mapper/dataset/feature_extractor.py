@@ -495,11 +495,15 @@ def slice_beatmap_into_musical_chunks(
     frame_ms: float = 16.0,
     align_mode: str = "beat",
     bars_per_step: int = 2,
+    timing_source: str = "map",
+    timing_override: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Slices beatmap audio representations and tokens into synchronized training/inference chunks.
 
     Parameters:
+    - timing_source: "map" (Ground Truth directly from .osu file) or "model1" (AI predicted BPM & Offset).
+    - timing_override: Optional (bpm, offset_ms) tuple to override beatmap timing when using Model 1 sync.
     - align_mode="beat" (Default):
         Audio slices are strictly synchronized to the song's Offset and BPM.
         Each chunk begins on an exact musical downbeat (beat 1 of a measure/square):
@@ -515,12 +519,18 @@ def slice_beatmap_into_musical_chunks(
     chunks: List[Dict[str, Any]] = []
 
     if align_mode == "beat":
-        bpm = max(30.0, float(details.bpm))
+        # Determine active BPM and Offset (either ground truth from map or override from Model 1)
+        if timing_override is not None:
+            bpm_val, offset_val = timing_override
+        else:
+            bpm_val, offset_val = float(details.bpm), float(details.offset_ms)
+
+        bpm = max(30.0, float(bpm_val))
         beat_len_ms = 60000.0 / bpm
         bar_len_ms = 4.0 * beat_len_ms  # 1 measure / ход (in 4/4)
 
         # Align to first non-negative musical bar start
-        offset_ms = float(details.offset_ms)
+        offset_ms = float(offset_val)
         first_bar_ms = offset_ms
         while first_bar_ms >= bar_len_ms:
             first_bar_ms -= bar_len_ms
@@ -561,8 +571,9 @@ def slice_beatmap_into_musical_chunks(
                     "ln_mask": chunk_ln,
                     "sv_curve": chunk_sv,
                     "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
-                    "bpm": torch.tensor([details.bpm], dtype=torch.float32),
-                    "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                    "bpm": torch.tensor([bpm_val], dtype=torch.float32),
+                    "offset_ms": torch.tensor([offset_val], dtype=torch.float32),
+                    "timing_source": timing_source,
                     "start_ms": round(chunk_start_ms, 2),
                     "end_ms": round(chunk_start_ms + chunk_size * frame_ms, 2),
                     "bar_index": step_idx * bars_per_step,
@@ -574,7 +585,8 @@ def slice_beatmap_into_musical_chunks(
         if not chunks and num_frames >= chunk_size:
             # Fallback to frame mode if beat-anchoring yielded 0 windows
             return slice_beatmap_into_musical_chunks(
-                mel, tokens, ln_active, sv_curve, details, chunk_size, hop_size, frame_ms, align_mode="frame"
+                mel, tokens, ln_active, sv_curve, details, chunk_size, hop_size, frame_ms, align_mode="frame",
+                timing_source=timing_source, timing_override=timing_override
             )
 
     else:  # "frame" mode
