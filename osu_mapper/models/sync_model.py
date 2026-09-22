@@ -177,6 +177,7 @@ class SyncBPMOffsetModel(nn.Module):
         latent = self.fc(fused)
 
         # 4. Sharp Differentiable Soft-Expectation for BPM
+        bpm_logits = self.bpm_classifier(latent)  # [B, 301]
         probs = F.softmax(bpm_logits / 0.15, dim=-1)
         expected_bpm = (probs * self.bpm_bins.unsqueeze(0)).sum(dim=-1, keepdim=True)
         residual = torch.tanh(self.bpm_residual(latent)) * 0.5
