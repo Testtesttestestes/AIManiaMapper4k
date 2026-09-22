@@ -27,6 +27,7 @@ from osu_mapper.dataset.feature_extractor import (
     find_ffmpeg,
     parse_osu_for_training,
     quantize_beatmap_to_grid,
+    slice_beatmap_into_musical_chunks,
 )
 
 
@@ -38,9 +39,13 @@ def process_archives(
     target_sr: int = 16000,
     n_mels: int = 80,
     ffmpeg_path: Optional[str] = None,
+    align_mode: str = "beat",
+    bars_per_step: int = 2,
 ) -> Dict[str, Any]:
     """
     Parses all .osz beatmaps in input_dir and saves tokenized training chunks into output_dir.
+    - align_mode="beat": Slices audio strictly synchronized to BPM and offset (musical measures / squares).
+    - align_mode="frame": Fixed sliding window advancing by hop_size frames.
     """
     in_path = Path(input_dir)
     out_path = Path(output_dir)
@@ -163,27 +168,22 @@ def process_archives(
                     total_diffs += 1
                     tokens, ln_active, sv_curve = quantize_beatmap_to_grid(details, num_frames=num_frames)
 
-                    # Slice song into training windows [chunk_size]
-                    chunk_count = 0
-                    for start_idx in range(0, num_frames - chunk_size + 1, hop_size):
-                        end_idx = start_idx + chunk_size
-                        chunk_mel = mel[start_idx:end_idx]            # [chunk_size, n_mels]
-                        chunk_tok = tokens[start_idx:end_idx]          # [chunk_size]
-                        chunk_ln = ln_active[start_idx:end_idx]        # [chunk_size, 4]
-                        chunk_sv = sv_curve[start_idx:end_idx]         # [chunk_size]
+                    # Slice song into beat-synchronized or frame-based training windows
+                    chunks = slice_beatmap_into_musical_chunks(
+                        mel=mel,
+                        tokens=tokens,
+                        ln_active=ln_active,
+                        sv_curve=sv_curve,
+                        details=details,
+                        chunk_size=chunk_size,
+                        hop_size=hop_size,
+                        align_mode=align_mode,
+                        bars_per_step=bars_per_step,
+                    )
+                    chunks_list.extend(chunks)
+                    chunk_count = len(chunks)
 
-                        chunks_list.append({
-                            "audio_mel": chunk_mel,
-                            "tokens": chunk_tok,
-                            "ln_mask": chunk_ln,
-                            "sv_curve": chunk_sv,
-                            "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
-                            "bpm": torch.tensor([details.bpm], dtype=torch.float32),
-                            "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
-                        })
-                        chunk_count += 1
-
-                    print(f"  - Parsed {details.version}: SR={details.star_rating:.1f}, BPM={details.bpm}, Chunks={chunk_count}")
+                    print(f"  - Parsed {details.version}: SR={details.star_rating:.1f}, BPM={details.bpm}, Offset={details.offset_ms}ms, Chunks={chunk_count}")
 
                     metadata_records.append({
                         "archive": osz.name,
@@ -211,6 +211,8 @@ def process_archives(
         "total_diffs": total_diffs,
         "total_audio_hours": round(total_audio_sec / 3600.0, 3),
         "total_chunks": len(chunks_list),
+        "align_mode": align_mode,
+        "bars_per_step": bars_per_step if align_mode == "beat" else None,
         "chunk_size": chunk_size,
         "hop_size": hop_size,
         "n_mels": n_mels,
@@ -224,7 +226,7 @@ def process_archives(
     print(f"Dataset preparation complete:")
     print(f"  - Total archives processed: {len(osz_files)}")
     print(f"  - Valid 4K mania diffs:    {total_diffs}")
-    print(f"  - Training chunks created: {len(chunks_list)}")
+    print(f"  - Training chunks created: {len(chunks_list)} (align_mode='{align_mode}')")
     print(f"  - Output binary tensor:    {dataset_file} ({dataset_file.stat().st_size / (1024 * 1024):.1f} MB)")
     print(f"  - Metadata manifest:       {meta_file}")
     return summary
@@ -235,7 +237,9 @@ def main():
     parser.add_argument("--input_dir", "-i", type=str, default="sample beatmaps", help="Directory with .osz beatmaps")
     parser.add_argument("--output_dir", "-o", type=str, default="dataset_processed", help="Output directory for processed tensors")
     parser.add_argument("--chunk_size", type=int, default=256, help="Frames per sequence chunk (256 frames = ~4.09s)")
-    parser.add_argument("--hop_size", type=int, default=128, help="Stride between consecutive chunks (128 frames = ~2.04s)")
+    parser.add_argument("--hop_size", type=int, default=128, help="Stride between consecutive chunks in frame mode (128 frames = ~2.04s)")
+    parser.add_argument("--align_mode", type=str, choices=["beat", "frame"], default="beat", help="Chunking alignment mode: 'beat' (BPM/offset musical measures/squares) or 'frame' (unaligned)")
+    parser.add_argument("--bars_per_step", type=int, default=2, help="Number of musical bars per step in 'beat' mode (default 2 bars)")
     parser.add_argument("--ffmpeg", "--ffmpeg_path", type=str, default=None, help="Explicit path to ffmpeg executable (e.g. ffmpeg/ffmpeg.exe)")
     args = parser.parse_args()
 
@@ -245,6 +249,8 @@ def main():
         chunk_size=args.chunk_size,
         hop_size=args.hop_size,
         ffmpeg_path=args.ffmpeg,
+        align_mode=args.align_mode,
+        bars_per_step=args.bars_per_step,
     )
     if summary.get("error") == "ffmpeg_not_found":
         sys.exit(1)

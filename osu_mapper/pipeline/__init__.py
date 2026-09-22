@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .audio import AudioRhythmResult, analyze_audio_rhythm
+from .audio import AudioRhythmResult, analyze_audio_rhythm, predict_bpm_offset_with_model
 from .packager import BeatmapMetadata, BeatmapPackager
 from .pattern_generator import ManiaHitObject, generate_patterns
 from .timing import TimingPoint, generate_timing_points
@@ -23,27 +23,57 @@ def generate_beatmap_pipeline(
     creator: str = "AIManiaMapper",
     manual_bpm: Optional[float] = None,
     manual_offset: Optional[int] = None,
+    sync_model_checkpoint: Optional[str] = None,
+    dynamics_model_checkpoint: Optional[str] = None,
+    pattern_model_checkpoint: Optional[str] = None,
     seed: int = 42,
+    device: str = "auto",
 ) -> Tuple[str, str, AudioRhythmResult]:
     """
     Executes the full pipeline:
-    1. Audio analysis (transients, BPM, offset)
-    2. Timing points & SV dynamics generation
-    3. Pattern generation conditioned on Star Rating (1.0 to 9.9)
-    4. Serialization to .osu v14 and bundling into .osz archive.
+    1. Step 1 (Model 1 / Rhythm): Predict BPM and beat offset (from neural model or audio analysis)
+    2. Step 2 (Model 2 / SV): Timing points & SV dynamics generation based on timing grid
+    3. Step 3 (Model 3 / Patterns): Pattern generation conditioned on Star Rating and timing grid
+    4. Step 4 (Packaging): Serialization to .osu v14 and bundling into .osz archive.
 
     Returns:
         (osu_content_str, generated_osz_path, audio_analysis_result)
     """
     audio_analysis = analyze_audio_rhythm(wav_path)
 
-    effective_bpm = manual_bpm if manual_bpm is not None else audio_analysis.bpm
-    effective_offset = manual_offset if manual_offset is not None else audio_analysis.offset_ms
+    effective_bpm = audio_analysis.bpm
+    effective_offset = audio_analysis.offset_ms
+
+    # Step 1: Use Model 1 (SyncBPMOffsetModel) if checkpoint provided or exists in checkpoints/
+    checkpoint_to_try = sync_model_checkpoint
+    if checkpoint_to_try is None:
+        default_ckpt = Path("checkpoints/model_1_sync_best.pt")
+        if default_ckpt.exists():
+            checkpoint_to_try = str(default_ckpt)
+
+    if checkpoint_to_try and Path(checkpoint_to_try).exists():
+        try:
+            model_bpm, model_offset = predict_bpm_offset_with_model(
+                wav_path=wav_path,
+                checkpoint_path=checkpoint_to_try,
+                device=device,
+            )
+            print(f"[Model 1: Sync] Model predicted BPM={model_bpm:.2f}, Offset={model_offset}ms")
+            effective_bpm = model_bpm
+            effective_offset = model_offset
+        except Exception as ex:
+            print(f"[Model 1: Sync] Note: using audio analysis fallback: {ex}")
+
+    # Manual user overrides always take precedence if explicitly given
+    if manual_bpm is not None:
+        effective_bpm = manual_bpm
+    if manual_offset is not None:
+        effective_offset = manual_offset
 
     if version is None:
         version = f"AI 4K [{star_rating:.1f}*]"
 
-    # Generate SV & timing points
+    # Step 2: Generate SV & timing points aligned to Model 1's BPM and Offset
     timing_points = generate_timing_points(
         bpm=effective_bpm,
         offset_ms=effective_offset,
@@ -51,7 +81,7 @@ def generate_beatmap_pipeline(
         rms_profile=audio_analysis.rms_profile,
     )
 
-    # Generate hit objects conditioned on star rating
+    # Step 3: Generate hit objects conditioned on star rating and beat-aligned grid
     hit_objects = generate_patterns(
         bpm=effective_bpm,
         offset_ms=effective_offset,
