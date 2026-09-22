@@ -20,9 +20,21 @@
 ## 2. Системные требования и подготовка окружения
 
 ### 2.1. Необходимое ПО
-- **Python 3.10+** (рекомендуется Python 3.11)
-- **PyTorch 2.0+**
+- **Python 3.10+** (рекомендуется Python 3.11 или 3.12)
+- **PyTorch 2.0+** (`pip install torch torchvision torchaudio`)
 - **ffmpeg** (обязателен для распаковки и перекодирования MP3/OGG аудио в стандартизированный 16 кГц WAV)
+
+#### Установка FFmpeg на Windows:
+Скрипт автоматически ищет `ffmpeg.exe` в следующих местах:
+1. **Папка проекта** `ffmpeg/ffmpeg.exe` или `ffmpeg/bin/ffmpeg.exe` (самый простой способ!).
+2. **Аргумент командной строки**: `python prepare_dataset.py --ffmpeg "C:\path\to\ffmpeg.exe"`
+3. **Системный PATH Windows**: если `ffmpeg` добавлен в переменные среды.
+
+> 💡 **Быстрая установка FFmpeg на Windows за 1 минуту:**
+> 1. Скачайте архив сборки FFmpeg (например, `ffmpeg-release-essentials.zip` с официального сайта [ffmpeg.org/download.html](https://ffmpeg.org/download.html) или [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)).
+> 2. Откройте скачанный zip-архив, зайдите в папку `bin` и скопируйте файл `ffmpeg.exe`.
+> 3. Вставьте его прямо в папку `ffmpeg/` в проекте: `AIManiaMapper4k\ffmpeg\ffmpeg.exe`.
+> 4. Готово! Скрипты автоматически подхватят его.
 
 ### 2.2. Проверка окружения
 Для проверки готовности системы запустите в терминале:
@@ -78,18 +90,26 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ### Запуск препроцессинга в один клик:
 
+**Для Windows PowerShell:**
+```powershell
+.\prepare_dataset.ps1
+```
+*(Или в командной строке CMD: `prepare_dataset.bat`)*
+
+**Для Linux / macOS / Git Bash:**
 ```bash
 ./prepare_dataset.sh
 ```
 
 Либо напрямую через Python с настройкой параметров:
 ```bash
-python3 prepare_dataset.py \
+python prepare_dataset.py \
     --input_dir "sample beatmaps" \
     --output_dir "dataset_processed" \
     --chunk_size 256 \
     --hop_size 128
 ```
+*(Если `ffmpeg.exe` лежит в нестандартном месте, добавьте `--ffmpeg "C:\путь\к\ffmpeg.exe"`)*
 
 ### Результат выполнения:
 - Создается файл **`dataset_processed/train_data.pt`** — готовый скомпилированный бинарный датасет со всеми обучающими тензорами.
@@ -246,6 +266,22 @@ python3 -m osu_mapper.pipeline \
 
 ## 9. Частые вопросы и решение проблем (FAQ & Troubleshooting)
 
+### В: Ошибка `[WinError 2] Не удается найти указанный файл` при обработке архивов
+**О:** Данная ошибка в Windows возникает, когда скрипт пытается вызвать внешнюю утилиту `ffmpeg`, но исполняемый файл `ffmpeg.exe` не найден.
+**Решение:**
+1. Скачайте `ffmpeg.exe` (например, zip-архив с [ffmpeg.org](https://ffmpeg.org/download.html)).
+2. Скопируйте файл `ffmpeg.exe` прямо в папку `ffmpeg/` в корне проекта (`AIManiaMapper4k\ffmpeg\ffmpeg.exe`). Скрипт автоматически найдет его там.
+3. Либо укажите путь через флаг:
+   ```powershell
+   python prepare_dataset.py --ffmpeg "C:\Users\...\ffmpeg.exe"
+   ```
+
+### В: Как запускать скрипты в Windows PowerShell?
+**О:** Для всех операций созданы нативные `.ps1` (PowerShell) и `.bat` скрипты:
+- Препроцессинг: `.\prepare_dataset.ps1` (или `prepare_dataset.bat`)
+- Бенчмарк: `.\benchmark.ps1 -Model 3` (или `benchmark.bat 3`)
+- Обучение: `.\train.ps1 -Model 3 -Device cuda -Epochs 20` (или `train.bat 3 cuda 20`)
+
 ### В: Что делать при ошибке `CUDA out of memory` (OOM)?
 **О:** Память видеокарты переполнена. Уменьшите размер батча:
 ```bash
@@ -258,5 +294,5 @@ python3 -m osu_mapper.pipeline \
 ### В: Как дообучить модель на новых картах?
 **О:** 
 1. Положите новые `.osz` файлы в `sample beatmaps/`.
-2. Запустите `./prepare_dataset.sh`, чтобы обновить `train_data.pt`.
-3. Запустите `./train.sh 3 gpu 15 16`.
+2. Запустите `.\prepare_dataset.ps1` (или `./prepare_dataset.sh`), чтобы обновить `train_data.pt`.
+3. Запустите `.\train.ps1 -Model 3 -Device cuda -Epochs 15` (или `./train.sh 3 gpu 15 16`).

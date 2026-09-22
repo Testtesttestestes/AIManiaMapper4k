@@ -14,13 +14,17 @@ import os
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore
 
 from osu_mapper.dataset.feature_extractor import (
     compute_mel_spectrogram,
     extract_audio_waveform,
+    find_ffmpeg,
     parse_osu_for_training,
     quantize_beatmap_to_grid,
 )
@@ -33,6 +37,7 @@ def process_archives(
     hop_size: int = 128,
     target_sr: int = 16000,
     n_mels: int = 80,
+    ffmpeg_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Parses all .osz beatmaps in input_dir and saves tokenized training chunks into output_dir.
@@ -40,6 +45,39 @@ def process_archives(
     in_path = Path(input_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if torch is None:
+        print("\n" + "=" * 76)
+        print("❌ ОШИБКА: Библиотека PyTorch (torch) не установлена!")
+        print("=" * 76)
+        print("Для токенизации и создания обучающих тензоров требуется PyTorch.")
+        print("Установите PyTorch командой:")
+        print("  pip install torch numpy\n")
+        print("=" * 76 + "\n")
+        return {"total_archives": 0, "total_chunks": 0, "error": "torch_not_found"}
+
+    # Pre-flight check for FFmpeg (required for mp3/ogg decoding)
+    resolved_ffmpeg = find_ffmpeg(ffmpeg_path)
+    if not resolved_ffmpeg:
+        print("\n" + "=" * 76)
+        print("❌ ОШИБКА: Утилита FFmpeg не найдена на вашей системе!")
+        print("=" * 76)
+        print("Для извлечения звуковых дорожек из .osz (.mp3 / .ogg) необходим FFmpeg.")
+        print("При его отсутствии Windows выдает ошибку:")
+        print("  [WinError 2] Не удается найти указанный файл\n")
+        print("КАК ИСПРАВИТЬ (выберите ОДИН из вариантов):")
+        print(" 1) [РЕКОМЕНДУЕТСЯ] Положите 'ffmpeg.exe' в папку проекта:")
+        print(f"    -> {Path('ffmpeg/ffmpeg.exe').resolve()}")
+        print("    (Скрипт автоматически найдет его там!)")
+        print(" 2) Укажите путь к ffmpeg через аргумент:")
+        print('    python prepare_dataset.py --ffmpeg "C:\\путь\\к\\ffmpeg.exe"')
+        print(" 3) Задайте переменную окружения в PowerShell:")
+        print('    $env:FFMPEG_PATH = "C:\\путь\\к\\ffmpeg.exe"')
+        print(" 4) Либо добавьте папку с ffmpeg.exe в системный PATH Windows.")
+        print("=" * 76 + "\n")
+        return {"total_archives": 0, "total_chunks": 0, "error": "ffmpeg_not_found"}
+
+    print(f"[Preprocessor] Using FFmpeg binary: {resolved_ffmpeg}")
 
     osz_files = sorted(list(in_path.glob("*.osz")))
     if not osz_files:
@@ -91,7 +129,12 @@ def process_archives(
 
                 audio_bytes = z.read(audio_entry)
                 ext = Path(audio_entry).suffix.lower()
-                waveform = extract_audio_waveform(audio_bytes, file_ext=ext, target_sr=target_sr)
+                waveform = extract_audio_waveform(
+                    audio_bytes,
+                    file_ext=ext,
+                    target_sr=target_sr,
+                    ffmpeg_path=resolved_ffmpeg,
+                )
                 if waveform is None or waveform.shape[0] < target_sr:
                     print(f"  [Skip] Failed to decode audio '{audio_entry}' in '{osz.name}'.")
                     continue
@@ -193,14 +236,18 @@ def main():
     parser.add_argument("--output_dir", "-o", type=str, default="dataset_processed", help="Output directory for processed tensors")
     parser.add_argument("--chunk_size", type=int, default=256, help="Frames per sequence chunk (256 frames = ~4.09s)")
     parser.add_argument("--hop_size", type=int, default=128, help="Stride between consecutive chunks (128 frames = ~2.04s)")
+    parser.add_argument("--ffmpeg", "--ffmpeg_path", type=str, default=None, help="Explicit path to ffmpeg executable (e.g. ffmpeg/ffmpeg.exe)")
     args = parser.parse_args()
 
-    process_archives(
+    summary = process_archives(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         chunk_size=args.chunk_size,
         hop_size=args.hop_size,
+        ffmpeg_path=args.ffmpeg,
     )
+    if summary.get("error") == "ffmpeg_not_found":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

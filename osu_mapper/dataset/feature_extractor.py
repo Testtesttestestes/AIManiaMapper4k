@@ -16,14 +16,104 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-import numpy as np
-import torch
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore
+
+
+def find_ffmpeg(custom_path: Optional[str] = None) -> Optional[str]:
+    """
+    Locates FFmpeg executable across Windows, Linux, and macOS.
+    Checks:
+    1. Explicit custom_path if passed (strictly checked).
+    2. Environment variables FFMPEG_PATH, FFMPEG_BINARY, FFMPEG_EXECUTABLE.
+    3. Common project-relative folders (e.g. ffmpeg/ffmpeg.exe, bin/ffmpeg.exe).
+    4. Common Windows paths (C:\\ffmpeg\\bin\\ffmpeg.exe, C:\\ffmpeg\\ffmpeg.exe, etc.).
+    5. System PATH via shutil.which("ffmpeg") / shutil.which("ffmpeg.exe").
+    """
+    if custom_path:
+        cand = Path(custom_path)
+        if cand.is_file():
+            return str(cand.resolve())
+        which = shutil.which(custom_path)
+        if which:
+            return which
+        return None
+
+    candidates: List[Path] = []
+
+    for env_var in ("FFMPEG_PATH", "FFMPEG_BINARY", "FFMPEG_EXECUTABLE"):
+        val = os.environ.get(env_var)
+        if val:
+            candidates.append(Path(val))
+
+    # Current working dir and module dir
+    cwd = Path.cwd()
+    module_dir = Path(__file__).resolve().parent
+    repo_root = module_dir.parents[1]  # osu_mapper/dataset -> root
+
+    search_roots = [cwd, repo_root, module_dir]
+    relative_patterns = [
+        "ffmpeg/ffmpeg.exe",
+        "ffmpeg/bin/ffmpeg.exe",
+        "ffmpeg/ffmpeg",
+        "ffmpeg/bin/ffmpeg",
+        "bin/ffmpeg.exe",
+        "bin/ffmpeg",
+        "ffmpeg.exe",
+        "ffmpeg",
+    ]
+
+    for root in search_roots:
+        for rel in relative_patterns:
+            candidates.append(root / rel)
+
+    # Windows-specific typical install locations
+    if os.name == "nt" or sys.platform.startswith("win"):
+        candidates.extend([
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\ffmpeg\ffmpeg.exe"),
+            Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\Program Files\ffmpeg\ffmpeg.exe"),
+            Path(r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe"),
+        ])
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            candidates.extend([
+                Path(user_profile) / "ffmpeg" / "bin" / "ffmpeg.exe",
+                Path(user_profile) / "ffmpeg" / "ffmpeg.exe",
+                Path(user_profile) / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / "ffmpeg.exe",
+            ])
+
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand.resolve())
+        except Exception:
+            continue
+
+    # Fall back to PATH
+    which_exe = shutil.which("ffmpeg.exe")
+    if which_exe:
+        return which_exe
+    which_bin = shutil.which("ffmpeg")
+    if which_bin:
+        return which_bin
+
+    return None
 
 
 def keys_to_token(k0: int, k1: int, k2: int, k3: int) -> int:
@@ -115,8 +205,61 @@ def compute_mel_spectrogram(
     return log_mel.transpose(0, 1)
 
 
-def extract_audio_waveform(audio_bytes: bytes, file_ext: str = ".mp3", target_sr: int = 16000) -> Optional[torch.Tensor]:
-    """Decodes audio bytes (mp3, ogg, wav) to a 16kHz mono float32 PyTorch tensor using ffmpeg."""
+def extract_audio_waveform(
+    audio_bytes: bytes,
+    file_ext: str = ".mp3",
+    target_sr: int = 16000,
+    ffmpeg_path: Optional[str] = None,
+) -> Optional[torch.Tensor]:
+    """Decodes audio bytes (mp3, ogg, wav) to a 16kHz mono float32 PyTorch tensor using ffmpeg or wave."""
+    if np is None or torch is None:
+        raise ImportError(
+            "NumPy and PyTorch are required to decode audio waveforms. "
+            "Please install them via: pip install numpy torch"
+        )
+
+    # If audio is already a WAV file, decode natively with Python wave without external ffmpeg
+    if file_ext.lower() == ".wav":
+        try:
+            import io
+            import wave
+            import struct
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+                num_channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                in_sr = wf.getframerate()
+                num_frames = wf.getnframes()
+                raw_bytes = wf.readframes(num_frames)
+
+            if sample_width == 2:
+                total_samples = len(raw_bytes) // 2
+                ints = struct.unpack(f"<{total_samples}h", raw_bytes)
+                if num_channels == 1:
+                    samples = [x / 32768.0 for x in ints]
+                else:
+                    samples = [
+                        sum(ints[i : i + num_channels]) / (num_channels * 32768.0)
+                        for i in range(0, len(ints), num_channels)
+                    ]
+                arr = np.array(samples, dtype=np.float32)
+                if in_sr != target_sr:
+                    num_target = int(len(arr) * target_sr / in_sr)
+                    arr = np.interp(
+                        np.linspace(0, len(arr), num_target, endpoint=False),
+                        np.arange(len(arr)),
+                        arr,
+                    ).astype(np.float32)
+                return torch.from_numpy(arr)
+        except Exception:
+            pass  # fallback to ffmpeg
+
+    resolved_ffmpeg = find_ffmpeg(ffmpeg_path)
+    if not resolved_ffmpeg:
+        raise FileNotFoundError(
+            "FFmpeg не найден на компьютере! Невозможно декодировать сжатый аудиофайл (.mp3 / .ogg).\n"
+            "Пожалуйста, положите 'ffmpeg.exe' в папку 'ffmpeg/' проекта или укажите путь через параметр --ffmpeg."
+        )
+
     with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as in_file, \
          tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_wav:
         in_file.write(audio_bytes)
@@ -125,7 +268,7 @@ def extract_audio_waveform(audio_bytes: bytes, file_ext: str = ".mp3", target_sr
         out_wav.close()
 
         cmd = [
-            "ffmpeg",
+            resolved_ffmpeg,
             "-y",
             "-v", "error",
             "-i", in_file.name,
@@ -134,12 +277,20 @@ def extract_audio_waveform(audio_bytes: bytes, file_ext: str = ".mp3", target_sr
             "-f", "f32le",
             out_wav.name,
         ]
-        res = subprocess.run(cmd, capture_output=True)
         try:
+            res = subprocess.run(cmd, capture_output=True)
             if res.returncode == 0 and os.path.exists(out_wav.name) and os.path.getsize(out_wav.name) > 0:
                 raw_bytes = Path(out_wav.name).read_bytes()
                 samples = np.frombuffer(raw_bytes, dtype=np.float32)
                 return torch.from_numpy(samples.copy())
+            else:
+                stderr_msg = res.stderr.decode("utf-8", errors="ignore") if res.stderr else "Unknown error"
+                raise RuntimeError(f"FFmpeg decoding failed ({res.returncode}): {stderr_msg}")
+        except FileNotFoundError as fnf:
+            raise FileNotFoundError(
+                f"Не удалось запустить FFmpeg по пути '{resolved_ffmpeg}': [WinError 2]. "
+                "Проверьте, что файл существует и доступен для запуска."
+            ) from fnf
         finally:
             if os.path.exists(in_file.name):
                 os.unlink(in_file.name)
