@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -36,7 +35,6 @@ from osu_mapper.models import (
     ManiaPatternTransformer,
     SyncBPMOffsetModel,
     TransformerConfig,
-    snap_offset_to_audio_transients,
 )
 
 
@@ -225,24 +223,22 @@ def train_model_1_sync(
     checkpoint_dir: Path,
     is_song_level: bool = False,
     augment: bool = True,
-    stage: str = "all",
 ) -> Dict[str, Any]:
     """
     Trains Model 1: SyncBPMOffsetModel (Audio tempo and beat synchronization).
     Features high-efficiency small-dataset training:
-    - Decoupled BPM and Offset backbones to eliminate Multi-Task Interference.
-    - Discrete 241-class Cross-Entropy classification over integer BPMs (60..300 BPM).
-    - Staged training support (--stage bpm / --stage offset / --stage all).
-    - Cyclic Phase loss for downbeat offset (modulo beat length).
+    - Pitch-invariant Speed/Tempo perturbation (alpha in [0.75, 1.35])
+    - SpecAugment frequency band masking
+    - Soft-Argmax Gaussian smoothed CrossEntropy over 301 BPM bins + Smooth L1
+    - Cyclic Phase loss for downbeat offset (modulo beat length)
     """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 1: SyncBPMOffsetModel (BPM & Offset Sync)")
     print(f"  Mode: {'Song-Level (First 16s audio)' if is_song_level else 'Musical Chunks'}")
-    print(f"  Stage: {stage.upper()} ({'Pure BPM Classification' if stage == 'bpm' else 'Pure Offset' if stage == 'offset' else 'Staged Curriculum (BPM first, then Offset)'})")
-    print(f"  Augmentation: {'SpecAugment' if stage == 'bpm' else 'Speed Perturbation + SpecAugment' if augment else 'Disabled'}")
+    print(f"  Augmentation: {'Speed Perturbation [0.75..1.35x] + SpecAugment' if augment else 'Disabled'}")
     print("=" * 60)
 
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=128).to(device)
+    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
@@ -255,32 +251,17 @@ def train_model_1_sync(
         total_loss, total_bpm_err, total_phase_err = 0.0, 0.0, 0.0
         start_t = time.time()
 
-        # Staged curriculum weights:
-        if stage == "bpm":
-            bpm_weight = 1.0
-            offset_weight = 0.0
-        elif stage == "offset":
-            bpm_weight = 0.0
-            offset_weight = 1.0
-        else:  # all
-            bpm_weight = 1.0
-            # Smoothly ramp offset weight starting at epoch 5 up to 1.0 at epoch 15
-            offset_weight = 0.0 if epoch <= 5 else min(1.0, (epoch - 5) / 10.0)
-
         for batch in train_loader:
             audio_mel = batch["audio_mel"].to(device)
             target_bpm = batch["bpm"].to(device).squeeze(-1)
             target_offset = batch["offset_ms"].to(device).squeeze(-1)
 
-            # If training on mid-song chunks (e.g. train_data.pt), anchor target to this chunk's start
-            if not is_song_level and "start_ms" in batch:
-                chunk_start = batch["start_ms"].to(device)
-                beat_len_true = 60000.0 / (target_bpm + 1e-5)
-                target_offset = (target_offset - chunk_start) % beat_len_true
-
-            if augment and stage != "bpm" and epoch > 10 and torch.rand(1).item() > 0.4:
-                # 1. Pitch-Invariant Speed Perturbation: alpha in [0.90, 1.10]
-                alpha = float(torch.empty(1).uniform_(0.90, 1.10).item())
+            if augment:
+                # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.80, 1.25]
+                # Stretching audio in time (alpha > 1) makes music SLOWER, so BPM decreases (BPM / alpha).
+                # Compressing audio in time (alpha < 1) makes music FASTER, so BPM increases (BPM / alpha).
+                alpha = float(torch.empty(1).uniform_(0.80, 1.25).item())
+                # Resample along time axis: [B, T, 80] -> [B, 80, T]
                 mel_t = audio_mel.transpose(1, 2)
                 orig_T = mel_t.shape[-1]
                 new_T = max(32, int(round(orig_T * alpha)))
@@ -288,9 +269,7 @@ def train_model_1_sync(
                 if new_T >= orig_T:
                     audio_mel = mel_aug[:, :orig_T, :]
                 else:
-                    # Tile from beginning instead of silence padding to preserve rhythm continuity
-                    pad_len = orig_T - new_T
-                    pad = mel_aug[:, :pad_len, :]
+                    pad = torch.zeros(audio_mel.shape[0], orig_T - new_T, audio_mel.shape[2], device=device)
                     audio_mel = torch.cat([mel_aug, pad], dim=1)
 
                 target_bpm = torch.clamp(target_bpm / alpha, min=60.0, max=360.0)
@@ -302,37 +281,28 @@ def train_model_1_sync(
                     audio_mel[:, :, f_start:f_start + 8] = 0.0
 
             optimizer.zero_grad()
-            pred_bpm, pred_offset, bpm_logits, (u_cos, u_sin) = model(audio_mel, return_logits=True)
+            pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
             pred_bpm = pred_bpm.squeeze(-1)
             pred_offset = pred_offset.squeeze(-1)
 
-            # 3. Gaussian Smoothed Target Distribution over 241 BPM classes (sigma = 1.2 bins)
-            sigma = 1.2
-            bins = model.bpm_bins.unsqueeze(0)  # [1, 241]
+            # 3. Soft Gaussian smoothed Cross-Entropy loss over 301 BPM bins
+            bins = model.bpm_bins.unsqueeze(0)  # [1, 301]
+            sigma = 1.0
             target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
-            target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)
+            target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
             loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
+
+            # 4. Smooth L1 regression loss on continuous BPM
             loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
-            # 5. Differentiable Continuous Unit-Circle Phase Loss
+            # 5. Beat-Periodic Phase offset loss (modulo beat length)
             beat_len_true = 60000.0 / (target_bpm + 1e-5)
-            true_phase = target_offset % beat_len_true
-            theta_true = (true_phase / beat_len_true) * (2.0 * math.pi)
-            t_cos = torch.cos(theta_true)
-            t_sin = torch.sin(theta_true)
-
-            # Pure continuous cosine phase loss on unit circle vectors (no non-differentiable jump discontinuities):
-            loss_phase_cos = (1.0 - (u_cos.squeeze(-1) * t_cos + u_sin.squeeze(-1) * t_sin)).mean()
-
-            # Millisecond distance for metric reporting
-            pred_phase = pred_offset % beat_len_true
-            phase_diff = (pred_phase - true_phase).abs() % beat_len_true
+            phase_diff = (pred_offset - target_offset).abs() % beat_len_true
             phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
-            loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
+            loss_phase = (phase_dist / beat_len_true).mean()
+            loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
 
-            loss_offset = 0.10 * loss_phase_ms + 2.0 * loss_phase_cos
-
-            loss = bpm_weight * (loss_ce + 0.1 * loss_reg) + offset_weight * loss_offset
+            loss = loss_ce + 0.5 * loss_reg + 1.0 * loss_offset
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
@@ -343,7 +313,6 @@ def train_model_1_sync(
             total_phase_err += phase_dist.sum().item()
 
         scheduler.step()
-        cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - start_t
         train_loss = total_loss / len(train_loader.dataset)
         bpm_mae = total_bpm_err / len(train_loader.dataset)
@@ -351,68 +320,42 @@ def train_model_1_sync(
 
         # Validation (Evaluated on clean real data without speed perturbation)
         model.eval()
-        val_loss, val_bpm_err, val_phase_err, val_snapped_err = 0.0, 0.0, 0.0, 0.0
+        val_loss, val_bpm_err, val_phase_err = 0.0, 0.0, 0.0
         with torch.no_grad():
             for batch in val_loader:
                 audio_mel = batch["audio_mel"].to(device)
                 target_bpm = batch["bpm"].to(device).squeeze(-1)
                 target_offset = batch["offset_ms"].to(device).squeeze(-1)
-
-                if not is_song_level and "start_ms" in batch:
-                    chunk_start = batch["start_ms"].to(device)
-                    beat_len_true = 60000.0 / (target_bpm + 1e-5)
-                    target_offset = (target_offset - chunk_start) % beat_len_true
-
-                pred_bpm, pred_offset, bpm_logits, (u_cos, u_sin) = model(audio_mel, return_logits=True)
+                pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
                 pred_bpm = pred_bpm.squeeze(-1)
                 pred_offset = pred_offset.squeeze(-1)
 
-                # Gaussian Smoothed Target Distribution over 241 BPM classes
-                sigma = 1.2
                 bins = model.bpm_bins.unsqueeze(0)
+                sigma = 1.0
                 target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
-                target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)
+                target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
                 loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
                 loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
                 beat_len_true = 60000.0 / (target_bpm + 1e-5)
-                true_phase = target_offset % beat_len_true
-                theta_true = (true_phase / beat_len_true) * (2.0 * math.pi)
-                t_cos = torch.cos(theta_true)
-                t_sin = torch.sin(theta_true)
-
-                loss_phase_cos = (1.0 - (u_cos.squeeze(-1) * t_cos + u_sin.squeeze(-1) * t_sin)).mean()
-
-                pred_phase = pred_offset % beat_len_true
-                phase_diff = (pred_phase - true_phase).abs() % beat_len_true
+                phase_diff = (pred_offset - target_offset).abs() % beat_len_true
                 phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
-
-                loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
-                loss_offset = 0.10 * loss_phase_ms + 2.0 * loss_phase_cos
-
-                # Micro-transient snapped phase error
-                snapped_offset = snap_offset_to_audio_transients(
-                    audio_mel, pred_offset.unsqueeze(-1), pred_bpm.unsqueeze(-1)
-                ).squeeze(-1)
-                snapped_phase = snapped_offset % beat_len_true
-                snapped_diff = (snapped_phase - true_phase).abs() % beat_len_true
-                snapped_dist = torch.min(snapped_diff, beat_len_true - snapped_diff)
+                loss_phase = (phase_dist / beat_len_true).mean()
+                loss_offset = loss_phase + 0.0005 * F.smooth_l1_loss(pred_offset, target_offset)
 
                 B = audio_mel.shape[0]
-                val_loss += (bpm_weight * (loss_ce + 0.1 * loss_reg) + offset_weight * loss_offset).item() * B
+                val_loss += (loss_ce + 0.5 * loss_reg + 1.0 * loss_offset).item() * B
                 val_bpm_err += torch.abs(pred_bpm - target_bpm).sum().item()
                 val_phase_err += phase_dist.sum().item()
-                val_snapped_err += snapped_dist.sum().item()
 
         val_loss /= len(val_loader.dataset)
         val_mae = val_bpm_err / len(val_loader.dataset)
         val_phase_mae = val_phase_err / len(val_loader.dataset)
-        val_snapped_mae = val_snapped_err / len(val_loader.dataset)
 
         print(
-            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s | lr: {cur_lr:.6f}] "
-            f"Train: BPM MAE {bpm_mae:.2f}, Phase {phase_mae:.1f}ms | "
-            f"Val: BPM MAE {val_mae:.2f}, Phase {val_phase_mae:.1f}ms (Snapped: {val_snapped_mae:.1f}ms)"
+            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s] "
+            f"Train Loss: {train_loss:.2f} (BPM MAE: {bpm_mae:.2f}, Phase: {phase_mae:.1f}ms) | "
+            f"Val Loss: {val_loss:.2f} (BPM MAE: {val_mae:.2f}, Phase: {val_phase_mae:.1f}ms)"
         )
 
         history.append({"epoch": epoch, "val_loss": val_loss, "val_bpm_mae": val_mae, "val_phase_mae": val_phase_mae})
@@ -574,20 +517,13 @@ def main():
         default="3",
         help="Model choice: 1 (sync), 2 (dynamics), 3 (transformer), 4 (evaluator), or all",
     )
-    parser.add_argument(
-        "--stage",
-        type=str,
-        default="all",
-        choices=["all", "bpm", "offset"],
-        help="Model 1 training stage: 'bpm' (only BPM head), 'offset' (only Offset head), or 'all' (curriculum: BPM first, then Offset)",
-    )
     parser.add_argument("--device", "-d", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt")
-    parser.add_argument("--checkpoint_dir", "--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--epochs", "-e", type=int, default=50)
-    parser.add_argument("--batch_size", "--batch-size", "-b", type=int, default=16)
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--epochs", "-e", type=int, default=10)
+    parser.add_argument("--batch_size", "-b", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--val_split", "--val-split", type=float, default=0.1)
+    parser.add_argument("--val_split", type=float, default=0.1)
     args = parser.parse_args()
 
     # Create checkpoints dir
@@ -623,21 +559,8 @@ def main():
 
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
-        dataset_path = Path(args.dataset)
-        sync_cand = dataset_path.parent / "song_sync_data.pt"
-        if "song_sync" not in str(args.dataset).lower() and sync_cand.exists():
-            print(f"\n💡 [Model 1 Auto-Select] Dedicated whole-song sync dataset detected: '{sync_cand}'")
-            print("   Switching to 16s song-level audio for Model 1 (BPM & first downbeat sync).")
-            sync_ds = ManiaDataset(sync_cand)
-            v_size = max(1, int(len(sync_ds) * args.val_split))
-            t_size = len(sync_ds) - v_size
-            t_set, v_set = random_split(sync_ds, [t_size, v_size], generator=torch.Generator().manual_seed(42))
-            m1_train_loader = DataLoader(t_set, batch_size=min(args.batch_size, 16), shuffle=True, num_workers=0)
-            m1_val_loader = DataLoader(v_set, batch_size=min(args.batch_size, 16), shuffle=False, num_workers=0)
-            train_model_1_sync(m1_train_loader, m1_val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=True, stage=args.stage)
-        else:
-            is_song = "song_sync" in str(args.dataset).lower()
-            train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song, stage=args.stage)
+        is_song = "song_sync" in str(args.dataset).lower()
+        train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song)
     if target in ("2", "dynamics", "all"):
         train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
     if target in ("3", "transformer", "pattern", "all"):
