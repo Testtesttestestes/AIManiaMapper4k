@@ -258,7 +258,13 @@ def train_model_1_sync(
             target_bpm = batch["bpm"].to(device).squeeze(-1)
             target_offset = batch["offset_ms"].to(device).squeeze(-1)
 
-            if augment:
+            # If training on mid-song chunks (e.g. train_data.pt), anchor target to this chunk's start
+            if not is_song_level and "start_ms" in batch:
+                chunk_start = batch["start_ms"].to(device)
+                beat_len_true = 60000.0 / (target_bpm + 1e-5)
+                target_offset = (target_offset - chunk_start) % beat_len_true
+
+            if augment and torch.rand(1).item() > 0.4:
                 # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.80, 1.25]
                 # Stretching audio in time (alpha > 1) makes music SLOWER, so BPM decreases (BPM / alpha).
                 # Compressing audio in time (alpha < 1) makes music FASTER, so BPM increases (BPM / alpha).
@@ -283,7 +289,7 @@ def train_model_1_sync(
                     audio_mel[:, :, f_start:f_start + 8] = 0.0
 
             optimizer.zero_grad()
-            pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
+            pred_bpm, pred_offset, bpm_logits, (u_cos, u_sin) = model(audio_mel, return_logits=True)
             pred_bpm = pred_bpm.squeeze(-1)
             pred_offset = pred_offset.squeeze(-1)
 
@@ -297,20 +303,23 @@ def train_model_1_sync(
             # 4. Smooth L1 regression loss on continuous BPM
             loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
-            # 5. Pure High-Precision Cyclic Phase Loss (Modulo beat length, zero whole-beat penalty)
+            # 5. Differentiable Continuous Unit-Circle Phase Loss
             beat_len_true = 60000.0 / (target_bpm + 1e-5)
-            pred_phase = pred_offset % beat_len_true
             true_phase = target_offset % beat_len_true
+            theta_true = (true_phase / beat_len_true) * (2.0 * math.pi)
+            t_cos = torch.cos(theta_true)
+            t_sin = torch.sin(theta_true)
+
+            # Pure continuous cosine phase loss on unit circle vectors (no non-differentiable jump discontinuities):
+            loss_phase_cos = (1.0 - (u_cos.squeeze(-1) * t_cos + u_sin.squeeze(-1) * t_sin)).mean()
+
+            # Millisecond distance for metric reporting
+            pred_phase = pred_offset % beat_len_true
             phase_diff = (pred_phase - true_phase).abs() % beat_len_true
-            phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)  # in milliseconds
-
-            # SmoothL1 on milliseconds with beta=2.0 ms
+            phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
             loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
-            # Circular Cosine phase loss for global phase angle gradient
-            phase_rad = (phase_dist / beat_len_true) * (2.0 * math.pi)
-            loss_phase_cos = (1.0 - torch.cos(phase_rad)).mean()
 
-            loss_offset = 0.15 * loss_phase_ms + 2.0 * loss_phase_cos
+            loss_offset = 0.10 * loss_phase_ms + 2.0 * loss_phase_cos
 
             loss = loss_ce + 0.5 * loss_reg + 1.0 * loss_offset
             loss.backward()
@@ -337,7 +346,13 @@ def train_model_1_sync(
                 audio_mel = batch["audio_mel"].to(device)
                 target_bpm = batch["bpm"].to(device).squeeze(-1)
                 target_offset = batch["offset_ms"].to(device).squeeze(-1)
-                pred_bpm, pred_offset, bpm_logits = model(audio_mel, return_logits=True)
+
+                if not is_song_level and "start_ms" in batch:
+                    chunk_start = batch["start_ms"].to(device)
+                    beat_len_true = 60000.0 / (target_bpm + 1e-5)
+                    target_offset = (target_offset - chunk_start) % beat_len_true
+
+                pred_bpm, pred_offset, bpm_logits, (u_cos, u_sin) = model(audio_mel, return_logits=True)
                 pred_bpm = pred_bpm.squeeze(-1)
                 pred_offset = pred_offset.squeeze(-1)
 
@@ -349,15 +364,19 @@ def train_model_1_sync(
                 loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
                 beat_len_true = 60000.0 / (target_bpm + 1e-5)
-                pred_phase = pred_offset % beat_len_true
                 true_phase = target_offset % beat_len_true
+                theta_true = (true_phase / beat_len_true) * (2.0 * math.pi)
+                t_cos = torch.cos(theta_true)
+                t_sin = torch.sin(theta_true)
+
+                loss_phase_cos = (1.0 - (u_cos.squeeze(-1) * t_cos + u_sin.squeeze(-1) * t_sin)).mean()
+
+                pred_phase = pred_offset % beat_len_true
                 phase_diff = (pred_phase - true_phase).abs() % beat_len_true
                 phase_dist = torch.min(phase_diff, beat_len_true - phase_diff)
 
                 loss_phase_ms = F.smooth_l1_loss(phase_dist, torch.zeros_like(phase_dist), beta=2.0)
-                phase_rad = (phase_dist / beat_len_true) * (2.0 * math.pi)
-                loss_phase_cos = (1.0 - torch.cos(phase_rad)).mean()
-                loss_offset = 0.15 * loss_phase_ms + 2.0 * loss_phase_cos
+                loss_offset = 0.10 * loss_phase_ms + 2.0 * loss_phase_cos
 
                 # Micro-transient snapped phase error
                 snapped_offset = snap_offset_to_audio_transients(
@@ -585,8 +604,21 @@ def main():
 
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
-        is_song = "song_sync" in str(args.dataset).lower()
-        train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song)
+        dataset_path = Path(args.dataset)
+        sync_cand = dataset_path.parent / "song_sync_data.pt"
+        if "song_sync" not in str(args.dataset).lower() and sync_cand.exists():
+            print(f"\n💡 [Model 1 Auto-Select] Dedicated whole-song sync dataset detected: '{sync_cand}'")
+            print("   Switching to 16s song-level audio for Model 1 (BPM & first downbeat sync).")
+            sync_ds = ManiaDataset(sync_cand)
+            v_size = max(1, int(len(sync_ds) * args.val_split))
+            t_size = len(sync_ds) - v_size
+            t_set, v_set = random_split(sync_ds, [t_size, v_size], generator=torch.Generator().manual_seed(42))
+            m1_train_loader = DataLoader(t_set, batch_size=min(args.batch_size, 16), shuffle=True, num_workers=0)
+            m1_val_loader = DataLoader(v_set, batch_size=min(args.batch_size, 16), shuffle=False, num_workers=0)
+            train_model_1_sync(m1_train_loader, m1_val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=True)
+        else:
+            is_song = "song_sync" in str(args.dataset).lower()
+            train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song)
     if target in ("2", "dynamics", "all"):
         train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir)
     if target in ("3", "transformer", "pattern", "all"):
