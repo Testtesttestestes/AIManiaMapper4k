@@ -9,3 +9,5 @@ coverage/
 __pycache__/
 .pytest_cache/
 run_outputs/
+ffmpeg/ffmpeg.exe
+sample beatmaps/
