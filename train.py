@@ -264,7 +264,8 @@ def train_model_1_sync(
             offset_weight = 1.0
         else:  # all
             bpm_weight = 1.0
-            offset_weight = 0.0 if epoch <= 15 else 1.0
+            # Smoothly ramp offset weight starting at epoch 5 up to 1.0 at epoch 15
+            offset_weight = 0.0 if epoch <= 5 else min(1.0, (epoch - 5) / 10.0)
 
         for batch in train_loader:
             audio_mel = batch["audio_mel"].to(device)
@@ -277,12 +278,9 @@ def train_model_1_sync(
                 beat_len_true = 60000.0 / (target_bpm + 1e-5)
                 target_offset = (target_offset - chunk_start) % beat_len_true
 
-            if augment and stage != "bpm" and torch.rand(1).item() > 0.4:
-                # 1. Dynamic Pitch-Invariant Speed Perturbation: alpha in [0.80, 1.25]
-                # Stretching audio in time (alpha > 1) makes music SLOWER, so BPM decreases (BPM / alpha).
-                # Compressing audio in time (alpha < 1) makes music FASTER, so BPM increases (BPM / alpha).
-                alpha = float(torch.empty(1).uniform_(0.80, 1.25).item())
-                # Resample along time axis: [B, T, 80] -> [B, 80, T]
+            if augment and stage != "bpm" and epoch > 10 and torch.rand(1).item() > 0.4:
+                # 1. Pitch-Invariant Speed Perturbation: alpha in [0.90, 1.10]
+                alpha = float(torch.empty(1).uniform_(0.90, 1.10).item())
                 mel_t = audio_mel.transpose(1, 2)
                 orig_T = mel_t.shape[-1]
                 new_T = max(32, int(round(orig_T * alpha)))
@@ -290,7 +288,9 @@ def train_model_1_sync(
                 if new_T >= orig_T:
                     audio_mel = mel_aug[:, :orig_T, :]
                 else:
-                    pad = torch.zeros(audio_mel.shape[0], orig_T - new_T, audio_mel.shape[2], device=device)
+                    # Tile from beginning instead of silence padding to preserve rhythm continuity
+                    pad_len = orig_T - new_T
+                    pad = mel_aug[:, :pad_len, :]
                     audio_mel = torch.cat([mel_aug, pad], dim=1)
 
                 target_bpm = torch.clamp(target_bpm / alpha, min=60.0, max=360.0)
@@ -306,9 +306,12 @@ def train_model_1_sync(
             pred_bpm = pred_bpm.squeeze(-1)
             pred_offset = pred_offset.squeeze(-1)
 
-            # 3. Discrete Cross-Entropy loss over 241 BPM classes
-            target_class = torch.clamp(torch.round(target_bpm - model.bpm_min).long(), 0, model.num_bins - 1)
-            loss_ce = F.cross_entropy(bpm_logits, target_class, label_smoothing=0.02)
+            # 3. Gaussian Smoothed Target Distribution over 241 BPM classes (sigma = 1.2 bins)
+            sigma = 1.2
+            bins = model.bpm_bins.unsqueeze(0)  # [1, 241]
+            target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
+            target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)
+            loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
             loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
             # 5. Differentiable Continuous Unit-Circle Phase Loss
@@ -364,8 +367,12 @@ def train_model_1_sync(
                 pred_bpm = pred_bpm.squeeze(-1)
                 pred_offset = pred_offset.squeeze(-1)
 
-                target_class = torch.clamp(torch.round(target_bpm - model.bpm_min).long(), 0, model.num_bins - 1)
-                loss_ce = F.cross_entropy(bpm_logits, target_class, label_smoothing=0.02)
+                # Gaussian Smoothed Target Distribution over 241 BPM classes
+                sigma = 1.2
+                bins = model.bpm_bins.unsqueeze(0)
+                target_dist = torch.exp(- (bins - target_bpm.unsqueeze(1)) ** 2 / (2.0 * sigma ** 2))
+                target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)
+                loss_ce = - (target_dist * F.log_softmax(bpm_logits, dim=-1)).sum(dim=-1).mean()
                 loss_reg = F.smooth_l1_loss(pred_bpm, target_bpm)
 
                 beat_len_true = 60000.0 / (target_bpm + 1e-5)

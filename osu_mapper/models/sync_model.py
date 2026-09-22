@@ -18,53 +18,84 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DifferentiableAutocorr(nn.Module):
+class HarmonicTempogram(nn.Module):
     """
-    Extracts differentiable periodicity features from audio Mel spectrograms.
-    Computes spectral flux (onset strength envelope) and its multi-lag autocorrelation,
-    explicitly exposing periodic rhythm peaks (tempo) to the network.
+    Differentiable multi-band rhythm periodicity and tempogram resonance bank.
+    1. Computes onset spectral flux emphasizing low/mid rhythm transients (kick, snare, bass).
+    2. Calculates multi-lag autocorrelation via fast vectorized FFT.
+    3. Resamples autocorrelation directly into 241 candidate BPM bins (60..300 BPM)
+       at fundamental beat lag, 2-beat measure lag, and half-beat sub-harmonic lag.
     """
-    def __init__(self, min_lag: int = 8, max_lag: int = 96):
+    def __init__(self, bpm_min: float = 60.0, bpm_max: float = 300.0, num_bins: int = 241, hop_ms: float = 16.0):
         super().__init__()
-        self.min_lag = min_lag
-        self.max_lag = max_lag
-        self.num_lags = max_lag - min_lag
+        self.num_bins = num_bins
+        self.bpm_min = bpm_min
+        self.bpm_max = bpm_max
+        self.register_buffer("bpm_bins", torch.linspace(bpm_min, bpm_max, num_bins))
+
+        # Fundamental period in frames = (60000.0 / hop_ms) / bpm = 3750.0 / bpm
+        lags_fund = 3750.0 / self.bpm_bins
+        lags_double = 2.0 * lags_fund
+        lags_half = 0.5 * lags_fund
+
+        self.register_buffer("lags_fund", lags_fund)
+        self.register_buffer("lags_double", lags_double)
+        self.register_buffer("lags_half", lags_half)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         """
         Args:
             mel: [Batch, Channels=80, Time]
         Returns:
-            autocorr: [Batch, num_lags] normalized periodicity feature vector
+            tempogram: [Batch, num_bins] physical periodicity resonance for each BPM
         """
-        # Spectral flux: positive half-wave rectified difference over time
-        flux = F.relu(mel[:, :, 1:] - mel[:, :, :-1]).mean(dim=1, keepdim=True)  # [B, 1, T-1]
+        B, C, T = mel.shape
+        if T < 32:
+            return torch.zeros(B, self.num_bins, device=mel.device)
+
+        # Multi-band onset spectral flux: 70% low frequencies (kick/bass), 30% low-mids (snare body)
+        low_band = min(25, max(1, C // 3))
+        mid_band = min(50, max(low_band + 1, 2 * C // 3))
+        flux_low = F.relu(mel[:, :low_band, 1:] - mel[:, :low_band, :-1]).mean(dim=1)
+        flux_mid = F.relu(mel[:, low_band:mid_band, 1:] - mel[:, low_band:mid_band, :-1]).mean(dim=1)
+        flux = 0.7 * flux_low + 0.3 * flux_mid  # [B, T-1]
+
         flux_norm = flux - flux.mean(dim=-1, keepdim=True)
-        var = (flux_norm ** 2).mean(dim=-1, keepdim=True) + 1e-6
+        flux_std = torch.sqrt((flux_norm ** 2).mean(dim=-1, keepdim=True)) + 1e-6
+        flux_norm = flux_norm / flux_std
 
-        # Fast autocorrelation over candidate lags
-        B, _, T = flux_norm.shape
-        autocorr_list = []
-        for lag in range(self.min_lag, min(self.max_lag, T // 2)):
-            corr = (flux_norm[:, 0, :-lag] * flux_norm[:, 0, lag:]).mean(dim=-1, keepdim=True) / var[:, 0]
-            autocorr_list.append(corr)
+        # Fast FFT autocorrelation
+        n_fft = 2 ** math.ceil(math.log2(max(64, 2 * (T - 1))))
+        F_flux = torch.fft.rfft(flux_norm, n=n_fft, dim=-1)
+        R = torch.fft.irfft(torch.abs(F_flux) ** 2, n=n_fft, dim=-1)
+        max_lag = min(140, R.shape[-1])
+        R_slice = R[:, :max_lag]
+        R_norm = R_slice / (R_slice[:, 0:1] + 1e-6)  # [B, max_lag]
 
-        if not autocorr_list:
-            return torch.zeros(B, self.num_lags, device=mel.device)
+        # Vectorized linear lag interpolation
+        def _interp_lags(R_mat: torch.Tensor, lags: torch.Tensor) -> torch.Tensor:
+            i0 = torch.floor(lags).long().clamp(0, R_mat.shape[-1] - 2)
+            i1 = (i0 + 1).clamp(0, R_mat.shape[-1] - 1)
+            frac = (lags - i0.float()).unsqueeze(0)  # [1, num_bins]
+            v0 = torch.gather(R_mat, dim=1, index=i0.unsqueeze(0).expand(B, -1))
+            v1 = torch.gather(R_mat, dim=1, index=i1.unsqueeze(0).expand(B, -1))
+            return (1.0 - frac) * v0 + frac * v1
 
-        ac = torch.cat(autocorr_list, dim=-1)
-        if ac.shape[-1] < self.num_lags:
-            pad = torch.zeros(B, self.num_lags - ac.shape[-1], device=mel.device)
-            ac = torch.cat([ac, pad], dim=-1)
-        return ac[:, :self.num_lags]
+        r_fund = _interp_lags(R_norm, self.lags_fund)
+        r_double = _interp_lags(R_norm, self.lags_double)
+        r_half = _interp_lags(R_norm, self.lags_half)
+
+        # Harmonic combination: fundamental beat + 0.5 * 2-beat downbeat + 0.25 * half-beat
+        tempogram = r_fund + 0.5 * r_double + 0.25 * r_half  # [B, num_bins]
+        return tempogram
 
 
 class SyncBPMOffsetModel(nn.Module):
     """
     Decoupled Tempo (BPM) and Downbeat Offset synchronization network.
     Solves Multi-Task Interference by splitting into two independent specialized backbones:
-      1. BPM Tempo Backbone: Uses per-sample audio standardization, differentiable
-         autocorrelation tempogram, and 241-class discrete Cross-Entropy classification (60..300 BPM).
+      1. BPM Tempo Backbone: Uses HarmonicTempogram (FFT-based physical periodicity resonance)
+         refined by a 1D Octave ConvNet and local soft-argmax peak interpolation (60..300 BPM).
       2. Offset Transient Backbone: Uses high-resolution temporal convolutions to track
          micro-attack transients, unit-circle phase vector (cos, sin), and 4/4 downbeat bar position.
     """
@@ -73,50 +104,41 @@ class SyncBPMOffsetModel(nn.Module):
         self.audio_dim = audio_dim
         self.hidden_dim = hidden_dim
 
-        # Input audio normalization layer
-        self.in_norm = nn.BatchNorm1d(audio_dim)
-
-        # =========================================================================
-        # BRANCH 1: BPM TEMPO CLASSIFICATION BACKBONE (Independent weights)
-        # =========================================================================
-        self.autocorr = DifferentiableAutocorr(min_lag=8, max_lag=96)  # 88 lags (~40 to 450 BPM)
-        self.autocorr_proj = nn.Sequential(
-            nn.Linear(88, 64),
-            nn.GELU(),
-            nn.Linear(64, 64),
-            nn.GELU(),
-        )
-
-        self.bpm_conv = nn.Sequential(
-            nn.Conv1d(audio_dim, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Conv1d(128, 128, kernel_size=3, dilation=2, padding=2),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Conv1d(128, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Conv1d(128, 128, kernel_size=3, dilation=4, padding=4),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(4),
-        )
-
-        self.bpm_fc = nn.Sequential(
-            nn.Linear(128 * 4 + 64, 256),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(256, 128),
-            nn.GELU(),
-        )
-
         # Discrete classification over integer BPMs: 60..300 BPM (step 1.0 BPM -> 241 classes)
         self.bpm_min = 60.0
         self.bpm_max = 300.0
         self.num_bins = 241
         self.register_buffer("bpm_bins", torch.linspace(self.bpm_min, self.bpm_max, self.num_bins))
-        self.bpm_classifier = nn.Linear(128, self.num_bins)
+
+        # Input audio normalization layer
+        self.in_norm = nn.BatchNorm1d(audio_dim)
+
+        # =========================================================================
+        # BRANCH 1: BPM TEMPO BACKBONE (Harmonic Tempogram + 1D Conv Refinement)
+        # =========================================================================
+        self.tempogram = HarmonicTempogram(self.bpm_min, self.bpm_max, self.num_bins)
+
+        self.tempo_conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=9, padding=4),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Conv1d(32, 32, kernel_size=9, padding=4),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Conv1d(32, 1, kernel_size=9, padding=4),
+        )
+
+        self.bpm_audio_conv = nn.Sequential(
+            nn.Conv1d(audio_dim, 64, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(128, self.num_bins),
+        )
 
         # =========================================================================
         # BRANCH 2: OFFSET & PHASE TRANSIENT BACKBONE (Independent weights)
@@ -173,42 +195,23 @@ class SyncBPMOffsetModel(nn.Module):
         x_norm = self.in_norm(x_norm)
 
         # =========================================================================
-        # 1. BPM Prediction via Discrete Classification with Sub-Bin Peak Refinement
+        # 1. BPM Prediction via Harmonic Tempogram + 1D Conv Refinement
         # =========================================================================
-        ac_feat = self.autocorr(x_norm)
-        ac_emb = self.autocorr_proj(ac_feat)  # [B, 64]
+        raw_tempo = self.tempogram(x)  # [B, 241] physical periodicity resonance
+        tempo_refined = self.tempo_conv(raw_tempo.unsqueeze(1)).squeeze(1)  # [B, 241]
+        audio_bias = self.bpm_audio_conv(x_norm)  # [B, 241]
+        bpm_logits = raw_tempo + tempo_refined + 0.2 * audio_bias  # [B, 241]
 
-        h_bpm = self.bpm_conv(x_norm).flatten(1)  # [B, 128 * 4]
-        fused_bpm = torch.cat([h_bpm, ac_emb], dim=-1)
-        latent_bpm = self.bpm_fc(fused_bpm)
-        bpm_logits = self.bpm_classifier(latent_bpm)  # [B, 241]
-
-        # In training, we use soft expectation for continuous gradient flow;
-        # in eval or inference, we pick the highest class with parabolic sub-bin refinement
-        if self.training:
-            probs = F.softmax(bpm_logits / 0.20, dim=-1)
-            pred_bpm = (probs * self.bpm_bins.unsqueeze(0)).sum(dim=-1, keepdim=True)
-        else:
-            top_k = torch.argmax(bpm_logits, dim=-1)  # [B]
-            refined_bpms = []
-            for b_idx in range(x.shape[0]):
-                k = int(top_k[b_idx].item())
-                base_bpm = float(self.bpm_bins[k].item())
-                if 0 < k < self.num_bins - 1:
-                    y0 = float(bpm_logits[b_idx, k - 1].item())
-                    y1 = float(bpm_logits[b_idx, k].item())
-                    y2 = float(bpm_logits[b_idx, k + 1].item())
-                    denom = y0 - 2.0 * y1 + y2
-                    if abs(denom) > 1e-6 and y1 >= y0 and y1 >= y2:
-                        delta = 0.5 * (y0 - y2) / denom
-                        delta = max(-0.5, min(0.5, delta))
-                    else:
-                        delta = 0.0
-                else:
-                    delta = 0.0
-                refined_bpms.append(base_bpm + delta)
-            pred_bpm = torch.tensor(refined_bpms, device=x.device, dtype=torch.float32).unsqueeze(-1)
-
+        # Local soft-argmax around peak to ensure sub-bin precision without global mean collapse
+        top_k = torch.argmax(bpm_logits, dim=-1)  # [B]
+        B = x.shape[0]
+        k_clamped = torch.clamp(top_k, 2, self.num_bins - 3)
+        offsets = torch.tensor([-2, -1, 0, 1, 2], device=x.device).unsqueeze(0)  # [1, 5]
+        indices = k_clamped.unsqueeze(1) + offsets  # [B, 5]
+        local_logits = torch.gather(bpm_logits, dim=1, index=indices)  # [B, 5]
+        local_probs = F.softmax(local_logits, dim=-1)  # [B, 5]
+        local_bins = torch.gather(self.bpm_bins.unsqueeze(0).expand(B, -1), dim=1, index=indices)  # [B, 5]
+        pred_bpm = (local_probs * local_bins).sum(dim=-1, keepdim=True)  # [B, 1]
         pred_bpm = torch.clamp(pred_bpm, min=50.0, max=360.0)
 
         # =========================================================================
