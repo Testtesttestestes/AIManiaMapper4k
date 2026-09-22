@@ -3,23 +3,44 @@ Unit tests for the training pipeline, models, and feature extraction.
 """
 
 import unittest
-import torch
-from osu_mapper.models import (
-    SyncBPMOffsetModel,
-    DynamicsSVModel,
-    ManiaPatternTransformer,
-    DifficultyEvaluatorModel,
-    TransformerConfig,
-    keys_to_token,
-    token_to_keys,
-)
-from osu_mapper.dataset.feature_extractor import (
-    create_mel_filterbank,
-    compute_mel_spectrogram,
-)
+import os
+from pathlib import Path
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
+
+if TORCH_AVAILABLE:
+    from osu_mapper.models import (
+        SyncBPMOffsetModel,
+        DynamicsSVModel,
+        ManiaPatternTransformer,
+        DifficultyEvaluatorModel,
+        TransformerConfig,
+        keys_to_token,
+        token_to_keys,
+    )
+    from osu_mapper.dataset.feature_extractor import (
+        create_mel_filterbank,
+        compute_mel_spectrogram,
+        find_ffmpeg,
+    )
+else:
+    from osu_mapper.dataset.feature_extractor import find_ffmpeg
 
 
 class TestTrainingPipeline(unittest.TestCase):
+    def test_find_ffmpeg_detection(self):
+        """Verify find_ffmpeg correctly returns None or a valid binary without crashing."""
+        res = find_ffmpeg()
+        if res is not None:
+            self.assertTrue(isinstance(res, str))
+            self.assertTrue(len(res) > 0)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
     def test_token_encoding_decoding(self):
         """Verify 16-chord token bijection for 4K mania."""
         for token in range(16):
@@ -27,6 +48,7 @@ class TestTrainingPipeline(unittest.TestCase):
             re_token = keys_to_token(k0, k1, k2, k3)
             self.assertEqual(token, re_token)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
     def test_mel_filterbank_and_spectrogram(self):
         """Verify Mel filterbank generation and spectrogram computation."""
         fb = create_mel_filterbank(sr=16000, n_fft=512, n_mels=80)
@@ -37,6 +59,7 @@ class TestTrainingPipeline(unittest.TestCase):
         self.assertEqual(mel.shape[-1], 80)
         self.assertGreater(mel.shape[0], 0)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
     def test_all_four_models_forward(self):
         """Test forward passes for all 4 AI models."""
         B, T = 2, 64
