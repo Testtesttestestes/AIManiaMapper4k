@@ -2,9 +2,10 @@
 ManiaPatternTransformer architecture for osu!mania 4K beatmap generation.
 
 Features:
-- Mel-spectrogram audio feature projection
+- Mel-spectrogram audio feature projection with temporal lookahead context
 - Star Rating (1.0 to 9.9) continuous conditioning tensor
 - Causal autoregressive self-attention layers
+- Context Dropout (anti-cold-start regularization) during training
 - 16-class chord tokenization (2^4 = 16 discrete 4K key configurations)
 - Multi-head Long Note (LN) duration prediction
 """
@@ -51,6 +52,7 @@ class TransformerConfig:
     num_classes: int = 16        # 16 4K chord combinations
     max_seq_len: int = 1024      # Temporal context window length
     dropout: float = 0.1         # Dropout rate
+    context_dropout: float = 0.20 # Probability of zeroing/masking history during training
 
 
 if TORCH_AVAILABLE:
@@ -70,7 +72,8 @@ if TORCH_AVAILABLE:
 
     class ManiaPatternTransformer(nn.Module):
         """
-        PyTorch causal Transformer for osu!mania 4K pattern generation.
+        PyTorch Transformer for osu!mania 4K pattern generation.
+        Includes bidirectional temporal lookahead on audio and Context Dropout for cold-start mitigation.
         """
         def __init__(self, config: Optional[TransformerConfig] = None):
             super().__init__()
@@ -117,6 +120,7 @@ if TORCH_AVAILABLE:
             star_rating: Optional[torch.Tensor] = None,
             prev_tokens: Optional[torch.Tensor] = None,
             return_hidden: bool = False,
+            context_dropout: Optional[float] = None,
         ):
             """
             Args:
@@ -124,6 +128,7 @@ if TORCH_AVAILABLE:
                 star_rating: [Batch, 1] Continuous difficulty scalar (optional)
                 prev_tokens: [Batch, SeqLen] Previous chord tokens (0-15) (optional)
                 return_hidden: bool, if True returns hidden state [B, T, d_model]
+                context_dropout: Optional override for context dropout probability
             Returns:
                 hidden [Batch, SeqLen, d_model] if return_hidden or star_rating is None
                 otherwise (chord_logits, ln_logits)
@@ -136,8 +141,18 @@ if TORCH_AVAILABLE:
             else:
                 audio_feat = self.audio_proj(audio_mel)
 
+            # Context Dropout: during training, randomly zero-out history to prevent cold-start over-reliance
+            cd_prob = context_dropout if context_dropout is not None else (self.config.context_dropout if self.training else 0.0)
             if prev_tokens is not None:
-                tok_feat = self.token_embed(prev_tokens)
+                if self.training and cd_prob > 0.0:
+                    # Random batch-wide or prefix history dropout
+                    drop_mask = (torch.rand(B, 1, device=prev_tokens.device) < cd_prob).expand(B, T)
+                    effective_tokens = prev_tokens.clone()
+                    effective_tokens[drop_mask] = 0
+                    tok_feat = self.token_embed(effective_tokens)
+                    tok_feat[drop_mask] = 0.0
+                else:
+                    tok_feat = self.token_embed(prev_tokens)
             else:
                 tok_feat = torch.zeros_like(audio_feat)
 
@@ -159,38 +174,5 @@ if TORCH_AVAILABLE:
 
             chord_logits = self.chord_head(hidden)
             ln_logits = self.ln_head(hidden)
+
             return chord_logits, ln_logits
-
-else:
-    class ManiaPatternTransformer:
-        """
-        Architecture specification and pure-Python fallback interface
-        when PyTorch is not available in the current execution runtime.
-        """
-        def __init__(self, config: Optional[TransformerConfig] = None):
-            self.config = config or TransformerConfig()
-            self.is_torch_backed = False
-
-        def get_model_summary(self) -> Dict[str, Any]:
-            """Returns theoretical architecture parameters and sizing."""
-            return {
-                "name": "ManiaPatternTransformer",
-                "audio_dim": self.config.audio_dim,
-                "d_model": self.config.d_model,
-                "nhead": self.config.nhead,
-                "num_layers": self.config.num_layers,
-                "num_classes": self.config.num_classes,
-                "max_seq_len": self.config.max_seq_len,
-                "torch_available": False,
-                "estimated_parameters": (
-                    self.config.audio_dim * self.config.d_model
-                    + self.config.num_layers * (4 * self.config.d_model * self.config.d_model + 2 * self.config.d_model * self.config.dim_feedforward)
-                    + self.config.d_model * self.config.num_classes
-                ),
-            }
-
-        def forward(self, *args, **kwargs):
-            raise NotImplementedError(
-                "PyTorch is not installed in the current environment. "
-                "Install PyTorch (`pip install torch`) to run live neural inference."
-            )

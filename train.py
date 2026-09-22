@@ -192,6 +192,7 @@ def train_model_3_transformer(
     checkpoint_dir: Path,
     timing_source: str = "map",
     resume_path: Optional[str] = None,
+    context_dropout: float = 0.20,
 ) -> Dict[str, Any]:
     """
     Trains Model 3: ManiaPatternTransformer (Causal Autoregressive Pattern Generator).
@@ -199,11 +200,13 @@ def train_model_3_transformer(
       preventing error compounding from Model 1 (Teacher Forcing).
     - timing_source="model1": Evaluates/trains using Model 1 AI predicted alignment.
     - resume_path: Resumes training exactly from previous checkpoint (weights, optimizer, epoch).
+    - context_dropout: Probability of zeroing/masking history during training to eliminate cold start.
     """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 3: ManiaPatternTransformer (Hit Object Synthesis)")
     source_desc = "ORIGINAL BEATMAP GROUND TRUTH (Direct from .osu — zero Model 1 drift)" if timing_source == "map" else "MODEL 1 CASCADED TIMING (AI Sync Inferred)"
     print(f"  Timing & Data Source: {source_desc}")
+    print(f"  Context Dropout:      {context_dropout * 100:.0f}% (Anti-Cold-Start Regularization)")
     print("=" * 60)
 
     cfg = TransformerConfig(
@@ -215,6 +218,7 @@ def train_model_3_transformer(
         num_classes=16,
         max_seq_len=512,
         dropout=0.1,
+        context_dropout=context_dropout,
     )
     model = ManiaPatternTransformer(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -846,6 +850,12 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument(
+        "--context_dropout",
+        type=float,
+        default=0.20,
+        help="Probability of dropping/zeroing history tokens during Model 3 training to mitigate cold-start (default 0.20).",
+    )
+    parser.add_argument(
         "--resume",
         "-r",
         nargs="?",
@@ -904,7 +914,7 @@ def main():
     if target in ("2", "dynamics", "all"):
         train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target)
     if target in ("3", "transformer", "pattern", "all"):
-        train_model_3_transformer(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target)
+        train_model_3_transformer(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout)
     if target in ("4", "evaluator", "sr", "all"):
         train_model_4_evaluator(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, resume_path=resume_target)
 
