@@ -23,6 +23,28 @@ class TimingPoint:
     uninherited: int = 1  # 1 for Red line (BPM), 0 for Green line (SV)
     effects: int = 0
 
+    def __init__(
+        self,
+        time: float = 0.0,
+        beat_length: float = 500.0,
+        meter: int = 4,
+        sample_set: int = 1,
+        sample_index: int = 0,
+        volume: int = 70,
+        uninherited: int | bool = 1,
+        effects: int = 0,
+        time_ms: Optional[float] = None,
+        slider_velocity: Optional[float] = None,
+    ):
+        self.time = float(time_ms if time_ms is not None else time)
+        self.beat_length = float(beat_length)
+        self.meter = int(meter)
+        self.sample_set = int(sample_set)
+        self.sample_index = int(sample_index)
+        self.volume = int(volume)
+        self.uninherited = 1 if (uninherited is True or uninherited == 1) else 0
+        self.effects = int(effects)
+
     def to_osu_line(self) -> str:
         """Formats the timing point into standard osu! v14 line syntax."""
         return (
