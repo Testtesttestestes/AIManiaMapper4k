@@ -5,7 +5,9 @@ param (
     [int]$Epochs = 15,
     [int]$BatchSize = 16,
     [float]$Lr = 0.0002,
-    [string]$TimingSource = "map"
+    [string]$TimingSource = "map",
+    [switch]$Resume,
+    [string]$ResumeFrom = ""
 )
 
 Write-Host "======================================================================" -ForegroundColor Cyan
@@ -14,8 +16,17 @@ Write-Host "====================================================================
 Write-Host " Model:       $Model (1=Sync, 2=Dynamics, 3=Transformer, 4=Evaluator, all)"
 Write-Host " Device:      $Device"
 Write-Host " Data Source: $TimingSource (map = Ground Truth .osu, model1 = Cascaded Sync)"
+Write-Host " Resume:      $(if ($ResumeFrom -ne "") { "From $ResumeFrom" } elseif ($Resume) { "Auto (checkpoints/)" } else { "Disabled (Fresh start)" })"
 Write-Host " Epochs:      $Epochs"
 Write-Host " Batch Size:  $BatchSize"
 Write-Host " LR:          $Lr"
 
-python train.py --model $Model --device $Device --epochs $Epochs --batch_size $BatchSize --lr $Lr --timing_source $TimingSource
+$extraArgs = @()
+if ($ResumeFrom -ne "") {
+    $extraArgs += "--resume"
+    $extraArgs += $ResumeFrom
+} elseif ($Resume) {
+    $extraArgs += "--resume"
+}
+
+python train.py --model $Model --device $Device --epochs $Epochs --batch_size $BatchSize --lr $Lr --timing_source $TimingSource @extraArgs

@@ -141,5 +141,59 @@ class TestTrainingPipeline(unittest.TestCase):
         self.assertEqual(float(model1_chunks[0]["offset_ms"].item()), 30.0)
 
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
+    def test_checkpoint_resume_backward_compatibility(self):
+        """Test that load_checkpoint_state correctly and seamlessly loads legacy and new checkpoints."""
+        import tempfile
+        from train import load_checkpoint_state, find_resume_checkpoint
+
+        cfg = TransformerConfig(audio_dim=80, d_model=32, nhead=2, num_layers=1, dim_feedforward=64)
+        model = ManiaPatternTransformer(cfg)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            # 1. Legacy Checkpoint (No optimizer_state)
+            legacy_ckpt_file = tmp_path / "model_3_transformer_best.pt"
+            torch.save({
+                "epoch": 7,
+                "model_state": model.state_dict(),
+                "best_val_loss": 0.421,
+            }, legacy_ckpt_file)
+
+            # Test finding
+            found = find_resume_checkpoint(tmp_path, "model_3_transformer")
+            self.assertEqual(found, legacy_ckpt_file)
+
+            # Test loading legacy
+            loaded_epoch, loaded_best, _ = load_checkpoint_state(
+                legacy_ckpt_file, model, optimizer=optimizer
+            )
+            self.assertEqual(loaded_epoch, 7)
+            self.assertAlmostEqual(loaded_best, 0.421, places=3)
+
+            # 2. Modern Checkpoint (With optimizer_state, history, etc.)
+            new_ckpt_file = tmp_path / "model_3_transformer_last.pt"
+            torch.save({
+                "epoch": 14,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "best_val_loss": 0.315,
+                "history": [{"epoch": 1, "val_loss": 0.9}],
+            }, new_ckpt_file)
+
+            # Auto search prefers _last.pt over _best.pt
+            found_latest = find_resume_checkpoint(tmp_path, "model_3_transformer")
+            self.assertEqual(found_latest, new_ckpt_file)
+
+            loaded_epoch2, loaded_best2, ckpt_dict = load_checkpoint_state(
+                new_ckpt_file, model, optimizer=optimizer
+            )
+            self.assertEqual(loaded_epoch2, 14)
+            self.assertAlmostEqual(loaded_best2, 0.315, places=3)
+            self.assertEqual(len(ckpt_dict.get("history", [])), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
