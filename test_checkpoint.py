@@ -340,8 +340,8 @@ def main():
     parser.add_argument("--checkpoint", "-c", type=str, default=None, help="Path to .pt checkpoint file (defaults to checkpoints/model_X_..._best.pt)")
     parser.add_argument("--audio", "-a", type=str, default=None, help="Path to audio file (.wav, .mp3, .ogg, .flac)")
     parser.add_argument("--dataset", "-d", type=str, default=None, help="Path to train_data.pt dataset for evaluation")
-    parser.add_argument("--num_samples", "-n", type=int, default=5, help="Number of dataset samples to evaluate")
-    parser.add_argument("--sr", "--star_rating", type=float, default=4.0, help="Star rating conditioning for Model 3")
+    parser.add_argument("--num_samples", "--num-samples", "-n", type=int, default=5, help="Number of dataset samples to evaluate")
+    parser.add_argument("--sr", "--star_rating", "--star-rating", type=float, default=4.0, help="Star rating conditioning for Model 3")
     parser.add_argument("--device", type=str, default="auto", help="Execution device: auto, cpu, cuda, gpu, mps")
 
     args = parser.parse_args()
