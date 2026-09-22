@@ -70,7 +70,8 @@ class HarmonicTempogram(nn.Module):
         R = torch.fft.irfft(torch.abs(F_flux) ** 2, n=n_fft, dim=-1)
         max_lag = min(140, R.shape[-1])
         R_slice = R[:, :max_lag]
-        R_norm = R_slice / (R_slice[:, 0:1] + 1e-6)  # [B, max_lag]
+        R_norm = R_slice / torch.clamp(R_slice[:, 0:1].abs(), min=1e-6)  # [B, max_lag]
+        R_norm = torch.nan_to_num(R_norm, nan=0.0, posinf=1.0, neginf=0.0)
 
         # Vectorized linear lag interpolation
         def _interp_lags(R_mat: torch.Tensor, lags: torch.Tensor) -> torch.Tensor:
@@ -201,6 +202,7 @@ class SyncBPMOffsetModel(nn.Module):
         tempo_refined = self.tempo_conv(raw_tempo.unsqueeze(1)).squeeze(1)  # [B, 241]
         audio_bias = self.bpm_audio_conv(x_norm)  # [B, 241]
         bpm_logits = raw_tempo + tempo_refined + 0.2 * audio_bias  # [B, 241]
+        bpm_logits = torch.nan_to_num(bpm_logits, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # Local soft-argmax around peak to ensure sub-bin precision without global mean collapse
         top_k = torch.argmax(bpm_logits, dim=-1)  # [B]
@@ -212,6 +214,7 @@ class SyncBPMOffsetModel(nn.Module):
         local_probs = F.softmax(local_logits, dim=-1)  # [B, 5]
         local_bins = torch.gather(self.bpm_bins.unsqueeze(0).expand(B, -1), dim=1, index=indices)  # [B, 5]
         pred_bpm = (local_probs * local_bins).sum(dim=-1, keepdim=True)  # [B, 1]
+        pred_bpm = torch.nan_to_num(pred_bpm, nan=120.0, posinf=300.0, neginf=60.0)
         pred_bpm = torch.clamp(pred_bpm, min=50.0, max=360.0)
 
         # =========================================================================
@@ -232,6 +235,7 @@ class SyncBPMOffsetModel(nn.Module):
 
         beat_len_ms = 60000.0 / (pred_bpm + 1e-5)
         pred_offset = (expected_beat + phi) * beat_len_ms
+        pred_offset = torch.nan_to_num(pred_offset, nan=0.0, posinf=0.0, neginf=0.0)
         pred_offset = torch.clamp(pred_offset, min=0.0)
 
         if return_logits:
@@ -260,32 +264,44 @@ def snap_offset_to_audio_transients(
     else:
         mel = audio_mel
 
+    mel = torch.nan_to_num(mel, nan=0.0, posinf=1.0, neginf=-1.0)
+
     # Compute onset strength envelope (spectral flux)
     flux = F.relu(mel[:, :, 1:] - mel[:, :, :-1]).mean(dim=1)  # [B, T-1]
     B, T = flux.shape
-    beat_len_ms = 60000.0 / (bpm.squeeze(-1) + 1e-5)
+    if T < 2:
+        return offset_ms
+
+    safe_bpm = torch.nan_to_num(bpm, nan=120.0, posinf=300.0, neginf=60.0).clamp(min=30.0, max=400.0)
+    beat_len_ms = 60000.0 / (safe_bpm.squeeze(-1) + 1e-5)
 
     refined = []
     for b in range(B):
-        cur_off = float(offset_ms[b].squeeze().item())
+        raw_off = float(offset_ms[b].squeeze().item()) if offset_ms.dim() > 0 else float(offset_ms.item())
+        cur_off = raw_off if not (math.isnan(raw_off) or math.isinf(raw_off)) else 0.0
+        
         b_len = float(beat_len_ms[b].item()) if beat_len_ms.dim() > 0 else float(beat_len_ms.item())
+        if math.isnan(b_len) or math.isinf(b_len) or b_len <= 0.0:
+            refined.append(cur_off)
+            continue
+
         cur_flux = flux[b]
 
         # Beat period in frames
         beat_frames = b_len / frame_ms
-        if beat_frames < 2.0 or beat_frames > T:
+        if math.isnan(beat_frames) or math.isinf(beat_frames) or beat_frames < 2.0 or beat_frames > T:
             refined.append(cur_off)
             continue
 
         # 1. Global Pulse Comb Filter over candidate phase offsets in [0, beat_frames)
         # Search at fine resolution (0.25 frame ~= 4.0 ms)
-        max_phase_frames = int(math.ceil(beat_frames))
+        max_phase_frames = max(1, int(math.ceil(beat_frames)))
         num_steps = max(24, max_phase_frames * 4)
         cand_phases = [i * (beat_frames / num_steps) for i in range(num_steps)]
 
         best_comb_score = -1e9
         best_phase_frame = 0.0
-        num_beats_to_sum = min(32, int(T / beat_frames))
+        num_beats_to_sum = min(32, max(1, int(T / max(beat_frames, 1.0))))
 
         for cand_p in cand_phases:
             score = 0.0
@@ -293,8 +309,10 @@ def snap_offset_to_audio_transients(
             for k in range(num_beats_to_sum):
                 f_idx = int(round(cand_p + k * beat_frames))
                 if 0 <= f_idx < T:
-                    score += float(cur_flux[f_idx].item())
-                    count += 1
+                    val = float(cur_flux[f_idx].item())
+                    if not (math.isnan(val) or math.isinf(val)):
+                        score += val
+                        count += 1
             if count > 0:
                 score /= count
                 # Prior bias: slightly prefer the phase closest to neural net's prediction
@@ -342,6 +360,9 @@ def snap_offset_to_audio_transients(
         # 3. Combine with integer whole-beat offset from neural network prediction
         whole_beats = round((cur_off - (cur_off % b_len)) / b_len)
         final_offset_ms = whole_beats * b_len + (best_transient_ms % b_len)
-        refined.append(final_offset_ms)
+        if math.isnan(final_offset_ms) or math.isinf(final_offset_ms):
+            refined.append(cur_off)
+        else:
+            refined.append(final_offset_ms)
 
     return torch.tensor(refined, device=offset_ms.device, dtype=offset_ms.dtype).unsqueeze(-1)
