@@ -174,13 +174,21 @@ def test_model_1_dataset(
     model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256)
     meta = load_model_checkpoint(checkpoint_path, model, device)
 
+    # For Model 1, prefer the dedicated whole-song sync dataset if available
+    dataset_p = Path(dataset_path)
+    sync_cand = dataset_p.parent / "song_sync_data.pt"
+    if "song_sync" not in str(dataset_path).lower() and sync_cand.exists():
+        print(f"💡 [Model 1 Auto-Select] Dedicated whole-song sync dataset detected: '{sync_cand}'")
+        print("   Testing Model 1 against whole-song 16s audio tracks.")
+        dataset_path = sync_cand
+
     print(f"[Dataset] Loading dataset: {dataset_path}")
     try:
         dataset: List[Dict[str, Any]] = torch.load(dataset_path, map_location="cpu", weights_only=False)
     except TypeError:
         dataset = torch.load(dataset_path, map_location="cpu")
     total_chunks = len(dataset)
-    print(f"[Dataset] Total chunks in dataset: {total_chunks}")
+    print(f"[Dataset] Total samples in dataset: {total_chunks}")
 
     num_eval = min(num_samples, total_chunks)
     step = max(1, total_chunks // num_eval)
@@ -203,6 +211,13 @@ def test_model_1_dataset(
         true_bpm = float(item["bpm"].squeeze().item())
         true_off = float(item["offset_ms"].squeeze().item())
 
+        # Downbeat phase modulo beat duration
+        beat_len = 60000.0 / (true_bpm + 1e-5)
+        # If evaluating a mid-song chunk (from train_data.pt), calibrate target offset to chunk start
+        if "start_ms" in item:
+            chunk_start = float(item["start_ms"])
+            true_off = (true_off - chunk_start) % beat_len
+
         with torch.no_grad():
             bpm_out, off_out = model(mel)
             pred_bpm = float(bpm_out.squeeze().item())
@@ -212,8 +227,6 @@ def test_model_1_dataset(
         bpm_err = abs(pred_bpm - true_bpm)
         off_err = abs(pred_off - true_off)
 
-        # Downbeat phase error modulo beat duration
-        beat_len = 60000.0 / (true_bpm + 1e-5)
         phase_diff = abs(pred_off - true_off) % beat_len
         phase_err = min(phase_diff, beat_len - phase_diff)
 
