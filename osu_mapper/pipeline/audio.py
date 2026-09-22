@@ -268,3 +268,54 @@ def analyze_audio_rhythm(wav_path: str) -> AudioRhythmResult:
         onsets_ms=onsets,
         rms_profile=rms_profile,
     )
+
+
+def predict_bpm_offset_with_model(
+    wav_path: str,
+    checkpoint_path: str,
+    device: str = "auto",
+) -> Tuple[float, int]:
+    """
+    Uses trained SyncBPMOffsetModel (Model 1) to regress BPM and downbeat offset (ms) directly
+    from the audio Mel spectrogram representation.
+    """
+    try:
+        import torch
+        from osu_mapper.models.sync_model import SyncBPMOffsetModel
+        from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
+    except ImportError as e:
+        raise RuntimeError(f"PyTorch is required for model-driven rhythm prediction: {e}")
+
+    if device == "auto":
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        dev = torch.device(device)
+
+    model = SyncBPMOffsetModel()
+    checkpoint = torch.load(checkpoint_path, map_location=dev)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+
+    model.to(dev)
+    model.eval()
+
+    # Extract audio waveform and compute Mel spectrogram
+    audio = extract_audio_waveform(wav_path, target_sr=16000)
+    mel = compute_mel_spectrogram(audio, sr=16000, n_mels=80)
+
+    # Use first sequence window (up to 1024 frames = ~16s)
+    seq_len = min(1024, mel.shape[0])
+    inp = mel[:seq_len].unsqueeze(0).to(dev)  # [1, seq_len, 80]
+
+    with torch.no_grad():
+        bpm_out, offset_out = model(inp)
+        pred_bpm = float(bpm_out.squeeze().item())
+        pred_offset = int(round(float(offset_out.squeeze().item())))
+
+    pred_bpm = max(45.0, min(360.0, pred_bpm))
+    pred_offset = max(0, pred_offset)
+    return pred_bpm, pred_offset

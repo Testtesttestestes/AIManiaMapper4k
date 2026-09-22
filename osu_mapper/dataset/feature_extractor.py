@@ -482,3 +482,133 @@ def quantize_beatmap_to_grid(
         torch.from_numpy(ln_active),
         torch.from_numpy(sv_curve),
     )
+
+
+def slice_beatmap_into_musical_chunks(
+    mel: torch.Tensor,
+    tokens: torch.Tensor,
+    ln_active: torch.Tensor,
+    sv_curve: torch.Tensor,
+    details: ParsedBeatmapDetails,
+    chunk_size: int = 256,
+    hop_size: int = 128,
+    frame_ms: float = 16.0,
+    align_mode: str = "beat",
+    bars_per_step: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Slices beatmap audio representations and tokens into synchronized training/inference chunks.
+
+    Parameters:
+    - align_mode="beat" (Default):
+        Audio slices are strictly synchronized to the song's Offset and BPM.
+        Each chunk begins on an exact musical downbeat (beat 1 of a measure/square):
+        t_start = first_bar_ms + bar_idx * (bars_per_step * bar_len_ms).
+        This guarantees zero phase drift and aligns Model 3's context with Model 1 (BPM/Offset)
+        and Model 2 (SV Dynamics).
+        Also preserves autoregressive context ('prev_tokens') from the preceding measures/squares.
+
+    - align_mode="frame":
+        Fallback unaligned sliding window advancing by fixed frame increments (hop_size).
+    """
+    num_frames = mel.shape[0]
+    chunks: List[Dict[str, Any]] = []
+
+    if align_mode == "beat":
+        bpm = max(30.0, float(details.bpm))
+        beat_len_ms = 60000.0 / bpm
+        bar_len_ms = 4.0 * beat_len_ms  # 1 measure / ход (in 4/4)
+
+        # Align to first non-negative musical bar start
+        offset_ms = float(details.offset_ms)
+        first_bar_ms = offset_ms
+        while first_bar_ms >= bar_len_ms:
+            first_bar_ms -= bar_len_ms
+        while first_bar_ms < 0:
+            first_bar_ms += bar_len_ms
+
+        step_idx = 0
+        while True:
+            chunk_start_ms = first_bar_ms + step_idx * (bars_per_step * bar_len_ms)
+            start_frame = int(round(chunk_start_ms / frame_ms))
+            end_frame = start_frame + chunk_size
+
+            if end_frame > num_frames:
+                break
+
+            if start_frame >= 0:
+                chunk_mel = mel[start_frame:end_frame]
+                chunk_tok = tokens[start_frame:end_frame]
+                chunk_ln = ln_active[start_frame:end_frame]
+                chunk_sv = sv_curve[start_frame:end_frame]
+
+                # Retain autoregressive context of previous measures/squares
+                prev_start_frame = start_frame - chunk_size
+                if prev_start_frame >= 0:
+                    prev_tok = tokens[prev_start_frame:start_frame].clone()
+                else:
+                    if start_frame > 0:
+                        valid = tokens[0:start_frame]
+                        pad = torch.zeros(chunk_size - len(valid), dtype=torch.int64)
+                        prev_tok = torch.cat([pad, valid])
+                    else:
+                        prev_tok = torch.zeros(chunk_size, dtype=torch.int64)
+
+                chunks.append({
+                    "audio_mel": chunk_mel,
+                    "tokens": chunk_tok,
+                    "prev_tokens": prev_tok,
+                    "ln_mask": chunk_ln,
+                    "sv_curve": chunk_sv,
+                    "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
+                    "bpm": torch.tensor([details.bpm], dtype=torch.float32),
+                    "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                    "start_ms": round(chunk_start_ms, 2),
+                    "end_ms": round(chunk_start_ms + chunk_size * frame_ms, 2),
+                    "bar_index": step_idx * bars_per_step,
+                    "beat_len_ms": round(beat_len_ms, 2),
+                })
+
+            step_idx += 1
+
+        if not chunks and num_frames >= chunk_size:
+            # Fallback to frame mode if beat-anchoring yielded 0 windows
+            return slice_beatmap_into_musical_chunks(
+                mel, tokens, ln_active, sv_curve, details, chunk_size, hop_size, frame_ms, align_mode="frame"
+            )
+
+    else:  # "frame" mode
+        for start_idx in range(0, num_frames - chunk_size + 1, hop_size):
+            end_idx = start_idx + chunk_size
+            chunk_mel = mel[start_idx:end_idx]
+            chunk_tok = tokens[start_idx:end_idx]
+            chunk_ln = ln_active[start_idx:end_idx]
+            chunk_sv = sv_curve[start_idx:end_idx]
+
+            prev_start = start_idx - chunk_size
+            if prev_start >= 0:
+                prev_tok = tokens[prev_start:start_idx].clone()
+            else:
+                if start_idx > 0:
+                    valid = tokens[0:start_idx]
+                    pad = torch.zeros(chunk_size - len(valid), dtype=torch.int64)
+                    prev_tok = torch.cat([pad, valid])
+                else:
+                    prev_tok = torch.zeros(chunk_size, dtype=torch.int64)
+
+            chunks.append({
+                "audio_mel": chunk_mel,
+                "tokens": chunk_tok,
+                "prev_tokens": prev_tok,
+                "ln_mask": chunk_ln,
+                "sv_curve": chunk_sv,
+                "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
+                "bpm": torch.tensor([details.bpm], dtype=torch.float32),
+                "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                "start_ms": round(start_idx * frame_ms, 2),
+                "end_ms": round(end_idx * frame_ms, 2),
+                "bar_index": 0,
+                "beat_len_ms": round(60000.0 / max(30.0, float(details.bpm)), 2),
+            })
+
+    return chunks

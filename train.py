@@ -131,9 +131,12 @@ def train_model_3_transformer(
             ln_mask = batch["ln_mask"].to(device)           # [B, T, 4]
             star_rating = batch["star_rating"].to(device)   # [B, 1]
 
-            # Autoregressive target: input is shifted tokens with 0 start token
+            # Autoregressive target: input is shifted tokens seeded with prior square/measure context
             prev_tok = torch.roll(tokens, shifts=1, dims=1)
-            prev_tok[:, 0] = 0
+            if "prev_tokens" in batch:
+                prev_tok[:, 0] = batch["prev_tokens"].to(device)[:, -1]
+            else:
+                prev_tok[:, 0] = 0
 
             optimizer.zero_grad()
             chord_logits, ln_logits = model(audio_mel, star_rating=star_rating, prev_tokens=prev_tok)
@@ -170,7 +173,10 @@ def train_model_3_transformer(
                 star_rating = batch["star_rating"].to(device)
 
                 prev_tok = torch.roll(tokens, shifts=1, dims=1)
-                prev_tok[:, 0] = 0
+                if "prev_tokens" in batch:
+                    prev_tok[:, 0] = batch["prev_tokens"].to(device)[:, -1]
+                else:
+                    prev_tok[:, 0] = 0
 
                 c_logits, l_logits = model(audio_mel, star_rating=star_rating, prev_tokens=prev_tok)
                 B, T, C = c_logits.shape
