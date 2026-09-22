@@ -91,6 +91,27 @@ class TestTrainingPipeline(unittest.TestCase):
         pred_sr = m4(tokens)
         self.assertEqual(pred_sr.shape, (B, 1))
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed in test environment")
+    def test_snap_offset_to_audio_transients_robustness(self):
+        """Verify transient snapping handles standard, extreme, and NaN inputs safely."""
+        from osu_mapper.models.sync_model import snap_offset_to_audio_transients
+        B, T = 2, 64
+        mel = torch.randn(B, T, 80)
+        offset = torch.tensor([[150.0], [250.0]])
+        bpm = torch.tensor([[140.0], [180.0]])
+
+        # Normal input
+        res = snap_offset_to_audio_transients(mel, offset, bpm)
+        self.assertEqual(res.shape, (B, 1))
+        self.assertFalse(torch.isnan(res).any())
+
+        # NaN / Inf inputs
+        nan_bpm = torch.tensor([[float('nan')], [200.0]])
+        nan_offset = torch.tensor([[float('nan')], [100.0]])
+        res_nan = snap_offset_to_audio_transients(mel, nan_offset, nan_bpm)
+        self.assertEqual(res_nan.shape, (B, 1))
+        self.assertFalse(torch.isnan(res_nan).any())
+
 
 if __name__ == "__main__":
     unittest.main()
