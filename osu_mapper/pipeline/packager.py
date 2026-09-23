@@ -135,24 +135,48 @@ class BeatmapPackager:
         """
         Creates an .osz ZIP archive bundling the .osu difficulty and the audio file.
         """
+        return self.package_multi_diff_osz(
+            diff_items=[(self.meta, osu_content)],
+            audio_source_path=audio_source_path,
+            output_osz_path=output_osz_path,
+        )
+
+    @staticmethod
+    def package_multi_diff_osz(
+        diff_items: List[Tuple[BeatmapMetadata, str]],
+        audio_source_path: str,
+        output_osz_path: str,
+    ) -> Path:
+        """
+        Bundles MULTIPLE .osu difficulty files and the shared audio track into a single .osz archive.
+        """
         out_path = Path(output_osz_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         audio_src = Path(audio_source_path)
-        audio_name = self.meta.audio_filename or audio_src.name
-
-        # Filename for .osu inside the archive: "Artist - Title (Creator) [Difficulty].osu"
-        safe_artist = "".join(c for c in self.meta.artist if c.isalnum() or c in " -_").strip()
-        safe_title = "".join(c for c in self.meta.title if c.isalnum() or c in " -_").strip()
-        safe_diff = "".join(c for c in self.meta.version if c.isalnum() or c in " -_").strip()
-        safe_creator = "".join(c for c in self.meta.creator if c.isalnum() or c in " -_").strip()
-
-        osu_filename = f"{safe_artist} - {safe_title} ({safe_creator}) [{safe_diff}].osu"
+        first_meta = diff_items[0][0] if diff_items else BeatmapMetadata()
+        audio_name = first_meta.audio_filename or audio_src.name
 
         with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            # Write .osu file
-            z.writestr(osu_filename, osu_content.encode("utf-8"))
-            # Copy audio file
+            # Write all difficulty files
+            used_filenames = set()
+            for meta, osu_content in diff_items:
+                safe_artist = "".join(c for c in meta.artist if c.isalnum() or c in " -_").strip() or "AI Artist"
+                safe_title = "".join(c for c in meta.title if c.isalnum() or c in " -_").strip() or "AI Track"
+                safe_diff = "".join(c for c in meta.version if c.isalnum() or c in " -_[]*.").strip() or "Normal"
+                safe_creator = "".join(c for c in meta.creator if c.isalnum() or c in " -_").strip() or "AIManiaMapper"
+
+                base_name = f"{safe_artist} - {safe_title} ({safe_creator}) [{safe_diff}].osu"
+                final_name = base_name
+                counter = 2
+                while final_name in used_filenames:
+                    final_name = f"{safe_artist} - {safe_title} ({safe_creator}) [{safe_diff}_{counter}].osu"
+                    counter += 1
+                used_filenames.add(final_name)
+
+                z.writestr(final_name, osu_content.encode("utf-8"))
+
+            # Copy audio file once
             if audio_src.exists():
                 z.write(audio_src, arcname=audio_name)
 
