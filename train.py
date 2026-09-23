@@ -264,6 +264,8 @@ def train_model_3_transformer(
                 tokens = batch["tokens"].to(device)             # [B, T]
                 ln_mask = batch["ln_mask"].to(device)           # [B, T, 4]
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
+                lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
+                grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
 
                 # Autoregressive target: shifted tokens seeded with prior measure context
                 prev_tok = torch.roll(tokens, shifts=1, dims=1)
@@ -272,8 +274,21 @@ def train_model_3_transformer(
                 else:
                     prev_tok[:, 0] = 0
 
+                # Shifted lane states for autoregression
+                if lane_states is not None:
+                    prev_lane = torch.roll(lane_states, shifts=1, dims=1)
+                    prev_lane[:, 0] = 0
+                else:
+                    prev_lane = None
+
                 optimizer.zero_grad()
-                chord_logits, ln_logits = model(audio_mel, star_rating=star_rating, prev_tokens=prev_tok)
+                chord_logits, ln_logits = model(
+                    audio_mel,
+                    star_rating=star_rating,
+                    prev_tokens=prev_tok,
+                    lane_states=prev_lane,
+                    grid_metrics=grid_metrics,
+                )
 
                 # Chord loss (16 classes)
                 B, T, C = chord_logits.shape
@@ -305,6 +320,8 @@ def train_model_3_transformer(
                     tokens = batch["tokens"].to(device)
                     ln_mask = batch["ln_mask"].to(device)
                     star_rating = batch["star_rating"].to(device)
+                    lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
+                    grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
 
                     prev_tok = torch.roll(tokens, shifts=1, dims=1)
                     if "prev_tokens" in batch:
@@ -312,7 +329,19 @@ def train_model_3_transformer(
                     else:
                         prev_tok[:, 0] = 0
 
-                    c_logits, l_logits = model(audio_mel, star_rating=star_rating, prev_tokens=prev_tok)
+                    if lane_states is not None:
+                        prev_lane = torch.roll(lane_states, shifts=1, dims=1)
+                        prev_lane[:, 0] = 0
+                    else:
+                        prev_lane = None
+
+                    c_logits, l_logits = model(
+                        audio_mel,
+                        star_rating=star_rating,
+                        prev_tokens=prev_tok,
+                        lane_states=prev_lane,
+                        grid_metrics=grid_metrics,
+                    )
                     B, T, C = c_logits.shape
                     l_c = criterion_chord(c_logits.view(B * T, C), tokens.view(B * T))
                     l_l = criterion_ln(l_logits, ln_mask)

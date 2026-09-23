@@ -8,6 +8,7 @@ from osu_mapper.pipeline.pattern_generator import (
     generate_patterns,
     get_star_rating_params,
     token_to_keys,
+    compute_audio_sustain_duration,
 )
 
 
@@ -64,7 +65,6 @@ class TestStarRatingAndTiming(unittest.TestCase):
             seed=42,
         )
 
-        # 1.0* must be strictly singles with low note count
         nps_1 = len(objects_1_star) / (duration_ms / 1000.0)
         nps_5 = len(objects_5_star) / (duration_ms / 1000.0)
 
@@ -81,6 +81,13 @@ class TestStarRatingAndTiming(unittest.TestCase):
             time_to_notes.setdefault(obj.start_time, []).append(obj)
         for t, notes in time_to_notes.items():
             self.assertEqual(len(notes), 1, f"Found chord of size {len(notes)} at {t}ms in 1.0* map!")
+
+    def test_audio_sustain_duration_quantization(self):
+        """Verify that LN hold duration is quantized to exact musical beat fractions."""
+        beat_len_ms = 500.0  # 120 BPM
+        sustain_1 = compute_audio_sustain_duration([], 0, beat_len_ms)
+        # 120 BPM -> beat_len=500ms -> 1/2 beat is 250ms, 1/1 beat is 500ms
+        self.assertIn(sustain_1, [250, 375, 500, 750, 1000])
 
     def test_token_to_keys_bijection(self):
         """Test token decoding for 4K columns."""

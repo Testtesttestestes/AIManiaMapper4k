@@ -4,12 +4,14 @@ Timing points and Slider Velocity (SV) dynamics generator for osu!mania 4K.
 Generates:
 - Uninherited Timing Points (Red lines): fundamental tempo and time signature
 - Inherited Timing Points (Green lines): dynamic SV speed adjustments responding to RMS audio intensity
+- Musical Grid Snapper: snaps notes to exact fractional beat ticks (1/1, 1/2, 1/3, 1/4, 1/6, 1/8).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -59,22 +61,46 @@ class TimingPoint:
         )
 
 
+def snap_to_musical_grid(
+    raw_time_ms: int | float,
+    bpm: float,
+    offset_ms: int | float,
+    divisors: Tuple[int, ...] = (1, 2, 4, 3, 6, 8),
+    max_snap_dist_ms: float = 24.0,
+) -> int:
+    """
+    Snaps a continuous or frame-based timestamp strictly to the closest musical beat divisor tick.
+    Prevents micro-phase jitter (early/late notes) during rhythm game playback.
+    """
+    beat_len = 60000.0 / max(1.0, bpm)
+    rel_time = raw_time_ms - offset_ms
+
+    best_tick = raw_time_ms
+    min_dist = float("inf")
+
+    for div in divisors:
+        step = beat_len / float(div)
+        k = round(rel_time / step)
+        cand_time = offset_ms + k * step
+        dist = abs(cand_time - raw_time_ms)
+        if dist < min_dist:
+            min_dist = dist
+            best_tick = cand_time
+
+    if min_dist <= max_snap_dist_ms:
+        return int(round(best_tick))
+    return int(round(raw_time_ms))
+
+
 def generate_timing_points(
     bpm: float,
     offset_ms: int,
     duration_ms: int,
-    rms_profile: List[Tuple[int, float]] = None,
+    rms_profile: Optional[List[Tuple[int, float]]] = None,
     sv_dynamic_intensity: float = 0.25,
 ) -> List[TimingPoint]:
     """
     Constructs uninherited BPM point and inherited SV timing points throughout the song.
-    
-    Args:
-        bpm: Tempo in beats per minute.
-        offset_ms: Millisecond of the first beat.
-        duration_ms: Song duration in milliseconds.
-        rms_profile: List of (time_ms, normalized_rms) tuples.
-        sv_dynamic_intensity: Depth of SV fluctuation (0.0 = static 1.0x SV, 0.3 = 0.85x to 1.3x).
     """
     beat_length = 60000.0 / max(1.0, bpm)
     points: List[TimingPoint] = []
@@ -93,27 +119,20 @@ def generate_timing_points(
     points.append(base_point)
 
     # 2. Inherited SV timing points (Green Lines) across bars
-    # In mania, 1 measure = 4 beats. We place SV changes every 2 to 4 measures or at significant RMS shifts.
     measure_length_ms = beat_length * 4.0
     if rms_profile and duration_ms > measure_length_ms:
-        # Group RMS values per measure
         current_time = offset_ms
         prev_sv = 1.0
 
         while current_time < duration_ms:
-            # Find average RMS in the upcoming measure
             m_end = current_time + measure_length_ms
             relevant_rms = [rms for (t, rms) in rms_profile if current_time <= t < m_end]
             avg_rms = (sum(relevant_rms) / len(relevant_rms)) if relevant_rms else 0.5
 
-            # Map normalized RMS (0.0 - 1.0) to SV multiplier (e.g. 0.85x to 1.25x)
-            # base = 1.0
             sv_mult = 1.0 + (avg_rms - 0.5) * (2.0 * sv_dynamic_intensity)
             sv_mult = max(0.75, min(1.40, round(sv_mult, 2)))
 
-            # If SV changed substantially from previous, emit inherited point
             if abs(sv_mult - prev_sv) >= 0.05 or current_time == offset_ms:
-                # osu! format: beatLength = -100.0 / sv_multiplier
                 sv_beat_length = -100.0 / sv_mult
                 vol = max(40, min(100, int(60 + avg_rms * 40)))
                 kiai = 1 if avg_rms > 0.8 else 0
@@ -132,6 +151,6 @@ def generate_timing_points(
                 )
                 prev_sv = sv_mult
 
-            current_time += int(round(measure_length_ms * 2))  # adjust every 2 measures
+            current_time += int(round(measure_length_ms * 2))
 
     return points
