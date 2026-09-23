@@ -231,6 +231,8 @@ def main():
     parser.add_argument("--creator", type=str, default="AIManiaMapper", help="Beatmap creator name")
     parser.add_argument("--bpm", type=float, default=None, help="Manual BPM override (takes precedence over AI sync)")
     parser.add_argument("--offset", type=int, default=None, help="Manual offset in ms override (takes precedence over AI sync)")
+    parser.add_argument("--mode", type=str, choices=["auto", "neural", "algorithmic"], default="auto", help="Pattern generation mode: 'neural' (Model 3 Transformer), 'algorithmic' (mathematical generator), or 'auto' (neural if weights available)")
+    parser.add_argument("--neural", action="store_true", help="Force neural pattern generation via Model 3 Transformer (fails with instructions if weights missing)")
     parser.add_argument("--model3_checkpoint", "--checkpoint", "-c", type=str, default=None, help="Path to Model 3 (ManiaPatternTransformer) .pt weights")
     parser.add_argument("--sync_checkpoint", type=str, default=None, help="Path to Model 1 (SyncBPMOffsetModel) .pt weights")
     parser.add_argument("--output", "-o", type=str, default="output_beatmaps/generated_map.osz", help="Output .osz file path")
@@ -331,6 +333,12 @@ def main():
 
     sr_display = ", ".join(f"{s:.2f}*" for s in sr_list)
 
+    # Determine pattern generation mode
+    force_neural = args.neural or (args.mode == "neural")
+    prefer_algorithmic = (args.mode == "algorithmic")
+
+    mode_display = "Neural (Model 3 Transformer)" if force_neural else ("Algorithmic (Heuristic)" if prefer_algorithmic else "Auto (Neural if weights exist)")
+
     print("\n" + "=" * 65)
     print(" 🎮 OSU!MANIA 4K AI BEATMAP GENERATOR (MODEL 3 TRANSFORMER)")
     print("=" * 65)
@@ -338,6 +346,7 @@ def main():
     print(f"  • Song Title:     {final_title}")
     print(f"  • Artist:         {final_artist}")
     print(f"  • Difficulties:   {len(sr_list)} diff(s) -> [{sr_display}]")
+    print(f"  • Generation Mode:{mode_display}")
     print(f"  • BPM:            {f'{final_bpm:.2f} (Preset/Manual)' if final_bpm else 'Auto Sync Inference'}")
     print(f"  • Offset:         {f'{final_offset} ms (Preset/Manual)' if final_offset is not None else 'Auto Sync Inference'}")
     print(f"  • Model 3 Weights:{args.model3_checkpoint or 'Auto (checkpoints/model_3_transformer_best.pt)'}")
@@ -358,6 +367,8 @@ def main():
             sync_model_checkpoint=args.sync_checkpoint,
             pattern_model_checkpoint=args.model3_checkpoint,
             existing_timing_points=template_timing_points,
+            force_neural=force_neural,
+            prefer_algorithmic=prefer_algorithmic,
             seed=args.seed,
         )
 
