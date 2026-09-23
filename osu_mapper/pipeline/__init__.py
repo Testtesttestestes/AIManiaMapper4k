@@ -32,6 +32,8 @@ def generate_beatmap_pipeline(
     dynamics_model_checkpoint: Optional[str] = None,
     pattern_model_checkpoint: Optional[str] = None,
     existing_timing_points: Optional[List[TimingPoint]] = None,
+    force_neural: bool = False,
+    prefer_algorithmic: bool = False,
     seed: int = 42,
     device: str = "auto",
 ) -> Tuple[List[str], str, AudioRhythmResult]:
@@ -122,21 +124,31 @@ def generate_beatmap_pipeline(
 
     # Step 3: Model 3 (ManiaPatternTransformer) Neural Pattern Synthesis
     m3_ckpt = pattern_model_checkpoint
-    if m3_ckpt is None:
+    if m3_ckpt is None and not prefer_algorithmic:
         for cand in (Path("checkpoints/model_3_transformer_best.pt"), Path("checkpoints/model_3_transformer_last.pt")):
             if cand.exists():
                 m3_ckpt = str(cand)
                 break
 
+    if force_neural and (m3_ckpt is None or not Path(m3_ckpt).exists()):
+        raise FileNotFoundError(
+            f"Neural generation was requested (--neural), but Model 3 checkpoint was not found!\n"
+            f"Expected file: checkpoints/model_3_transformer_best.pt (or specify with -c <path>).\n"
+            f"To train Model 3 weights first, run:\n"
+            f"  python train.py --model transformer --epochs 15"
+        )
+
     # Pre-extract spectrogram once for all difficulties
     mel = None
-    if m3_ckpt and Path(m3_ckpt).exists():
+    if m3_ckpt and Path(m3_ckpt).exists() and not prefer_algorithmic:
         try:
             from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
             audio_wav = extract_audio_waveform(wav_path, target_sr=16000)
             if audio_wav is not None:
                 mel = compute_mel_spectrogram(audio_wav, sr=16000, n_mels=80)
         except Exception as ex:
+            if force_neural:
+                raise RuntimeError(f"Failed to extract audio spectrogram for neural generation: {ex}")
             print(f"[Mel Extraction] Note: {ex}")
 
     diff_packages: List[Tuple[BeatmapMetadata, str]] = []
@@ -147,7 +159,7 @@ def generate_beatmap_pipeline(
         hit_objects: List[ManiaHitObject] = []
         used_neural = False
 
-        if m3_ckpt and Path(m3_ckpt).exists() and mel is not None:
+        if m3_ckpt and Path(m3_ckpt).exists() and mel is not None and not prefer_algorithmic:
             try:
                 hit_objects = generate_patterns_with_model3(
                     checkpoint_path=m3_ckpt,
@@ -158,7 +170,10 @@ def generate_beatmap_pipeline(
                     star_rating=sr,
                 )
                 used_neural = True
+                print(f"✨ [Model 3 Transformer] Successfully generated {len(hit_objects)} neural hit objects.")
             except Exception as err:
+                if force_neural:
+                    raise RuntimeError(f"Neural pattern generation failed: {err}")
                 print(f"⚠️ [Model 3 Warning] Neural pattern synthesis failed ({err}), falling back to algorithmic generation.")
 
         if not used_neural or not hit_objects:
