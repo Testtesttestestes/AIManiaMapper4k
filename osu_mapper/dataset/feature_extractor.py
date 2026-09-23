@@ -206,17 +206,24 @@ def compute_mel_spectrogram(
 
 
 def extract_audio_waveform(
-    audio_bytes: bytes,
+    audio_input: bytes | str | Path,
     file_ext: str = ".mp3",
     target_sr: int = 16000,
     ffmpeg_path: Optional[str] = None,
 ) -> Optional[torch.Tensor]:
-    """Decodes audio bytes (mp3, ogg, wav) to a 16kHz mono float32 PyTorch tensor using ffmpeg or wave."""
+    """Decodes audio bytes or file path (mp3, ogg, wav) to a 16kHz mono float32 PyTorch tensor using ffmpeg or wave."""
     if np is None or torch is None:
         raise ImportError(
             "NumPy and PyTorch are required to decode audio waveforms. "
             "Please install them via: pip install numpy torch"
         )
+
+    if isinstance(audio_input, (str, Path)):
+        p = Path(audio_input)
+        file_ext = p.suffix.lower()
+        audio_bytes = p.read_bytes()
+    else:
+        audio_bytes = audio_input
 
     # If audio is already a WAV file, decode natively with Python wave without external ffmpeg
     if file_ext.lower() == ".wav":
