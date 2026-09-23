@@ -2,10 +2,13 @@
 Pattern generation module for osu!mania 4K.
 
 Generates playable 4K hit objects conditioned on target Star Rating (1.0 to 9.9):
-- Neural Pattern Generation: Model 3 (ManiaPatternTransformer) with continuous Star Rating conditioning,
-  Anti-Cold-Start Lead-in Padding, and sliding context window.
-- Algorithmic Fallback: Accurate Star-Rating scaling (1.0* Easy to 9.9* Expert), ergonomic lane assignment,
-  and transient synchronization.
+- Neural Pattern Generation: Model 3 (ManiaPatternTransformer) with:
+  * Bidirectional deep audio Cross-Attention across full 80-bin frequency spectrum.
+  * Musical Grid Metric embeddings (1/1, 1/2, 1/3, 1/4, 1/6, 1/8 beat ticks, downbeat phase).
+  * Autoregressive 4-Lane physical state conditioning (Free, Tap, Hold Sustain, Release).
+  * Acoustic silence gating and spectral-sustained LN release prediction.
+- Algorithmic Generator: Star-Rating scaling (1.0* Easy to 9.9* Expert), ergonomic lane distribution,
+  and musical beat tick alignment.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from osu_mapper.pipeline.timing import snap_to_musical_grid
 
 try:
     import torch
@@ -73,7 +78,6 @@ def get_star_rating_params(star_rating: float) -> dict:
     sr = max(1.0, min(9.9, star_rating))
 
     if sr < 1.8:
-        # Easy / Beginner 1.0* - 1.8*
         target_nps = 0.8 + (sr - 1.0) * 0.9  # 0.8 - 1.5 NPS
         max_chord_size = 1
         chord_weights = [1.0, 0.0, 0.0, 0.0]
@@ -83,7 +87,6 @@ def get_star_rating_params(star_rating: float) -> dict:
         ln_prob = 0.0
         min_note_gap_ms = 450
     elif sr < 3.0:
-        # Normal 1.8* - 3.0*
         target_nps = 1.6 + (sr - 1.8) * 1.2  # 1.6 - 3.0 NPS
         max_chord_size = 2
         chord_weights = [0.90, 0.10, 0.0, 0.0]
@@ -93,7 +96,6 @@ def get_star_rating_params(star_rating: float) -> dict:
         ln_prob = 0.08
         min_note_gap_ms = 180
     elif sr < 4.8:
-        # Hard 3.0* - 4.8*
         target_nps = 3.0 + (sr - 3.0) * 2.0  # 3.0 - 6.6 NPS
         max_chord_size = 3
         chord_weights = [0.65, 0.28, 0.07, 0.0]
@@ -103,7 +105,6 @@ def get_star_rating_params(star_rating: float) -> dict:
         ln_prob = 0.12
         min_note_gap_ms = 70
     elif sr < 7.0:
-        # Insane 4.8* - 7.0*
         target_nps = 6.6 + (sr - 4.8) * 2.5  # 6.6 - 12.1 NPS
         max_chord_size = 3
         chord_weights = [0.45, 0.38, 0.15, 0.02]
@@ -113,7 +114,6 @@ def get_star_rating_params(star_rating: float) -> dict:
         ln_prob = 0.16
         min_note_gap_ms = 40
     else:
-        # Extra / Expert 7.0* - 9.9*
         target_nps = 12.0 + (sr - 7.0) * 3.0 # 12.0 - 20.7+ NPS
         max_chord_size = 4
         chord_weights = [0.25, 0.45, 0.24, 0.06]
@@ -136,6 +136,55 @@ def get_star_rating_params(star_rating: float) -> dict:
     }
 
 
+def compute_audio_sustain_duration(
+    mel: Any,
+    start_frame: int,
+    beat_len_ms: float,
+    frame_ms: float = 16.0,
+    max_beats: float = 2.0,
+) -> int:
+    """
+    Measures the continuous acoustic spectral sustain tail of a melodic note/vocal
+    and quantizes the release to the closest musical fraction (1/4, 1/2, 3/4, 1/1, 3/2, 2/1 beat).
+    """
+    total_frames = mel.shape[0] if hasattr(mel, "shape") else len(mel)
+    if start_frame >= total_frames - 2:
+        return int(round(beat_len_ms))
+
+    step_1_4 = beat_len_ms / 4.0
+    candidate_ticks = [
+        int(round(step_1_4 * 2)),   # 1/2 beat
+        int(round(step_1_4 * 3)),   # 3/4 beat
+        int(round(beat_len_ms)),     # 1/1 beat
+        int(round(beat_len_ms * 1.5)), # 3/2 beat
+        int(round(beat_len_ms * 2.0)), # 2/1 beat
+    ]
+
+    max_frames_lookahead = min(int((beat_len_ms * max_beats) / frame_ms), total_frames - start_frame)
+    if max_frames_lookahead <= 4:
+        return candidate_ticks[0]
+
+    try:
+        if hasattr(mel, "device"):
+            mid_slice = mel[start_frame : start_frame + max_frames_lookahead, 20:60]
+            energies = mid_slice.mean(dim=-1).cpu().numpy()
+        else:
+            energies = [0.0] * max_frames_lookahead
+        
+        start_energy = energies[0] if len(energies) > 0 else 1.0
+        sustain_frames = max_frames_lookahead
+        for f, e in enumerate(energies):
+            if (e - start_energy) < -1.5:
+                sustain_frames = f
+                break
+        
+        sustain_ms = sustain_frames * frame_ms
+        best_tick = min(candidate_ticks, key=lambda t: abs(t - sustain_ms))
+        return best_tick
+    except Exception:
+        return candidate_ticks[0]
+
+
 def generate_patterns_with_model3(
     checkpoint_path: str | Path,
     audio_mel: Any,  # torch.Tensor [Total_T, 80]
@@ -151,11 +200,10 @@ def generate_patterns_with_model3(
     Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
     
     Features:
-    1. Lead-in Silence Padding: Pre-pads silence so transformer positional encoding and audio attention
-       are warmed up before the first beat (mitigating cold start).
-    2. Overlapping History Window: Seamlessly preserves token history across chunk boundaries.
-    3. Natural High-Precision Timing: Preserves raw 16ms temporal stream density without destructive
-       quantization, while respecting requested Star Rating density and chord caps.
+    1. Deep Audio Cross-Attention: attends directly to all 80 audio frequency bins.
+    2. Musical Metric Grid Conditioning: Ingests beat divisors (1/1, 1/2, 1/3, 1/4, 1/8) & downbeat phase.
+    3. Autoregressive 4-Lane State Dynamics: Ingests real-time Free/Tap/Hold/Release state of each key.
+    4. Audio-Sustained Musical LN Duration: Releases hold notes on exact musical ticks aligned with audio energy.
     """
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for Model 3 neural inference.")
@@ -188,7 +236,8 @@ def generate_patterns_with_model3(
     orig_total_frames = audio_mel.shape[0]
     sr_tensor = torch.tensor([[star_rating]], dtype=torch.float32, device=dev)
     beat_len_ms = 60000.0 / max(1.0, bpm)
-    step_1_4_ms = beat_len_ms / 4.0
+    bar_len_ms = beat_len_ms * 4.0
+    frame_ms = 16.0
 
     sr_params = get_star_rating_params(star_rating)
     max_allowed_chord = sr_params["max_chord_size"]
@@ -199,36 +248,70 @@ def generate_patterns_with_model3(
     padded_mel = torch.cat([lead_in, audio_mel], dim=0)
     total_padded_frames = padded_mel.shape[0]
 
-    hit_objects: List[ManiaHitObject] = []
-    column_busy_until = [0, 0, 0, 0]
-    last_note_any_lane = -9999
+    # Precalculate Musical Grid Metrics across all padded frames
+    grid_metrics_np = []
+    for f in range(total_padded_frames):
+        orig_f = f - warmup_lead_in_frames
+        t_ms = orig_f * frame_ms
+        rel_ms = t_ms - offset_ms
 
+        bar_phase = (rel_ms % bar_len_ms) / bar_len_ms if bar_len_ms > 0 else 0.0
+        dist_downbeat = abs(rel_ms % bar_len_ms)
+        is_downbeat = 1.0 if (dist_downbeat < 16.0 or abs(dist_downbeat - bar_len_ms) < 16.0) else 0.0
+
+        best_div = 0.0
+        min_delta = 999.0
+        for div in (1, 2, 4, 3, 6, 8):
+            step = beat_len_ms / float(div)
+            cand_dist = abs(rel_ms % step)
+            dist = min(cand_dist, abs(cand_dist - step))
+            if dist < min_delta and dist <= (frame_ms * 0.75):
+                min_delta = dist
+                best_div = float(div)
+        grid_metrics_np.append([best_div, float(bar_phase), is_downbeat])
+
+    padded_grid_metrics = torch.tensor(grid_metrics_np, dtype=torch.float32, device=dev)
+
+    # Maintain real-time 4-lane physical activity state
+    lane_states_seq = torch.zeros(total_padded_frames, 4, dtype=torch.int64, device=dev)
+
+    hit_objects: List[ManiaHitObject] = []
+    last_note_any_lane = -9999
     generated_tokens: List[int] = [0] * warmup_lead_in_frames
     all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0]] * warmup_lead_in_frames
 
-    print(f"  • Generating neural 4K patterns (SR: {star_rating:.1f}*, {orig_total_frames} frames, {duration_ms / 1000:.1f}s)...")
+    print(f"  • Generating neural 4K patterns with Grid Metric & Lane State Conditioning (SR: {star_rating:.1f}*, {orig_total_frames} frames)...")
 
-    # Step through sequence with sliding window context (overlap=64)
+    # Step through sequence with sliding window context
     step_size = chunk_frames
     for cur_pos in range(warmup_lead_in_frames, total_padded_frames, step_size):
         end_pos = min(total_padded_frames, cur_pos + step_size)
 
         ctx_start = max(0, cur_pos - 128)
-        window_mel = padded_mel[ctx_start:end_pos].unsqueeze(0).to(dev)
-        window_len = window_mel.shape[1]
+        audio_lookahead_end = min(total_padded_frames, end_pos + 16)
+        window_mel = padded_mel[ctx_start:audio_lookahead_end].unsqueeze(0).to(dev)
+        window_len = end_pos - ctx_start
 
         ctx_tokens = generated_tokens[ctx_start:cur_pos]
         window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
         if ctx_tokens:
             window_prev_tokens[0, :len(ctx_tokens)] = torch.tensor(ctx_tokens, dtype=torch.int64, device=dev)
 
+        window_lane_states = lane_states_seq[ctx_start:end_pos].unsqueeze(0)
+        window_grid_metrics = padded_grid_metrics[ctx_start:end_pos].unsqueeze(0)
+
         with torch.no_grad():
-            chord_logits, ln_logits = model(window_mel, star_rating=sr_tensor, prev_tokens=window_prev_tokens)
+            chord_logits, ln_logits = model(
+                window_mel[:, :window_len],
+                star_rating=sr_tensor,
+                prev_tokens=window_prev_tokens,
+                lane_states=window_lane_states,
+                grid_metrics=window_grid_metrics,
+            )
             offset_in_window = cur_pos - ctx_start
             new_chord_logits = chord_logits[0, offset_in_window:]
             new_ln_logits = ln_logits[0, offset_in_window:]
 
-            # Calibrate logits for low Star Ratings (suppress multi-key chords for 1.0-2.5*)
             if max_allowed_chord < 4:
                 for tok_idx in range(16):
                     keys = token_to_keys(tok_idx)
@@ -241,23 +324,43 @@ def generate_patterns_with_model3(
         generated_tokens.extend(new_tokens)
         all_ln_probs.extend(new_lns)
 
-    # 2. Convert predicted tokens into ManiaHitObjects
+        # Update lane state sequence for future context using the 5 physical states
+        for local_idx, (tok, lns) in enumerate(zip(new_tokens, new_lns)):
+            global_f = cur_pos + local_idx
+            if global_f >= total_padded_frames:
+                break
+            if tok > 0:
+                cols = token_to_keys(tok)
+                for c in cols:
+                    if (star_rating >= 2.0) and (lns[c] > 0.45):
+                        lane_states_seq[global_f, c] = 2  # STATE_LN_START
+                        # Sustain propagation across hold length
+                        hold_frames = min(int(beat_len_ms / frame_ms), total_padded_frames - global_f - 1)
+                        for hf in range(1, hold_frames):
+                            lane_states_seq[global_f + hf, c] = 3  # STATE_LN_HOLD
+                        if (global_f + hold_frames) < total_padded_frames:
+                            lane_states_seq[global_f + hold_frames, c] = 4  # STATE_LN_RELEASE
+                    else:
+                        lane_states_seq[global_f, c] = 1  # STATE_TAP (instantaneous hit, free on next frame)
+
+    # 2. Convert predicted tokens into ManiaHitObjects with Musical Snapping & Audio-Sustained LNs
     for f_idx in range(orig_total_frames):
         padded_f_idx = f_idx + warmup_lead_in_frames
         tok = generated_tokens[padded_f_idx]
         if tok <= 0:
             continue
 
-        raw_t_ms = int(f_idx * 16.0)  # 16ms hop frame
+        raw_t_ms = int(f_idx * 16.0)
         if raw_t_ms >= duration_ms:
             break
 
-        # Suppress notes before song offset
-        if raw_t_ms < (offset_ms - 30):
+        # Snap to closest musical beat subdivision tick
+        t_ms = snap_to_musical_grid(raw_t_ms, bpm=bpm, offset_ms=offset_ms, max_snap_dist_ms=24.0)
+
+        if t_ms < (offset_ms - 20):
             continue
 
-        # Enforce minimum note interval for low Star Rating difficulties (Easy / 1*)
-        if star_rating < 2.5 and (raw_t_ms - last_note_any_lane) < min_gap:
+        if star_rating < 2.5 and (t_ms - last_note_any_lane) < min_gap:
             continue
 
         active_cols = token_to_keys(tok)
@@ -268,21 +371,18 @@ def generate_patterns_with_model3(
         placed_any = False
 
         for col in active_cols:
-            if column_busy_until[col] > raw_t_ms:
-                continue
-
             is_ln = (star_rating >= 2.0) and (cur_ln_prob[col] > 0.45)
             if is_ln:
-                hold_duration = max(int(step_1_4_ms * 2), int(beat_len_ms))
-                end_t_ms = min(duration_ms, raw_t_ms + hold_duration)
-                column_busy_until[col] = end_t_ms + 20
+                hold_duration = compute_audio_sustain_duration(audio_mel, f_idx, beat_len_ms)
+                end_t_ms = snap_to_musical_grid(t_ms + hold_duration, bpm=bpm, offset_ms=offset_ms, max_snap_dist_ms=24.0)
+                end_t_ms = min(duration_ms, max(t_ms + int(beat_len_ms / 2.0), end_t_ms))
             else:
-                end_t_ms = raw_t_ms
+                end_t_ms = t_ms
 
             hit_objects.append(
                 ManiaHitObject(
                     column=col,
-                    start_time=raw_t_ms,
+                    start_time=t_ms,
                     end_time=end_t_ms,
                     is_ln=is_ln,
                 )
@@ -290,7 +390,7 @@ def generate_patterns_with_model3(
             placed_any = True
 
         if placed_any:
-            last_note_any_lane = raw_t_ms
+            last_note_any_lane = t_ms
 
     hit_objects.sort(key=lambda o: (o.start_time, o.column))
     print(f"  ✓ Neural pattern synthesis finished: generated {len(hit_objects)} hit objects (SR: {star_rating:.1f}*).")
@@ -307,38 +407,19 @@ def generate_patterns(
 ) -> List[ManiaHitObject]:
     """
     Algorithmic generator conditioned strictly on requested Star Rating (1.0* to 9.9*).
-    Accurately synchronizes to audio transients without artificial quantization flattening.
+    Strictly synchronizes to musical beat grid ticks without floating micro-jitter.
     """
     rng = random.Random(seed)
     params = get_star_rating_params(star_rating)
     beat_length = 60000.0 / max(1.0, bpm)
     step_1_4 = beat_length / 4.0
     step_1_2 = beat_length / 2.0
-    step_1_1 = beat_length
 
     onset_set: List[int] = sorted(onsets_ms) if onsets_ms else []
-
-    def snap_to_transient(grid_time_ms: int, search_window_ms: float = 35.0) -> int:
-        if not onset_set:
-            return grid_time_ms
-        idx = bisect.bisect_left(onset_set, grid_time_ms)
-        candidates = []
-        if idx < len(onset_set):
-            candidates.append(onset_set[idx])
-        if idx > 0:
-            candidates.append(onset_set[idx - 1])
-        if not candidates:
-            return grid_time_ms
-        closest = min(candidates, key=lambda o: abs(o - grid_time_ms))
-        if abs(closest - grid_time_ms) <= search_window_ms:
-            return closest
-        return grid_time_ms
 
     # Determine rhythm grid steps based on Star Rating
     grid_events: List[int] = []
     num_1_4_steps = int((duration_ms - offset_ms) / step_1_4)
-
-    # For fast BPMs on 1.0* Easy difficulty, pace across 2-beat intervals (e.g. half notes)
     easy_step_mod = 8 if beat_length < 450 else 4
 
     for step_idx in range(max(0, num_1_4_steps)):
@@ -352,10 +433,8 @@ def generate_patterns(
 
         should_place = False
         if params["star_rating"] < 1.8:
-            # 1.0* - 1.8* (Easy): strictly 1/1 beats or 2/1 beats on fast songs
             should_place = is_easy_beat
         elif params["star_rating"] < 3.0:
-            # 2.0* - 3.0* (Normal): 1/1 beats + 1/2 beats + sparse 1/4
             if is_1_1:
                 should_place = True
             elif is_1_2:
@@ -363,22 +442,18 @@ def generate_patterns(
             else:
                 should_place = rng.random() < params["subdiv_1_4_prob"]
         else:
-            # 3.5*+ (Hard / Insane / Expert): 1/1, 1/2, 1/4 streams and 1/8 bursts
             if is_1_1 or is_1_2:
                 should_place = True
             else:
                 should_place = rng.random() < params["subdiv_1_4_prob"]
 
         if should_place:
-            search_win = max(40.0, step_1_4 * 0.90)
-            aligned_t = snap_to_transient(t_grid, search_window_ms=search_win)
-            grid_events.append(aligned_t)
+            grid_events.append(t_grid)
 
-    # For moderate to high SR (>= 3.5*), also ensure strong isolated transients are captured
+    # For moderate to high SR (>= 3.5*), also capture isolated sharp audio transients
     if params["star_rating"] >= 3.5 and onset_set:
         for onset in onset_set:
             if offset_ms <= onset < duration_ms:
-                # Add if not too close to an existing event
                 grid_events.append(onset)
 
     active_timestamps = sorted(list(set(grid_events)))
@@ -407,9 +482,8 @@ def generate_patterns(
 
         chord_size = min(max_chord, raw_chord)
 
-        # Restrict multi-key chords off-beat unless difficulty is high
         dist_to_beat = abs((t - offset_ms) % beat_length)
-        is_downbeat = dist_to_beat < 25.0 or abs(dist_to_beat - beat_length) < 25.0
+        is_downbeat = dist_to_beat < 15.0 or abs(dist_to_beat - beat_length) < 15.0
         if not is_downbeat and chord_size > 2 and params["star_rating"] < 6.0:
             chord_size = min(2, chord_size)
 
@@ -423,11 +497,18 @@ def generate_patterns(
 
         can_have_ln = (params["star_rating"] >= 2.0) and (rng.random() < params["ln_prob"])
         next_time = active_timestamps[i + 1] if (i + 1) < len(active_timestamps) else (t + int(beat_length))
-        max_hold_time = max(t + int(step_1_2), min(t + int(beat_length * 2), next_time + int(step_1_2)))
+        
+        gap_to_next = max(0, next_time - t)
+        if gap_to_next >= int(beat_length * 1.5):
+            hold_len = int(round(beat_length))
+        elif gap_to_next >= int(beat_length):
+            hold_len = int(round(step_1_2 + step_1_4))
+        else:
+            hold_len = int(round(step_1_2))
 
         for c_idx, col in enumerate(chosen_cols):
-            is_ln = can_have_ln and (c_idx == 0) and (max_hold_time - t >= int(step_1_2))
-            end_t = max_hold_time if is_ln else t
+            is_ln = can_have_ln and (c_idx == 0) and (hold_len >= int(step_1_2))
+            end_t = min(duration_ms, t + hold_len) if is_ln else t
 
             hit_objects.append(
                 ManiaHitObject(

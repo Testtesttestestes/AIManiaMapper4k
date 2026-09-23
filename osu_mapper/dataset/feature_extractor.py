@@ -443,21 +443,61 @@ def quantize_beatmap_to_grid(
     - tokens: [num_frames] integer tensor in [0..15]
     - ln_mask: [num_frames, 4] float tensor in [0, 1] indicating active long notes
     - sv_curve: [num_frames] float tensor representing local SV multiplier
+    - lane_states: [num_frames, 4] int64 tensor (0=Free, 1=Tap, 2=Hold, 3=Release)
+    - grid_metrics: [num_frames, 3] float tensor (beat_divisor, bar_phase, is_downbeat)
     """
     key_states = np.zeros((num_frames, 4), dtype=np.int64)
     ln_active = np.zeros((num_frames, 4), dtype=np.float32)
+    lane_states = np.zeros((num_frames, 4), dtype=np.int64)
     sv_curve = np.ones(num_frames, dtype=np.float32)
 
-    # Fill HitObjects
+    # Fill HitObjects & 5-State Physical Lanes (0=Free, 1=Tap, 2=LN_Start, 3=LN_Hold, 4=LN_Release)
     for col, start_ms, end_ms, is_ln in details.hit_objects:
         start_frame = int(round(start_ms / frame_ms))
         if 0 <= start_frame < num_frames:
             key_states[start_frame, col] = 1
+            lane_states[start_frame, col] = 2 if is_ln else 1  # 2 for LN start, 1 for Tap
 
         if is_ln:
             end_frame = int(round(end_ms / frame_ms))
-            for f in range(max(0, start_frame), min(num_frames, end_frame + 1)):
+            for f in range(max(0, start_frame + 1), min(num_frames, end_frame)):
                 ln_active[f, col] = 1.0
+                lane_states[f, col] = 3  # 3 for LN hold sustain
+            if 0 <= end_frame < num_frames:
+                ln_active[end_frame, col] = 1.0
+                lane_states[end_frame, col] = 4  # 4 for LN release
+
+    # Fill Musical Grid Metrics (Beat Divisor, Bar Position, Downbeat Flag)
+    grid_metrics = np.zeros((num_frames, 3), dtype=np.float32)
+    bpm = max(30.0, float(details.bpm))
+    beat_len_ms = 60000.0 / bpm
+    bar_len_ms = 4.0 * beat_len_ms
+    offset_ms = float(details.offset_ms)
+
+    for f in range(num_frames):
+        t_ms = f * frame_ms
+        rel_ms = t_ms - offset_ms
+        
+        # Bar phase fraction [0.0 to 1.0)
+        bar_phase = (rel_ms % bar_len_ms) / bar_len_ms if bar_len_ms > 0 else 0.0
+        grid_metrics[f, 1] = float(bar_phase)
+
+        # Downbeat detection (within 16ms of 1/1 bar start)
+        dist_to_downbeat = abs(rel_ms % bar_len_ms)
+        is_downbeat = 1.0 if (dist_to_downbeat < 16.0 or abs(dist_to_downbeat - bar_len_ms) < 16.0) else 0.0
+        grid_metrics[f, 2] = is_downbeat
+
+        # Beat divisor identification (1/1, 1/2, 1/3, 1/4, 1/6, 1/8)
+        best_div = 0.0
+        min_delta = 999.0
+        for div in (1, 2, 4, 3, 6, 8):
+            step = beat_len_ms / float(div)
+            cand_dist = abs(rel_ms % step)
+            dist = min(cand_dist, abs(cand_dist - step))
+            if dist < min_delta and dist <= (frame_ms * 0.75):
+                min_delta = dist
+                best_div = float(div)
+        grid_metrics[f, 0] = best_div
 
     # Fill SV Curve from TimingPoints
     for t_ms, val, uninherited in details.timing_points:
@@ -481,6 +521,8 @@ def quantize_beatmap_to_grid(
         torch.from_numpy(tokens),
         torch.from_numpy(ln_active),
         torch.from_numpy(sv_curve),
+        torch.from_numpy(lane_states),
+        torch.from_numpy(grid_metrics),
     )
 
 
@@ -497,6 +539,8 @@ def slice_beatmap_into_musical_chunks(
     bars_per_step: int = 2,
     timing_source: str = "map",
     timing_override: Optional[Tuple[float, float]] = None,
+    lane_states: Optional[torch.Tensor] = None,
+    grid_metrics: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, Any]]:
     """
     Slices beatmap audio representations and tokens into synchronized training/inference chunks.
@@ -551,6 +595,8 @@ def slice_beatmap_into_musical_chunks(
                 chunk_tok = tokens[start_frame:end_frame]
                 chunk_ln = ln_active[start_frame:end_frame]
                 chunk_sv = sv_curve[start_frame:end_frame]
+                chunk_lane = lane_states[start_frame:end_frame] if lane_states is not None else torch.zeros(chunk_size, 4, dtype=torch.int64)
+                chunk_grid = grid_metrics[start_frame:end_frame] if grid_metrics is not None else torch.zeros(chunk_size, 3, dtype=torch.float32)
 
                 # Retain autoregressive context of previous measures/squares
                 prev_start_frame = start_frame - chunk_size
@@ -568,6 +614,8 @@ def slice_beatmap_into_musical_chunks(
                     "audio_mel": chunk_mel,
                     "tokens": chunk_tok,
                     "prev_tokens": prev_tok,
+                    "lane_states": chunk_lane,
+                    "grid_metrics": chunk_grid,
                     "ln_mask": chunk_ln,
                     "sv_curve": chunk_sv,
                     "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
@@ -596,6 +644,8 @@ def slice_beatmap_into_musical_chunks(
             chunk_tok = tokens[start_idx:end_idx]
             chunk_ln = ln_active[start_idx:end_idx]
             chunk_sv = sv_curve[start_idx:end_idx]
+            chunk_lane = lane_states[start_idx:end_idx] if lane_states is not None else torch.zeros(chunk_size, 4, dtype=torch.int64)
+            chunk_grid = grid_metrics[start_idx:end_idx] if grid_metrics is not None else torch.zeros(chunk_size, 3, dtype=torch.float32)
 
             prev_start = start_idx - chunk_size
             if prev_start >= 0:
@@ -612,6 +662,8 @@ def slice_beatmap_into_musical_chunks(
                 "audio_mel": chunk_mel,
                 "tokens": chunk_tok,
                 "prev_tokens": prev_tok,
+                "lane_states": chunk_lane,
+                "grid_metrics": chunk_grid,
                 "ln_mask": chunk_ln,
                 "sv_curve": chunk_sv,
                 "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),

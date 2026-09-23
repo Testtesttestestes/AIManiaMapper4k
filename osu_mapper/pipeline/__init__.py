@@ -81,6 +81,10 @@ def generate_beatmap_pipeline(
         effective_offset = manual_offset
         print(f"[Timing] Using manual/template Offset: {effective_offset} ms")
 
+    # Update audio_analysis with effective synchronized values
+    audio_analysis.bpm = round(effective_bpm, 2)
+    audio_analysis.offset_ms = int(round(effective_offset))
+
     if version is None:
         version = f"AI 4K [{star_rating:.1f}*]"
 
