@@ -21,10 +21,10 @@ from .timing import TimingPoint, generate_timing_points
 def generate_beatmap_pipeline(
     wav_path: str,
     output_osz_path: str,
-    star_rating: float = 3.5,
+    star_rating: float | List[float] = 3.5,
     title: str = "AI Mania Map",
     artist: str = "AI Artist",
-    version: Optional[str] = None,
+    version: Optional[str | List[str]] = None,
     creator: str = "AIManiaMapper",
     manual_bpm: Optional[float] = None,
     manual_offset: Optional[int] = None,
@@ -34,16 +34,19 @@ def generate_beatmap_pipeline(
     existing_timing_points: Optional[List[TimingPoint]] = None,
     seed: int = 42,
     device: str = "auto",
-) -> Tuple[str, str, AudioRhythmResult]:
+) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
     1. Step 1 (Model 1 / Sync or Manual): BPM and offset synchronization
     2. Step 2 (Model 2 / Dynamics or Pre-set): SV & timing zones
     3. Step 3 (Model 3 / Transformer Neural Patterns): 4K Hit Object pattern synthesis using trained weights
-    4. Step 4 (Packaging): Serialization to .osu v14 and bundling into .osz archive.
+    4. Step 4 (Packaging): Serialization to .osu v14 and bundling into a single .osz archive.
+
+    Supports generating MULTIPLE difficulties in one call by passing a list of star_ratings:
+        star_rating=[2.0, 2.75, 3.5, 4.25, 5.0]
 
     Returns:
-        (osu_content_str, generated_osz_path, audio_analysis_result)
+        (list_of_osu_content_strings, generated_osz_path, audio_analysis_result)
     """
     audio_analysis = analyze_audio_rhythm(wav_path)
 
@@ -85,8 +88,25 @@ def generate_beatmap_pipeline(
     audio_analysis.bpm = round(effective_bpm, 2)
     audio_analysis.offset_ms = int(round(effective_offset))
 
+    # Normalize star ratings list
+    if isinstance(star_rating, (int, float)):
+        sr_list = [float(star_rating)]
+    else:
+        sr_list = [float(s) for s in star_rating]
+
+    # Normalize versions list
     if version is None:
-        version = f"AI 4K [{star_rating:.1f}*]"
+        version_list = [f"AI 4K [{sr:.2f}*]" for sr in sr_list]
+    elif isinstance(version, str):
+        if len(sr_list) == 1:
+            version_list = [version]
+        else:
+            version_list = [f"{version} [{sr:.2f}*]" for sr in sr_list]
+    else:
+        version_list = list(version)
+        while len(version_list) < len(sr_list):
+            missing_idx = len(version_list)
+            version_list.append(f"AI 4K [{sr_list[missing_idx]:.2f}*]")
 
     # Step 2: SV & timing points
     if existing_timing_points is not None and len(existing_timing_points) > 0:
@@ -108,55 +128,70 @@ def generate_beatmap_pipeline(
                 m3_ckpt = str(cand)
                 break
 
-    hit_objects: List[ManiaHitObject] = []
-    used_neural = False
-
+    # Pre-extract spectrogram once for all difficulties
+    mel = None
     if m3_ckpt and Path(m3_ckpt).exists():
         try:
             from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
             audio_wav = extract_audio_waveform(wav_path, target_sr=16000)
-            mel = compute_mel_spectrogram(audio_wav, sr=16000, n_mels=80)
-            hit_objects = generate_patterns_with_model3(
-                checkpoint_path=m3_ckpt,
-                audio_mel=mel,
+            if audio_wav is not None:
+                mel = compute_mel_spectrogram(audio_wav, sr=16000, n_mels=80)
+        except Exception as ex:
+            print(f"[Mel Extraction] Note: {ex}")
+
+    diff_packages: List[Tuple[BeatmapMetadata, str]] = []
+    osu_contents: List[str] = []
+
+    for idx, (sr, diff_name) in enumerate(zip(sr_list, version_list)):
+        print(f"\n--- [Difficulty {idx + 1}/{len(sr_list)}] Generating '{diff_name}' (Target SR: {sr:.2f}*) ---")
+        hit_objects: List[ManiaHitObject] = []
+        used_neural = False
+
+        if m3_ckpt and Path(m3_ckpt).exists() and mel is not None:
+            try:
+                hit_objects = generate_patterns_with_model3(
+                    checkpoint_path=m3_ckpt,
+                    audio_mel=mel,
+                    bpm=effective_bpm,
+                    offset_ms=effective_offset,
+                    duration_ms=audio_analysis.duration_ms,
+                    star_rating=sr,
+                )
+                used_neural = True
+            except Exception as err:
+                print(f"⚠️ [Model 3 Warning] Neural pattern synthesis failed ({err}), falling back to algorithmic generation.")
+
+        if not used_neural or not hit_objects:
+            print(f"ℹ️ [Pattern Generator] Using algorithmic pattern synthesis (Conditioned on SR {sr:.2f}*)...")
+            hit_objects = generate_patterns(
                 bpm=effective_bpm,
                 offset_ms=effective_offset,
                 duration_ms=audio_analysis.duration_ms,
-                star_rating=star_rating,
+                star_rating=sr,
+                onsets_ms=audio_analysis.onsets_ms,
+                seed=seed + idx,
             )
-            used_neural = True
-        except Exception as err:
-            print(f"⚠️ [Model 3 Warning] Neural pattern synthesis failed ({err}), falling back to algorithmic generation.")
 
-    if not used_neural or not hit_objects:
-        print(f"ℹ️ [Pattern Generator] Using algorithmic pattern synthesis (Conditioned on SR {star_rating:.1f}*)...")
-        hit_objects = generate_patterns(
-            bpm=effective_bpm,
-            offset_ms=effective_offset,
-            duration_ms=audio_analysis.duration_ms,
-            star_rating=star_rating,
-            onsets_ms=audio_analysis.onsets_ms,
-            seed=seed,
+        # Set up difficulty metadata
+        meta = BeatmapMetadata(
+            title=title,
+            artist=artist,
+            creator=creator,
+            version=diff_name,
+            audio_filename=Path(wav_path).name,
+            overall_difficulty=min(10.0, max(4.0, 4.0 + sr * 0.6)),
+            hp_drain=min(10.0, max(5.0, 5.0 + sr * 0.45)),
         )
+        packager = BeatmapPackager(meta)
+        osu_str = packager.generate_osu_content(timing_points, hit_objects)
+        diff_packages.append((meta, osu_str))
+        osu_contents.append(osu_str)
 
-    # Set up metadata & packager
-    meta = BeatmapMetadata(
-        title=title,
-        artist=artist,
-        creator=creator,
-        version=version,
-        audio_filename=Path(wav_path).name,
-        overall_difficulty=min(10.0, max(4.0, 4.0 + star_rating * 0.6)),
-        hp_drain=min(10.0, max(5.0, 5.0 + star_rating * 0.45)),
-    )
-    packager = BeatmapPackager(meta)
-    osu_content = packager.generate_osu_content(timing_points, hit_objects)
-
-    # Build .osz package
-    final_osz = packager.package_osz(
-        osu_content=osu_content,
+    # Bundle all difficulties into single .osz archive
+    final_osz = BeatmapPackager.package_multi_diff_osz(
+        diff_items=diff_packages,
         audio_source_path=wav_path,
         output_osz_path=output_osz_path,
     )
 
-    return osu_content, str(final_osz), audio_analysis
+    return osu_contents, str(final_osz), audio_analysis

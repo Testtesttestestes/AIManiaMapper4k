@@ -218,7 +218,13 @@ def main():
     parser.add_argument("--template", "--osz", "--osu", type=str, default=None, help="Path to template .osz / .osu file with pre-set BPM/timing points")
     parser.add_argument("--song", type=int, default=None, help="Map a specific song from dataset by index number (1..N)")
     parser.add_argument("--list_songs", action="store_true", help="List all available songs from dataset and exit")
-    parser.add_argument("--sr", "--star-rating", type=float, default=3.5, dest="star_rating", help="Target difficulty Star Rating (1.0 to 9.9)")
+    parser.add_argument(
+        "--sr", "--star-rating", "--diffs", "--difficulties",
+        type=str,
+        default="3.5",
+        dest="star_rating",
+        help="Target Star Rating(s). Accepts single value or comma-separated list with 2 decimal precision (e.g. --sr '2.0, 2.75, 3.5, 4.25, 5.0')",
+    )
     parser.add_argument("--title", type=str, default=None, help="Song title override")
     parser.add_argument("--artist", type=str, default=None, help="Song artist override")
     parser.add_argument("--version", type=str, default=None, help="Difficulty name (default: 'AI 4K [X.X*]')")
@@ -307,11 +313,23 @@ def main():
     wav_target = work_dir / "converted_audio.wav"
     effective_wav = convert_audio_to_wav(audio_path, wav_target)
 
+    # Parse Star Rating(s): single float or comma-separated list
+    sr_input = str(args.star_rating).strip()
+    try:
+        sr_list = [round(float(s.strip()), 2) for s in sr_input.split(",") if s.strip()]
+        if not sr_list:
+            sr_list = [3.50]
+    except ValueError as val_err:
+        print(f"❌ [Error] Invalid --sr value '{args.star_rating}'. Please provide numbers like --sr '2.0, 2.75, 3.5, 4.25': {val_err}")
+        sys.exit(1)
+
     # Resolve metadata
     final_title = args.title or template_meta.get("title", Path(audio_path).stem)
     final_artist = args.artist or template_meta.get("artist", "AI Artist")
     final_bpm = args.bpm if args.bpm is not None else template_meta.get("bpm")
     final_offset = args.offset if args.offset is not None else template_meta.get("offset_ms")
+
+    sr_display = ", ".join(f"{s:.2f}*" for s in sr_list)
 
     print("\n" + "=" * 65)
     print(" 🎮 OSU!MANIA 4K AI BEATMAP GENERATOR (MODEL 3 TRANSFORMER)")
@@ -319,7 +337,7 @@ def main():
     print(f"  • Audio Track:    {Path(audio_path).name}")
     print(f"  • Song Title:     {final_title}")
     print(f"  • Artist:         {final_artist}")
-    print(f"  • Target SR:      {args.star_rating:.1f}*")
+    print(f"  • Difficulties:   {len(sr_list)} diff(s) -> [{sr_display}]")
     print(f"  • BPM:            {f'{final_bpm:.2f} (Preset/Manual)' if final_bpm else 'Auto Sync Inference'}")
     print(f"  • Offset:         {f'{final_offset} ms (Preset/Manual)' if final_offset is not None else 'Auto Sync Inference'}")
     print(f"  • Model 3 Weights:{args.model3_checkpoint or 'Auto (checkpoints/model_3_transformer_best.pt)'}")
@@ -327,10 +345,10 @@ def main():
     print("=" * 65 + "\n")
 
     try:
-        osu_str, osz_path, analysis = generate_beatmap_pipeline(
+        osu_contents, osz_path, analysis = generate_beatmap_pipeline(
             wav_path=effective_wav,
             output_osz_path=args.output,
-            star_rating=args.star_rating,
+            star_rating=sr_list,
             title=final_title,
             artist=final_artist,
             version=args.version,
@@ -344,13 +362,14 @@ def main():
         )
 
         print("\n" + "=" * 65)
-        print(" 🎉 BEATMAP GENERATION SUCCEEDED!")
+        print(" 🎉 BEATMAP PACKAGE GENERATION SUCCEEDED!")
         print("=" * 65)
+        print(f"  • Difficulties:      {len(osu_contents)} generated [{sr_display}]")
         print(f"  • Final BPM:         {analysis.bpm:.2f}")
         print(f"  • Final Offset:      {analysis.offset_ms} ms")
         print(f"  • Track Duration:    {analysis.duration_sec:.2f}s")
         print(f"  • Package Created:   {osz_path}")
-        print(f"  • Ready to play in:  osu! (Just double-click or drag into osu!)")
+        print(f"  • Ready to play in:  osu! (Single .osz contains all difficulties)")
         print("=" * 65 + "\n")
 
     finally:

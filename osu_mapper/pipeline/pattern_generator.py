@@ -23,6 +23,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from osu_mapper.pipeline.timing import snap_to_musical_grid
 
 try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
+
+try:
     import torch
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
@@ -250,9 +255,11 @@ def generate_patterns_with_model3(
 
     # Precalculate global audio energy envelope and relative energy ratio per frame
     with torch.no_grad():
-        frame_energies = padded_mel.exp().mean(dim=-1).cpu().numpy()
-        mean_energy = float(np.mean(frame_energies[warmup_lead_in_frames:])) if total_padded_frames > warmup_lead_in_frames else 1.0
-        mean_energy = max(1e-4, mean_energy)
+        frame_energies_t = padded_mel.exp().mean(dim=-1)  # [T]
+        valid_energies = frame_energies_t[warmup_lead_in_frames:] if total_padded_frames > warmup_lead_in_frames else frame_energies_t
+        mean_energy_val = float(valid_energies.mean().item()) if valid_energies.numel() > 0 else 1.0
+        mean_energy = max(1e-4, mean_energy_val)
+        frame_energies = frame_energies_t.cpu().tolist()
 
     # Precalculate 6D Musical Grid & Macro-Temporal Song Structure Metrics across all padded frames
     grid_metrics_np = []
