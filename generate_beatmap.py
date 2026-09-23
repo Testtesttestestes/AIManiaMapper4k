@@ -73,6 +73,81 @@ def list_available_dataset_songs() -> List[dict]:
     return songs
 
 
+def parse_template_osu_text(osu_text: str) -> Tuple[dict, List[TimingPoint]]:
+    """
+    Parses metadata and timing points from a template .osu file.
+    Works even on empty/blank templates with 0 hit objects.
+    """
+    meta: dict = {}
+    timing_points: List[TimingPoint] = []
+    
+    current_section = ""
+    timing_lines: List[str] = []
+    
+    for line in osu_text.splitlines():
+        line_str = line.strip()
+        if not line_str or line_str.startswith("//"):
+            continue
+        if line_str.startswith("[") and line_str.endswith("]"):
+            current_section = line_str[1:-1].strip()
+            continue
+        
+        if current_section == "General" and ":" in line_str:
+            k, v = line_str.split(":", 1)
+            meta[k.strip()] = v.strip()
+            if k.strip() == "AudioFilename":
+                meta["audio_filename"] = v.strip()
+        elif current_section == "Metadata" and ":" in line_str:
+            k, v = line_str.split(":", 1)
+            k_clean = k.strip().lower()
+            if k_clean == "title":
+                meta["title"] = v.strip()
+            elif k_clean == "artist":
+                meta["artist"] = v.strip()
+            elif k_clean == "creator":
+                meta["creator"] = v.strip()
+            elif k_clean == "version":
+                meta["version"] = v.strip()
+        elif current_section == "Difficulty" and ":" in line_str:
+            k, v = line_str.split(":", 1)
+            meta[k.strip()] = v.strip()
+        elif current_section == "TimingPoints":
+            timing_lines.append(line_str)
+
+    # Parse all timing points
+    primary_bpm = None
+    primary_offset = None
+
+    for t_str in timing_lines:
+        parts = t_str.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            t_ms = float(parts[0])
+            beat_len = float(parts[1])
+            uninherited = 1 if (len(parts) <= 6 or parts[6].strip() == "1") else 0
+            
+            timing_points.append(TimingPoint(
+                time=t_ms,
+                beat_length=beat_len,
+                uninherited=uninherited,
+            ))
+
+            # First uninherited line defines base BPM and song offset
+            if uninherited == 1 and beat_len > 0 and primary_bpm is None:
+                primary_bpm = round(60000.0 / beat_len, 2)
+                primary_offset = int(round(t_ms))
+        except (ValueError, IndexError):
+            continue
+
+    if primary_bpm is not None:
+        meta["bpm"] = primary_bpm
+    if primary_offset is not None:
+        meta["offset_ms"] = primary_offset
+
+    return meta, timing_points
+
+
 def extract_template_osz(osz_path: str | Path, work_dir: Path) -> Tuple[str, dict, List[TimingPoint]]:
     """
     Extracts audio and timing points from a template .osz archive.
@@ -91,44 +166,19 @@ def extract_template_osz(osz_path: str | Path, work_dir: Path) -> Tuple[str, dic
     if not osu_files:
         raise ValueError(f"No .osu difficulty files found inside '{osz_p.name}'.")
 
-    # Pick first osu file or one matching 4K
+    # Pick first osu file (or find best match)
     osu_target = osu_files[0]
-    parsed_meta = {}
-    extracted_timing_points: List[TimingPoint] = []
-
     osu_text = osu_target.read_text(encoding="utf-8", errors="ignore")
-    parsed = parse_osu_for_training(osu_text, osu_target.name)
+    parsed_meta, extracted_timing_points = parse_template_osu_text(osu_text)
 
-    audio_file_name = None
-    if parsed:
-        audio_file_name = parsed.audio_filename
-        parsed_meta["bpm"] = parsed.bpm
-        parsed_meta["offset_ms"] = parsed.offset_ms
-        parsed_meta["version"] = parsed.version
-
-        for tp in parsed.timing_points:
-            t_ms, val, uninh = tp
-            extracted_timing_points.append(TimingPoint(
-                time=float(t_ms),
-                beat_length=float(val),
-                uninherited=1 if uninh else 0,
-            ))
-
-    # Parse Title & Artist from [Metadata]
-    for line in osu_text.splitlines():
-        if line.startswith("Title:"):
-            parsed_meta["title"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Artist:"):
-            parsed_meta["artist"] = line.split(":", 1)[1].strip()
-        elif line.startswith("AudioFilename:") and not audio_file_name:
-            audio_file_name = line.split(":", 1)[1].strip()
+    audio_file_name = parsed_meta.get("audio_filename") or parsed_meta.get("AudioFilename")
 
     # Locate audio inside extracted folder
     audio_path = None
     if audio_file_name and (extracted_dir / audio_file_name).exists():
         audio_path = str((extracted_dir / audio_file_name).resolve())
     else:
-        # Search for any audio
+        # Search for any audio in archive
         for ext in ("*.mp3", "*.ogg", "*.wav", "*.flac"):
             cands = list(extracted_dir.glob(ext))
             if cands:
@@ -234,12 +284,11 @@ def main():
         elif template_target.lower().endswith(".osu"):
             osu_p = Path(template_target)
             osu_text = osu_p.read_text(encoding="utf-8", errors="ignore")
-            parsed = parse_osu_for_training(osu_text, osu_p.name)
-            if parsed:
-                template_meta["bpm"] = parsed.bpm
-                template_meta["offset_ms"] = parsed.offset_ms
-                template_meta["version"] = parsed.version
-                audio_cand = osu_p.parent / parsed.audio_filename
+            parsed_meta, template_timing_points = parse_template_osu_text(osu_text)
+            template_meta.update(parsed_meta)
+            audio_cand_name = parsed_meta.get("audio_filename") or parsed_meta.get("AudioFilename")
+            if audio_cand_name:
+                audio_cand = osu_p.parent / audio_cand_name
                 if audio_cand.exists():
                     audio_path = str(audio_cand.resolve())
 
