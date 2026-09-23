@@ -2,21 +2,22 @@
 ManiaPatternTransformer architecture for osu!mania 4K beatmap generation.
 
 Features:
-- Bidirectional Deep Multi-Band Audio Encoder: Processes the full 80-bin frequency spectrum
-  with multi-scale temporal convolutions and future lookahead context (sub-bass, mid, highs, melody).
-- Multi-Head Audio-to-Rhythm Cross-Attention: Token queries attend directly to multi-band audio keys/values,
-  grounding every placed note and chord in the exact acoustic frequencies and transients.
+- Bidirectional Deep Multi-Band Audio Encoder with Transient Spectral Differentials:
+  Derives real-time first-order differential deltas (attacks/transients) and positive spectral flux (onsets)
+  alongside full 80-bin frequency spectrum and future lookahead. This enables the network to clearly
+  distinguish between hard musical strikes/drops, quiet whispers, and decaying background pads.
+- Global Macro-Temporal & Song-Structure Conditioning:
+  Ingests continuous song progress (0.0 to 1.0), time-to-end (1.0 to 0.0), and local-to-global energy ratio.
+  Prevents note quota spam in quiet intros/breaks and naturally focuses density on climaxes/drops.
 - 5-State Physical Lane Autoregression:
     0: STATE_FREE       (Lane is idle)
     1: STATE_TAP        (Instantaneous circle note hit)
     2: STATE_LN_START   (Long note head press)
     3: STATE_LN_HOLD    (Continuous sustain / key held down)
     4: STATE_LN_RELEASE (Long note release / tail)
-  This enables the model to natively distinguish between tap notes, micro-sliders, and long holds
-  without relying on post-hoc heuristics or filters.
 - Musical Grid & Metric Conditioning: Embeds musical beat fractions (1/1, 1/2, 1/3, 1/4, 1/6, 1/8) and downbeat phase.
 - Acoustic Energy Gating: Senses music slowdowns, breaks, drops, and pauses.
-- Star Rating (1.0 to 9.9) continuous conditioning.
+- Star Rating (1.0 to 9.9) continuous difficulty conditioning.
 """
 
 from __future__ import annotations
@@ -87,13 +88,15 @@ if TORCH_AVAILABLE:
 
     class DeepAudioEncoder(nn.Module):
         """
-        Bidirectional Multi-Band Audio Encoder.
-        Extracts multi-scale acoustic features across all frequency bands (bass/kicks, mid/synths, highs/cymbals)
-        with temporal future lookahead.
+        Bidirectional Multi-Band Audio Encoder with Transient Spectral Differentials.
+        Derives first-order differential deltas (attacks) and positive spectral flux (onsets)
+        on the fly, passing [Spectrogram, Delta, Flux] to temporal convolutions and attention.
         """
         def __init__(self, in_dim: int = 80, d_model: int = 256, dropout: float = 0.1):
             super().__init__()
-            self.in_proj = nn.Linear(in_dim, d_model)
+            self.in_dim = in_dim
+            # Tri-channel projection: Raw Log-Mel + Temporal Delta + Onset Flux (3 * in_dim)
+            self.in_proj = nn.Linear(in_dim * 3, d_model)
             
             # Multi-scale 1D depthwise-separable temporal convolutions for audio transients
             self.conv_block = nn.Sequential(
@@ -118,13 +121,29 @@ if TORCH_AVAILABLE:
 
         def forward(self, audio_mel: torch.Tensor) -> torch.Tensor:
             # audio_mel: [B, T, in_dim]
-            x = self.in_proj(audio_mel)  # [B, T, d_model]
+            B, T, C = audio_mel.shape
             
-            # Temporal convolution
+            if C == self.in_dim:
+                # 1. Compute frame-to-frame differential spectral delta: S_t - S_{t-1}
+                prev_mel = F.pad(audio_mel[:, :-1, :], (0, 0, 1, 0))
+                delta = audio_mel - prev_mel
+                # 2. Positive onset flux (transient attacks, suppresses steady state and decay)
+                flux = F.relu(delta)
+                # Concatenate [Raw Spectrum, Delta Transient, Onset Flux] -> [B, T, 3 * in_dim]
+                tri_mel = torch.cat([audio_mel, delta, flux], dim=-1)
+                x = self.in_proj(tri_mel)
+            elif C == (self.in_dim * 3):
+                x = self.in_proj(audio_mel)
+            else:
+                # Fallback linear projection if custom dimension
+                proj_layer = nn.Linear(C, self.in_proj.out_features, device=audio_mel.device)
+                x = proj_layer(audio_mel)
+            
+            # Temporal convolution for local rhythmic transients
             x_conv = self.conv_block(x.transpose(1, 2)).transpose(1, 2)
             x = self.norm(x + x_conv)
             
-            # Bidirectional audio attention (sees future and past acoustic frames)
+            # Bidirectional audio attention (sees entire song past & future lookahead)
             audio_encoded = self.audio_transformer(x)
             return audio_encoded
 
@@ -176,16 +195,16 @@ if TORCH_AVAILABLE:
         """
         PyTorch Transformer for osu!mania 4K pattern generation.
         Conditioned on:
-        - Multi-band audio spectrogram via Cross-Attention
+        - Multi-band audio spectrogram + Transient Differentials via Cross-Attention
         - Star Rating difficulty tensor
-        - Musical Grid Metric (beat fraction / downbeat phase)
+        - Musical Grid Metric (beat fraction / downbeat phase / song progress / local-to-global energy ratio)
         - 5-State Physical Lane Autoregression (0=Free, 1=Tap, 2=LN_Start, 3=LN_Hold, 4=LN_Release)
         """
         def __init__(self, config: Optional[TransformerConfig] = None):
             super().__init__()
             self.config = config or TransformerConfig()
 
-            # Bidirectional Deep Multi-Band Audio Encoder
+            # Bidirectional Deep Multi-Band Audio Encoder with Spectral Differentials
             self.audio_encoder = DeepAudioEncoder(
                 in_dim=self.config.audio_dim,
                 d_model=self.config.d_model,
@@ -207,9 +226,9 @@ if TORCH_AVAILABLE:
             self.num_lane_states = getattr(self.config, "num_lane_states", 5)
             self.lane_state_proj = nn.Linear(4 * self.num_lane_states, self.config.d_model)
 
-            # Musical Metric Grid Embedding (Beat divisor, Bar position, Downbeat flag) -> d_model
+            # Musical Metric & Song Structure Grid Embedding (up to 6 channels: divisor, bar_phase, is_downbeat, progress, time_to_end, energy_ratio)
             self.metric_proj = nn.Sequential(
-                nn.Linear(3, self.config.d_model // 2),
+                nn.Linear(6, self.config.d_model // 2),
                 nn.GELU(),
                 nn.Linear(self.config.d_model // 2, self.config.d_model),
             )
@@ -252,23 +271,27 @@ if TORCH_AVAILABLE:
             prev_tokens: Optional[torch.Tensor] = None,
             lane_states: Optional[torch.Tensor] = None,
             grid_metrics: Optional[torch.Tensor] = None,
+            audio_memory: Optional[torch.Tensor] = None,
             return_hidden: bool = False,
             context_dropout: Optional[float] = None,
         ):
             """
             Args:
-                audio_mel: [Batch, SeqLen, audio_dim] Full multi-band log-mel spectrogram
+                audio_mel: [Batch, SeqLen, audio_dim] Log-mel spectrogram (or passed through audio_memory)
                 star_rating: [Batch, 1] Continuous difficulty scalar (1.0 to 9.9)
                 prev_tokens: [Batch, SeqLen] Autoregressive history of chord tokens (0-15)
                 lane_states: Optional [Batch, SeqLen, 4] integer states [0..4] or [Batch, SeqLen, 20] float one-hot
-                grid_metrics: Optional [Batch, SeqLen, 3] musical metric values (divisor, bar_pos, downbeat)
+                grid_metrics: Optional [Batch, SeqLen, 3..6] musical metric & song structure values
+                audio_memory: Optional precomputed [Batch, SeqLen_or_Full, d_model] representation from audio_encoder
                 return_hidden: bool, if True returns latent representations
                 context_dropout: Optional override for context dropout probability
             """
             B, T = audio_mel.shape[0], audio_mel.shape[1]
             
-            # 1. Encode full acoustic spectrum with lookahead & multi-band attention
-            if audio_mel.shape[-1] == self.config.audio_dim:
+            # 1. Encode full acoustic spectrum with lookahead, multi-band attention & spectral differentials
+            if audio_memory is not None:
+                audio_encoded = audio_memory
+            elif audio_mel.shape[-1] == self.config.audio_dim or audio_mel.shape[-1] == (self.config.audio_dim * 3):
                 audio_encoded = self.audio_encoder(audio_mel)
             else:
                 audio_encoded = self.audio_proj(audio_mel)
@@ -306,9 +329,20 @@ if TORCH_AVAILABLE:
             else:
                 lane_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-            # 5. Musical Grid Metrics (Beat Divisor, Bar Fraction, Downbeat)
-            if grid_metrics is not None and grid_metrics.shape[-1] == 3:
-                metric_feat = self.metric_proj(grid_metrics.float())
+            # 5. Musical Grid & Song Structure Metrics (up to 6 dimensions)
+            if grid_metrics is not None:
+                if grid_metrics.shape[-1] == 6:
+                    metric_feat = self.metric_proj(grid_metrics.float())
+                elif grid_metrics.shape[-1] == 3:
+                    # Pad legacy 3-dim [divisor, bar_phase, downbeat] to 6-dim [divisor, bar_phase, downbeat, progress, time_to_end, energy_ratio]
+                    pad = torch.zeros(B, T, 3, device=grid_metrics.device)
+                    pad[:, :, 0] = torch.linspace(0.0, 1.0, T, device=grid_metrics.device).unsqueeze(0)
+                    pad[:, :, 1] = torch.linspace(1.0, 0.0, T, device=grid_metrics.device).unsqueeze(0)
+                    pad[:, :, 2] = 1.0
+                    six_metric = torch.cat([grid_metrics.float(), pad], dim=-1)
+                    metric_feat = self.metric_proj(six_metric)
+                else:
+                    metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
             else:
                 metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 

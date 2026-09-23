@@ -467,8 +467,14 @@ def quantize_beatmap_to_grid(
                 ln_active[end_frame, col] = 1.0
                 lane_states[end_frame, col] = 4  # 4 for LN release
 
-    # Fill Musical Grid Metrics (Beat Divisor, Bar Position, Downbeat Flag)
-    grid_metrics = np.zeros((num_frames, 3), dtype=np.float32)
+    # Fill Musical Grid & Song Structure Metrics (6 channels):
+    # 0: Beat Divisor (1/1, 1/2, 1/3, 1/4, 1/6, 1/8)
+    # 1: Bar Phase fraction [0.0..1.0)
+    # 2: Downbeat Flag (1.0 on beat 1, 0.0 otherwise)
+    # 3: Progress from start [0.0..1.0] (Macro-temporal position)
+    # 4: Time to end [1.0..0.0] (Remaining song fraction)
+    # 5: Local Energy Ratio (1.0 nominal baseline)
+    grid_metrics = np.zeros((num_frames, 6), dtype=np.float32)
     bpm = max(30.0, float(details.bpm))
     beat_len_ms = 60000.0 / bpm
     bar_len_ms = 4.0 * beat_len_ms
@@ -478,16 +484,16 @@ def quantize_beatmap_to_grid(
         t_ms = f * frame_ms
         rel_ms = t_ms - offset_ms
         
-        # Bar phase fraction [0.0 to 1.0)
+        # 1. Bar phase fraction [0.0 to 1.0)
         bar_phase = (rel_ms % bar_len_ms) / bar_len_ms if bar_len_ms > 0 else 0.0
         grid_metrics[f, 1] = float(bar_phase)
 
-        # Downbeat detection (within 16ms of 1/1 bar start)
+        # 2. Downbeat detection (within 16ms of 1/1 bar start)
         dist_to_downbeat = abs(rel_ms % bar_len_ms)
         is_downbeat = 1.0 if (dist_to_downbeat < 16.0 or abs(dist_to_downbeat - bar_len_ms) < 16.0) else 0.0
         grid_metrics[f, 2] = is_downbeat
 
-        # Beat divisor identification (1/1, 1/2, 1/3, 1/4, 1/6, 1/8)
+        # 3. Beat divisor identification (1/1, 1/2, 1/3, 1/4, 1/6, 1/8)
         best_div = 0.0
         min_delta = 999.0
         for div in (1, 2, 4, 3, 6, 8):
@@ -498,6 +504,13 @@ def quantize_beatmap_to_grid(
                 min_delta = dist
                 best_div = float(div)
         grid_metrics[f, 0] = best_div
+
+        # 4. Progress from start & Time to end (Macro Song Progression)
+        grid_metrics[f, 3] = float(f / max(1, num_frames))
+        grid_metrics[f, 4] = float((num_frames - f) / max(1, num_frames))
+
+        # 5. Local energy baseline
+        grid_metrics[f, 5] = 1.0
 
     # Fill SV Curve from TimingPoints
     for t_ms, val, uninherited in details.timing_points:

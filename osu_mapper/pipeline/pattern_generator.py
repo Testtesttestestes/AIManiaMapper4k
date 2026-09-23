@@ -248,7 +248,13 @@ def generate_patterns_with_model3(
     padded_mel = torch.cat([lead_in, audio_mel], dim=0)
     total_padded_frames = padded_mel.shape[0]
 
-    # Precalculate Musical Grid Metrics across all padded frames
+    # Precalculate global audio energy envelope and relative energy ratio per frame
+    with torch.no_grad():
+        frame_energies = padded_mel.exp().mean(dim=-1).cpu().numpy()
+        mean_energy = float(np.mean(frame_energies[warmup_lead_in_frames:])) if total_padded_frames > warmup_lead_in_frames else 1.0
+        mean_energy = max(1e-4, mean_energy)
+
+    # Precalculate 6D Musical Grid & Macro-Temporal Song Structure Metrics across all padded frames
     grid_metrics_np = []
     for f in range(total_padded_frames):
         orig_f = f - warmup_lead_in_frames
@@ -268,9 +274,20 @@ def generate_patterns_with_model3(
             if dist < min_delta and dist <= (frame_ms * 0.75):
                 min_delta = dist
                 best_div = float(div)
-        grid_metrics_np.append([best_div, float(bar_phase), is_downbeat])
+
+        progress = float(max(0, orig_f) / max(1, orig_total_frames))
+        time_to_end = float(max(0, orig_total_frames - orig_f) / max(1, orig_total_frames))
+        local_e = float(frame_energies[f])
+        energy_ratio = float(local_e / mean_energy)
+
+        grid_metrics_np.append([best_div, float(bar_phase), is_downbeat, progress, time_to_end, energy_ratio])
 
     padded_grid_metrics = torch.tensor(grid_metrics_np, dtype=torch.float32, device=dev)
+
+    # Pre-encode the ENTIRE full-song audio spectrum in one global forward pass
+    print(f"  • Pre-encoding entire audio track with Bidirectional Cross-Attention & Spectral Differentials...")
+    with torch.no_grad():
+        full_audio_memory = model.audio_encoder(padded_mel.unsqueeze(0).to(dev))  # [1, total_padded_frames, d_model]
 
     # Maintain real-time 4-lane physical activity state
     lane_states_seq = torch.zeros(total_padded_frames, 4, dtype=torch.int64, device=dev)
@@ -280,7 +297,7 @@ def generate_patterns_with_model3(
     generated_tokens: List[int] = [0] * warmup_lead_in_frames
     all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0]] * warmup_lead_in_frames
 
-    print(f"  • Generating neural 4K patterns with Grid Metric & Lane State Conditioning (SR: {star_rating:.1f}*, {orig_total_frames} frames)...")
+    print(f"  • Generating neural 4K patterns with Full-Song Global Audio Context (SR: {star_rating:.1f}*, {orig_total_frames} frames)...")
 
     # Step through sequence with sliding window context
     step_size = chunk_frames
@@ -288,9 +305,8 @@ def generate_patterns_with_model3(
         end_pos = min(total_padded_frames, cur_pos + step_size)
 
         ctx_start = max(0, cur_pos - 128)
-        audio_lookahead_end = min(total_padded_frames, end_pos + 16)
-        window_mel = padded_mel[ctx_start:audio_lookahead_end].unsqueeze(0).to(dev)
         window_len = end_pos - ctx_start
+        window_mel = padded_mel[ctx_start:end_pos].unsqueeze(0).to(dev)
 
         ctx_tokens = generated_tokens[ctx_start:cur_pos]
         window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
@@ -299,14 +315,16 @@ def generate_patterns_with_model3(
 
         window_lane_states = lane_states_seq[ctx_start:end_pos].unsqueeze(0)
         window_grid_metrics = padded_grid_metrics[ctx_start:end_pos].unsqueeze(0)
+        window_audio_memory = full_audio_memory[:, ctx_start:end_pos]
 
         with torch.no_grad():
             chord_logits, ln_logits = model(
-                window_mel[:, :window_len],
+                window_mel,
                 star_rating=sr_tensor,
                 prev_tokens=window_prev_tokens,
                 lane_states=window_lane_states,
                 grid_metrics=window_grid_metrics,
+                audio_memory=window_audio_memory,
             )
             offset_in_window = cur_pos - ctx_start
             new_chord_logits = chord_logits[0, offset_in_window:]
