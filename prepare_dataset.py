@@ -224,7 +224,7 @@ def process_archives(
                     chunk_count = len(chunks)
 
                     source_label = "GroundTruth .osu" if timing_source == "map" else "Model 1 Sync"
-                    print(f"  - Parsed {details.version}: SR={details.star_rating:.1f}, BPM={details.bpm}, Offset={details.offset_ms}ms, Source=[{source_label}], Chunks={chunk_count}")
+                    print(f"  - Parsed {details.version}: SR={details.star_rating:.2f}*, BPM={details.bpm}, Offset={details.offset_ms}ms, Source=[{source_label}], Chunks={chunk_count}")
 
                     metadata_records.append({
                         "archive": osz.name,

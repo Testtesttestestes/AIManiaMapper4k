@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
+
 
 @dataclass
 class TimingPointData:
@@ -52,6 +54,7 @@ class BeatmapInfo:
     circle_size: float
     overall_difficulty: float
     hp_drain: float
+    star_rating: float
     bpm: float
     min_bpm: float
     max_bpm: float
@@ -255,6 +258,15 @@ class DatasetExtractor:
         except ValueError:
             hp = 8.0
 
+        # Calculate exact osu!mania star rating
+        raw_hit_tuples = [(o.column, o.start_time, o.end_time, o.is_ln) for o in hit_objects]
+        star_rating = calculate_osu_mania_star_rating(
+            osu_text=content,
+            hit_objects=raw_hit_tuples,
+            overall_difficulty=od,
+            keys=4,
+        )
+
         return BeatmapInfo(
             archive_name=archive_name,
             osu_file_name=osu_file_name,
@@ -268,6 +280,7 @@ class DatasetExtractor:
             circle_size=circle_size,
             overall_difficulty=od,
             hp_drain=hp,
+            star_rating=round(star_rating, 2),
             bpm=round(base_bpm, 2),
             min_bpm=round(min_bpm, 2),
             max_bpm=round(max_bpm, 2),

@@ -42,7 +42,8 @@ class TestOsuSyntax(unittest.TestCase):
             creator="AIMapperTester",
         )
 
-        lines = osu_content.splitlines()
+        first_osu = osu_content[0] if isinstance(osu_content, list) else osu_content
+        lines = first_osu.splitlines()
 
         # 1. Header check
         self.assertEqual(lines[0].strip(), "osu file format v14", "Header must be 'osu file format v14'")

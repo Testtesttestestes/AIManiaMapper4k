@@ -33,6 +33,8 @@ try:
 except ImportError:
     torch = None  # type: ignore
 
+from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
+
 
 def find_ffmpeg(custom_path: Optional[str] = None) -> Optional[str]:
     """
@@ -419,10 +421,13 @@ def parse_osu_for_training(content: str, filename: str) -> Optional[ParsedBeatma
 
     hit_objects.sort(key=lambda o: (o[1], o[0]))
 
-    # Star Rating approximation from OD, NPS, and chords
-    duration_s = max(1.0, (hit_objects[-1][2] - hit_objects[0][1]) / 1000.0)
-    avg_nps = len(hit_objects) / duration_s
-    sr = min(9.9, max(1.0, 0.45 * avg_nps + 0.1 * od))
+    # Accurate osu!mania Star Rating via rosu-pp-py (or native strain calculator)
+    sr = calculate_osu_mania_star_rating(
+        osu_text=content,
+        hit_objects=hit_objects,
+        overall_difficulty=od,
+        keys=4,
+    )
 
     return ParsedBeatmapDetails(
         osu_file_name=filename,
