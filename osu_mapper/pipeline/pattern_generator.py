@@ -6,7 +6,7 @@ Generates playable 4K hit objects conditioned on target Star Rating (1.0 to 9.9)
   * Bidirectional deep audio Cross-Attention across full 80-bin frequency spectrum.
   * Musical Grid Metric embeddings (1/1, 1/2, 1/3, 1/4, 1/6, 1/8 beat ticks, downbeat phase).
   * Autoregressive 4-Lane physical state conditioning (Free, Tap, Hold Sustain, Release).
-  * Acoustic silence gating and spectral-sustained LN release prediction.
+  * Spectral-sustained LN release prediction.
 - Algorithmic Generator: Star-Rating scaling (1.0* Easy to 9.9* Expert), ergonomic lane distribution,
   and musical beat tick alignment.
 """

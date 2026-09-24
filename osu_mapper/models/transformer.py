@@ -252,14 +252,6 @@ if TORCH_AVAILABLE:
             self.ln_head = nn.Linear(self.config.d_model, 4)            # LN trigger probability per column
             self.ln_duration_head = nn.Linear(self.config.d_model, 4)   # LN sustain tail duration in frames
 
-            # Acoustic energy & silence gate (suppresses notes in drops/pauses)
-            self.acoustic_gate = nn.Sequential(
-                nn.Linear(self.config.d_model, 64),
-                nn.SiLU(),
-                nn.Linear(64, 1),
-                nn.Sigmoid(),
-            )
-
         def _generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
             mask = torch.triu(torch.full((sz, sz), float("-inf"), device=device), diagonal=1)
             return mask
@@ -361,11 +353,5 @@ if TORCH_AVAILABLE:
             # 8. Predictions
             chord_logits = self.chord_head(hidden)
             ln_logits = self.ln_head(hidden)
-            ln_durations = F.relu(self.ln_duration_head(hidden))
-
-            # 9. Acoustic silence gating
-            energy_gate = self.acoustic_gate(audio_encoded)
-            silence_boost = (1.0 - energy_gate) * 4.0
-            chord_logits[:, :, 0] += silence_boost.squeeze(-1)
 
             return chord_logits, ln_logits
