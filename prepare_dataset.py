@@ -29,6 +29,7 @@ from osu_mapper.dataset.feature_extractor import (
     quantize_beatmap_to_grid,
     slice_beatmap_into_musical_chunks,
 )
+from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
 
 
 def process_archives(
@@ -109,12 +110,14 @@ def process_archives(
     else:
         print("[Timing Strategy] Data Source: ORIGINAL MAP GROUND TRUTH (BPM, Offset & SV directly from .osu)")
 
-    osz_files = sorted(list(in_path.glob("*.osz")))
-    if not osz_files:
-        print(f"[Warning] No .osz archives found in '{in_path}'.")
+    osz_files, song_folders = resolve_beatmap_sources(in_path)
+    total_sources = len(osz_files) + len(song_folders)
+    if total_sources == 0:
+        print(f"[Warning] No .osz archives or song folders found for '{in_path}'.")
+        print("💡 Hint: You can place .osz files in 'sample beatmaps/' or create 'sample beatmaps/sources.txt' with full paths to external map folders (e.g. D:\\osu\\Songs).")
         return {"total_archives": 0, "total_chunks": 0}
 
-    print(f"[Preprocessor] Found {len(osz_files)} .osz archives in '{in_path}'.")
+    print(f"[Preprocessor] Found {len(osz_files)} .osz archives and {len(song_folders)} song directories.")
     chunks_list: List[Dict[str, torch.Tensor]] = []
     song_sync_list: List[Dict[str, Any]] = []
     metadata_records: List[Dict[str, Any]] = []
@@ -126,64 +129,56 @@ def process_archives(
         print(f"\nProcessing '{osz.name}'...")
         try:
             with zipfile.ZipFile(osz, "r") as z:
-                # Find primary audio entry (.mp3, .ogg, .wav): largest file or matching AudioFilename
-                audio_entry = None
-                # First inspect .osu files to find AudioFilename
-                for n in z.namelist():
-                    if n.lower().endswith(".osu"):
-                        raw = z.read(n).decode("utf-8-sig", errors="ignore")
-                        for line in raw.splitlines():
-                            if line.startswith("AudioFilename:"):
-                                cand = line.split(":", 1)[1].strip()
-                                # find case-insensitive in zip
-                                for z_name in z.namelist():
-                                    if z_name.lower() == cand.lower():
-                                        audio_entry = z_name
-                                        break
-                                break
-                    if audio_entry:
-                        break
+                # Cache decoded audio representations per audio file within archive
+                audio_cache: Dict[str, Tuple[torch.Tensor, int, float]] = {}
 
-                # Fallback: select largest audio file in archive (>100KB)
-                if not audio_entry:
-                    audio_candidates = [
-                        info for info in z.infolist()
-                        if info.filename.lower().endswith((".mp3", ".ogg", ".wav"))
-                    ]
-                    if audio_candidates:
-                        audio_candidates.sort(key=lambda info: info.file_size, reverse=True)
-                        audio_entry = audio_candidates[0].filename
+                def get_or_decode_audio(target_audio_name: str) -> Optional[Tuple[torch.Tensor, int, float]]:
+                    clean_name = target_audio_name.strip().lower()
+                    if clean_name in audio_cache:
+                        return audio_cache[clean_name]
 
-                if not audio_entry:
-                    print(f"  [Skip] No valid audio file found in '{osz.name}'.")
-                    continue
+                    # Match case-insensitively in archive
+                    matched_entry = None
+                    for z_name in z.namelist():
+                        if z_name.lower() == clean_name or Path(z_name).name.lower() == clean_name:
+                            matched_entry = z_name
+                            break
 
-                audio_bytes = z.read(audio_entry)
-                ext = Path(audio_entry).suffix.lower()
-                waveform = extract_audio_waveform(
-                    audio_bytes,
-                    file_ext=ext,
-                    target_sr=target_sr,
-                    ffmpeg_path=resolved_ffmpeg,
-                )
-                if waveform is None or waveform.shape[0] < target_sr:
-                    print(f"  [Skip] Failed to decode audio '{audio_entry}' in '{osz.name}'.")
-                    continue
+                    if not matched_entry:
+                        # Fallback: largest audio file in archive
+                        audio_candidates = [
+                            info for info in z.infolist()
+                            if info.filename.lower().endswith((".mp3", ".ogg", ".wav"))
+                        ]
+                        if audio_candidates:
+                            audio_candidates.sort(key=lambda info: info.file_size, reverse=True)
+                            matched_entry = audio_candidates[0].filename
 
-                audio_dur = waveform.shape[0] / target_sr
-                total_audio_sec += audio_dur
-                mel = compute_mel_spectrogram(waveform, sr=target_sr, n_mels=n_mels)
-                num_frames = mel.shape[0]
+                    if not matched_entry:
+                        return None
 
-                # Model 1 prediction override if cascaded mode is enabled
-                timing_override = None
-                if sync_model is not None:
-                    with torch.no_grad():
-                        pred_b, pred_o = sync_model(mel[:1024].unsqueeze(0))
-                        pred_b_val = float(pred_b.squeeze().item())
-                        pred_o_val = float(pred_o.squeeze().item())
-                        timing_override = (pred_b_val, pred_o_val)
-                        print(f"  [Model 1 Inferred Timing] BPM={pred_b_val:.2f}, Offset={pred_o_val:.1f}ms")
+                    try:
+                        audio_bytes = z.read(matched_entry)
+                        ext = Path(matched_entry).suffix.lower()
+                        waveform = extract_audio_waveform(
+                            audio_bytes,
+                            file_ext=ext,
+                            target_sr=target_sr,
+                            ffmpeg_path=resolved_ffmpeg,
+                        )
+                        if waveform is None or waveform.shape[0] < target_sr:
+                            return None
+
+                        dur = waveform.shape[0] / target_sr
+                        audio_mel = compute_mel_spectrogram(waveform, sr=target_sr, n_mels=n_mels)
+                        frames = audio_mel.shape[0]
+                        res = (audio_mel, frames, dur)
+                        audio_cache[clean_name] = res
+                        audio_cache[matched_entry.lower()] = res
+                        return res
+                    except Exception as dec_err:
+                        print(f"  [Audio Warning] Failed to decode '{matched_entry}': {dec_err}")
+                        return None
 
                 # Parse .osu files (Mode 3, CircleSize 4)
                 osu_entries = [n for n in z.namelist() if n.lower().endswith(".osu")]
@@ -199,6 +194,24 @@ def process_archives(
                     details = parse_osu_for_training(osu_text, osu_n)
                     if not details:
                         continue
+
+                    # Fetch exact audio spectrogram for this specific difficulty
+                    audio_res = get_or_decode_audio(details.audio_filename)
+                    if audio_res is None:
+                        print(f"  [Skip {details.version}] No valid audio found matching '{details.audio_filename}' in '{osz.name}'.")
+                        continue
+
+                    mel, num_frames, audio_dur = audio_res
+                    total_audio_sec += (audio_dur / len(osu_entries))  # approximate
+
+                    # Model 1 prediction override if cascaded mode is enabled
+                    timing_override = None
+                    if sync_model is not None:
+                        with torch.no_grad():
+                            pred_b, pred_o = sync_model(mel[:1024].unsqueeze(0))
+                            pred_b_val = float(pred_b.squeeze().item())
+                            pred_o_val = float(pred_o.squeeze().item())
+                            timing_override = (pred_b_val, pred_o_val)
 
                     matched_diffs += 1
                     total_diffs += 1
@@ -224,12 +237,13 @@ def process_archives(
                     chunk_count = len(chunks)
 
                     source_label = "GroundTruth .osu" if timing_source == "map" else "Model 1 Sync"
-                    print(f"  - Parsed {details.version}: SR={details.star_rating:.2f}*, BPM={details.bpm}, Offset={details.offset_ms}ms, Source=[{source_label}], Chunks={chunk_count}")
+                    print(f"  - Parsed {details.version}: SR={details.star_rating:.2f}*, BPM={details.bpm}, Offset={details.offset_ms}ms, Audio='{details.audio_filename}', Chunks={chunk_count}")
 
                     metadata_records.append({
                         "archive": osz.name,
                         "osu_file": osu_n,
                         "version": details.version,
+                        "audio_filename": details.audio_filename,
                         "bpm": details.bpm,
                         "offset_ms": details.offset_ms,
                         "timing_source": timing_source,
@@ -238,17 +252,149 @@ def process_archives(
                         "chunks_extracted": chunk_count,
                     })
 
-                # Record first 1024 frames of the song for Model 1 (Sync BPM / Offset)
-                if matched_diffs > 0 and len(osu_entries) > 0 and 'details' in locals() and details is not None:
-                    song_sync_list.append({
-                        "audio_mel": mel[:1024].clone(),
-                        "bpm": torch.tensor([details.bpm], dtype=torch.float32),
-                        "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
-                        "archive": osz.name,
-                    })
+                    # Record sync sample for Model 1
+                    if len(song_sync_list) < 5000:
+                        song_sync_list.append({
+                            "audio_mel": mel[:1024].clone(),
+                            "bpm": torch.tensor([details.bpm], dtype=torch.float32),
+                            "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                            "archive": osz.name,
+                        })
 
         except Exception as err:
             print(f"  [Error] Failed processing archive '{osz.name}': {err}")
+
+    # Also process uncompressed song folders (e.g. osu! Songs directory)
+    for sdir in song_folders:
+        print(f"\nProcessing folder '{sdir.name}'...")
+        try:
+            audio_cache: Dict[str, Tuple[torch.Tensor, int, float]] = {}
+
+            def get_or_decode_folder_audio(target_audio_name: str) -> Optional[Tuple[torch.Tensor, int, float]]:
+                clean_name = target_audio_name.strip().lower()
+                if clean_name in audio_cache:
+                    return audio_cache[clean_name]
+
+                matched_file = None
+                for f in sdir.iterdir():
+                    if f.is_file() and f.name.lower() == clean_name:
+                        matched_file = f
+                        break
+
+                if not matched_file:
+                    audio_candidates = [
+                        f for f in sdir.iterdir()
+                        if f.is_file() and f.suffix.lower() in (".mp3", ".ogg", ".wav")
+                    ]
+                    if audio_candidates:
+                        audio_candidates.sort(key=lambda f: f.stat().st_size, reverse=True)
+                        matched_file = audio_candidates[0]
+
+                if not matched_file:
+                    return None
+
+                try:
+                    audio_bytes = matched_file.read_bytes()
+                    ext = matched_file.suffix.lower()
+                    waveform = extract_audio_waveform(
+                        audio_bytes,
+                        file_ext=ext,
+                        target_sr=target_sr,
+                        ffmpeg_path=resolved_ffmpeg,
+                    )
+                    if waveform is None or waveform.shape[0] < target_sr:
+                        return None
+
+                    dur = waveform.shape[0] / target_sr
+                    audio_mel = compute_mel_spectrogram(waveform, sr=target_sr, n_mels=n_mels)
+                    frames = audio_mel.shape[0]
+                    res = (audio_mel, frames, dur)
+                    audio_cache[clean_name] = res
+                    audio_cache[matched_file.name.lower()] = res
+                    return res
+                except Exception as dec_err:
+                    print(f"  [Audio Warning] Failed to decode '{matched_file.name}': {dec_err}")
+                    return None
+
+            osu_files = sorted(list(sdir.glob("*.osu")))
+            for osu_path in osu_files:
+                try:
+                    with open(osu_path, "rb") as f_obj:
+                        osu_raw = f_obj.read()
+                    try:
+                        osu_text = osu_raw.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        osu_text = osu_raw.decode("latin-1", errors="ignore")
+
+                    details = parse_osu_for_training(osu_text, osu_path.name)
+                    if not details:
+                        continue
+
+                    audio_res = get_or_decode_folder_audio(details.audio_filename)
+                    if audio_res is None:
+                        continue
+
+                    mel, num_frames, audio_dur = audio_res
+                    total_audio_sec += (audio_dur / max(1, len(osu_files)))
+
+                    timing_override = None
+                    if sync_model is not None:
+                        with torch.no_grad():
+                            pred_b, pred_o = sync_model(mel[:1024].unsqueeze(0))
+                            pred_b_val = float(pred_b.squeeze().item())
+                            pred_o_val = float(pred_o.squeeze().item())
+                            timing_override = (pred_b_val, pred_o_val)
+
+                    matched_diffs += 1
+                    total_diffs += 1
+                    tokens, ln_active, sv_curve, lane_states, grid_metrics = quantize_beatmap_to_grid(details, num_frames=num_frames)
+
+                    chunks = slice_beatmap_into_musical_chunks(
+                        mel=mel,
+                        tokens=tokens,
+                        ln_active=ln_active,
+                        sv_curve=sv_curve,
+                        details=details,
+                        chunk_size=chunk_size,
+                        hop_size=hop_size,
+                        align_mode=align_mode,
+                        bars_per_step=bars_per_step,
+                        timing_source=timing_source,
+                        timing_override=timing_override,
+                        lane_states=lane_states,
+                        grid_metrics=grid_metrics,
+                    )
+                    chunks_list.extend(chunks)
+                    chunk_count = len(chunks)
+
+                    source_label = "GroundTruth .osu" if timing_source == "map" else "Model 1 Sync"
+                    print(f"  - Parsed {details.version}: SR={details.star_rating:.2f}*, BPM={details.bpm}, Offset={details.offset_ms}ms, Audio='{details.audio_filename}', Chunks={chunk_count}")
+
+                    metadata_records.append({
+                        "archive": sdir.name,
+                        "osu_file": osu_path.name,
+                        "version": details.version,
+                        "audio_filename": details.audio_filename,
+                        "bpm": details.bpm,
+                        "offset_ms": details.offset_ms,
+                        "timing_source": timing_source,
+                        "star_rating": details.star_rating,
+                        "total_hit_objects": len(details.hit_objects),
+                        "chunks_extracted": chunk_count,
+                    })
+
+                    if len(song_sync_list) < 5000:
+                        song_sync_list.append({
+                            "audio_mel": mel[:1024].clone(),
+                            "bpm": torch.tensor([details.bpm], dtype=torch.float32),
+                            "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
+                            "archive": sdir.name,
+                        })
+                except Exception as parse_err:
+                    print(f"  [Warning] Failed parsing '{osu_path.name}': {parse_err}")
+
+        except Exception as err:
+            print(f"  [Error] Failed processing folder '{sdir.name}': {err}")
 
     # Stack or save dataset
     dataset_file = out_path / "train_data.pt"
