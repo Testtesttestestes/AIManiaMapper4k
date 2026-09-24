@@ -191,19 +191,19 @@ class TestMusicalChunking(unittest.TestCase):
         )
 
         num_frames = 1000  # 16000ms
-        tokens, ln_active, sv_curve, lane_states, grid_metrics = quantize_beatmap_to_grid(
+        tokens, ln_active, sv_curve, lane_states, grid_metrics, ticks = quantize_beatmap_to_grid(
             multi_bpm_details,
             num_frames=num_frames,
             frame_ms=16.0,
         )
 
-        # Check frame 0 (0ms): 120 BPM downbeat
+        # Check tick 0 (0ms): 120 BPM downbeat
         self.assertEqual(grid_metrics[0, 2].item(), 1.0, "0ms must be downbeat")
 
-        # Check frame 625 (10000ms): 180 BPM section downbeat
-        f_10000 = int(round(10000 / 16.0))
-        self.assertEqual(grid_metrics[f_10000, 2].item(), 1.0, "10000ms (180 BPM start) must be downbeat")
-        self.assertAlmostEqual(grid_metrics[f_10000, 1].item(), 0.0, delta=0.05, msg="Bar phase at BPM change must reset to 0.0")
+        # Check tick at 10000ms: 180 BPM section downbeat
+        tick_10000_idx = min(range(len(ticks)), key=lambda i: abs(ticks[i].time_ms - 10000))
+        self.assertEqual(grid_metrics[tick_10000_idx, 2].item(), 1.0, "10000ms (180 BPM start) must be downbeat")
+        self.assertAlmostEqual(grid_metrics[tick_10000_idx, 1].item(), 0.0, delta=0.05, msg="Bar phase at BPM change must reset to 0.0")
 
 
 

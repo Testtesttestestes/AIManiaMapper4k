@@ -215,7 +215,7 @@ def process_archives(
 
                     matched_diffs += 1
                     total_diffs += 1
-                    tokens, ln_active, sv_curve, lane_states, grid_metrics = quantize_beatmap_to_grid(details, num_frames=num_frames)
+                    tokens, ln_active, sv_curve, lane_states, grid_metrics, ticks = quantize_beatmap_to_grid(details, num_frames=num_frames, audio_mel=mel)
 
                     # Slice song into beat-synchronized or frame-based training windows
                     chunks = slice_beatmap_into_musical_chunks(
@@ -232,6 +232,7 @@ def process_archives(
                         timing_override=timing_override,
                         lane_states=lane_states,
                         grid_metrics=grid_metrics,
+                        ticks=ticks,
                     )
                     chunks_list.extend(chunks)
                     chunk_count = len(chunks)
@@ -347,7 +348,7 @@ def process_archives(
 
                     matched_diffs += 1
                     total_diffs += 1
-                    tokens, ln_active, sv_curve, lane_states, grid_metrics = quantize_beatmap_to_grid(details, num_frames=num_frames)
+                    tokens, ln_active, sv_curve, lane_states, grid_metrics, ticks = quantize_beatmap_to_grid(details, num_frames=num_frames, audio_mel=mel)
 
                     chunks = slice_beatmap_into_musical_chunks(
                         mel=mel,
@@ -363,6 +364,7 @@ def process_archives(
                         timing_override=timing_override,
                         lane_states=lane_states,
                         grid_metrics=grid_metrics,
+                        ticks=ticks,
                     )
                     chunks_list.extend(chunks)
                     chunk_count = len(chunks)

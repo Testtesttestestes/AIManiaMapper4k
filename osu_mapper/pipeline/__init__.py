@@ -168,6 +168,7 @@ def generate_beatmap_pipeline(
                     offset_ms=effective_offset,
                     duration_ms=audio_analysis.duration_ms,
                     star_rating=sr,
+                    timing_points=timing_points,
                 )
                 used_neural = True
                 print(f"✨ [Model 3 Transformer] Successfully generated {len(hit_objects)} neural hit objects.")
