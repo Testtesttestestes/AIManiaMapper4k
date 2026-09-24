@@ -3,6 +3,10 @@ Unit tests for Star Rating scaling, density, stream preservation, and pattern ge
 """
 
 import unittest
+from osu_mapper.dataset.difficulty_calculator import (
+    calculate_osu_mania_star_rating,
+    OsuManiaStrainCalculator,
+)
 from osu_mapper.pipeline.pattern_generator import (
     ManiaHitObject,
     generate_patterns,
@@ -96,6 +100,19 @@ class TestStarRatingAndTiming(unittest.TestCase):
         self.assertEqual(token_to_keys(2), [1])
         self.assertEqual(token_to_keys(3), [0, 1])
         self.assertEqual(token_to_keys(15), [0, 1, 2, 3])
+
+    def test_osu_mania_strain_calculator(self):
+        """Test the strain-based difficulty calculation for mania patterns."""
+        # 1. Very sparse map (slow 1 note per sec)
+        sparse_objects = [(i % 4, i * 1000, i * 1000, False) for i in range(30)]
+        sr_sparse = calculate_osu_mania_star_rating(hit_objects=sparse_objects)
+        self.assertLess(sr_sparse, 2.0, "Sparse map must have low SR")
+
+        # 2. Dense fast stream map (1/4 streams at 180 BPM = 83ms intervals)
+        stream_objects = [(i % 4, int(i * 83.3), int(i * 83.3), False) for i in range(200)]
+        sr_stream = calculate_osu_mania_star_rating(hit_objects=stream_objects)
+        self.assertGreater(sr_stream, 3.0, "Dense 180 BPM streams must have substantial SR")
+        self.assertGreater(sr_stream, sr_sparse, "Streams must be harder than sparse notes")
 
 
 if __name__ == "__main__":
