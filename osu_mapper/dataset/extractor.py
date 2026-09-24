@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
+from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
 
 
 @dataclass
@@ -363,26 +364,24 @@ class DatasetExtractor:
         return results
 
     def extract_all(self) -> List[BeatmapInfo]:
-        """Scans sample_dir for .osz files as well as beatmap subfolders with .osu files."""
-        if not self.sample_dir.exists():
-            print(f"[Extractor] Directory {self.sample_dir} not found.")
+        """Scans sample_dir, text pointer files (.txt, .path, .link), and external folders for .osz/.osu beatmaps."""
+        osz_files, song_folders = resolve_beatmap_sources(self.sample_dir)
+        if not osz_files and not song_folders:
+            print(f"[Extractor] No .osz archives or song folders found for '{self.sample_dir}'.")
             return []
 
         all_infos: List[BeatmapInfo] = []
-        osz_files = sorted(self.sample_dir.glob("*.osz"))
-        print(f"[Extractor] Found {len(osz_files)} .osz archives in '{self.sample_dir}'")
+        print(f"[Extractor] Found {len(osz_files)} .osz archives and {len(song_folders)} song directories.")
 
         for osz in osz_files:
             extracted = self.extract_from_archive(osz)
-            print(f"  - {osz.name}: extracted {len(extracted)} valid mania 4K difficulties")
-            all_infos.extend(extracted)
+            if extracted:
+                print(f"  - {osz.name}: extracted {len(extracted)} valid mania 4K difficulties")
+                all_infos.extend(extracted)
 
-        # Also support uncompressed song folders (e.g. osu! Songs directory)
-        subdirs = sorted([d for d in self.sample_dir.iterdir() if d.is_dir() and any(d.glob("*.osu"))])
-        if subdirs:
-            print(f"[Extractor] Found {len(subdirs)} song directories in '{self.sample_dir}'")
-            for sdir in subdirs:
-                extracted = self.extract_from_folder(sdir)
+        for sdir in song_folders:
+            extracted = self.extract_from_folder(sdir)
+            if extracted:
                 print(f"  - {sdir.name}: extracted {len(extracted)} valid mania 4K difficulties")
                 all_infos.extend(extracted)
 

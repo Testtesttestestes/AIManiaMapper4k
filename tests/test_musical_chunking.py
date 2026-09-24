@@ -164,6 +164,48 @@ class TestMusicalChunking(unittest.TestCase):
             relative_start = c["start_ms"] - self.offset_ms
             self.assertAlmostEqual(relative_start % 1600.0, 0.0, delta=0.01)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch and NumPy required for tensor grid tests")
+    def test_variable_bpm_timing_points_grid_metrics(self):
+        """Verify that multiple uninherited timing points (BPM changes) calculate grid metrics correctly."""
+        from osu_mapper.dataset.feature_extractor import quantize_beatmap_to_grid
+
+        # Map starts at 120 BPM (500ms beat, 2000ms bar), then changes at 10000ms to 180 BPM (333.3ms beat, 1333.3ms bar)
+        multi_bpm_details = ParsedBeatmapDetails(
+            osu_file_name="variable_bpm.osu",
+            version="MultiBPM",
+            mode=3,
+            circle_size=4.0,
+            overall_difficulty=8.0,
+            audio_filename="audio.mp3",
+            bpm=120.0,
+            offset_ms=0,
+            star_rating=4.0,
+            timing_points=[
+                (0, 500.0, True),     # 120 BPM at 0ms
+                (10000, 333.333, True), # 180 BPM at 10000ms
+            ],
+            hit_objects=[
+                (0, 0, 0, False),
+                (1, 10000, 10000, False),
+            ],
+        )
+
+        num_frames = 1000  # 16000ms
+        tokens, ln_active, sv_curve, lane_states, grid_metrics = quantize_beatmap_to_grid(
+            multi_bpm_details,
+            num_frames=num_frames,
+            frame_ms=16.0,
+        )
+
+        # Check frame 0 (0ms): 120 BPM downbeat
+        self.assertEqual(grid_metrics[0, 2].item(), 1.0, "0ms must be downbeat")
+
+        # Check frame 625 (10000ms): 180 BPM section downbeat
+        f_10000 = int(round(10000 / 16.0))
+        self.assertEqual(grid_metrics[f_10000, 2].item(), 1.0, "10000ms (180 BPM start) must be downbeat")
+        self.assertAlmostEqual(grid_metrics[f_10000, 1].item(), 0.0, delta=0.05, msg="Bar phase at BPM change must reset to 0.0")
+
+
 
 if __name__ == "__main__":
     unittest.main()

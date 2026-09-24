@@ -487,21 +487,41 @@ def quantize_beatmap_to_grid(
     # 4: Time to end [1.0..0.0] (Remaining song fraction)
     # 5: Local Energy Ratio (1.0 nominal baseline)
     grid_metrics = np.zeros((num_frames, 6), dtype=np.float32)
-    bpm = max(30.0, float(details.bpm))
-    beat_len_ms = 60000.0 / bpm
-    bar_len_ms = 4.0 * beat_len_ms
-    offset_ms = float(details.offset_ms)
+
+    # Extract all uninherited timing points (red lines / BPM changes) sorted by timestamp
+    uninherited_tps: List[Tuple[int, float, float]] = []
+    for t_ms, val, uninherited in details.timing_points:
+        if uninherited and val > 0:
+            bpm_val = max(30.0, min(1000.0, 60000.0 / val))
+            uninherited_tps.append((t_ms, bpm_val, val))
+
+    if not uninherited_tps:
+        base_b = max(30.0, float(details.bpm))
+        uninherited_tps = [(int(details.offset_ms), base_b, 60000.0 / base_b)]
+    else:
+        uninherited_tps.sort(key=lambda x: x[0])
 
     for f in range(num_frames):
         t_ms = f * frame_ms
-        rel_ms = t_ms - offset_ms
-        
+
+        # Find active BPM section for timestamp t_ms
+        active_tp = uninherited_tps[0]
+        for tp in uninherited_tps:
+            if tp[0] <= t_ms:
+                active_tp = tp
+            else:
+                break
+
+        tp_offset_ms, tp_bpm, beat_len_ms = active_tp
+        bar_len_ms = 4.0 * beat_len_ms
+        rel_ms = t_ms - float(tp_offset_ms)
+
         # 1. Bar phase fraction [0.0 to 1.0)
         bar_phase = (rel_ms % bar_len_ms) / bar_len_ms if bar_len_ms > 0 else 0.0
         grid_metrics[f, 1] = float(bar_phase)
 
         # 2. Downbeat detection (within 16ms of 1/1 bar start)
-        dist_to_downbeat = abs(rel_ms % bar_len_ms)
+        dist_to_downbeat = abs(rel_ms % bar_len_ms) if bar_len_ms > 0 else 0.0
         is_downbeat = 1.0 if (dist_to_downbeat < 16.0 or abs(dist_to_downbeat - bar_len_ms) < 16.0) else 0.0
         grid_metrics[f, 2] = is_downbeat
 

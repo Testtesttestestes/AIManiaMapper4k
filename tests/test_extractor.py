@@ -9,7 +9,9 @@ import shutil
 import tempfile
 import unittest
 
+from pathlib import Path
 from osu_mapper.dataset.extractor import DatasetExtractor
+from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
 
 
 class TestExtractor(unittest.TestCase):
@@ -21,6 +23,28 @@ class TestExtractor(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.output_dir):
             shutil.rmtree(self.output_dir)
+
+    def test_source_resolver_pointer_files(self):
+        """Verify that text pointer files pointing to external folders resolve correctly."""
+        temp_external_dir = tempfile.mkdtemp(prefix="external_osu_")
+        temp_sample_dir = tempfile.mkdtemp(prefix="sample_pointer_")
+
+        try:
+            # Create a fake .osz in external directory
+            fake_osz = Path(temp_external_dir) / "test_song.osz"
+            fake_osz.write_text("fake osz content")
+
+            # Create a pointer .txt in sample dir pointing to external dir
+            pointer_file = Path(temp_sample_dir) / "sources.txt"
+            pointer_file.write_text(f"# External source path\n{temp_external_dir}\n")
+
+            osz_files, folders = resolve_beatmap_sources(temp_sample_dir)
+            self.assertEqual(len(osz_files), 1, "Should find the .osz via the text pointer file")
+            self.assertEqual(osz_files[0].resolve(), fake_osz.resolve())
+
+        finally:
+            shutil.rmtree(temp_external_dir, ignore_errors=True)
+            shutil.rmtree(temp_sample_dir, ignore_errors=True)
 
     def test_extract_real_sample_beatmaps(self):
         if not os.path.exists(self.sample_dir) or not list(Path(self.sample_dir).glob("*.osz")):
