@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI Tool to Compare osu!mania Star Rating between:
-1. Official `rosu-pp-py` (Rust-based engine mirroring osu! source code)
-2. Standalone Native Python Difficulty Engine (built-in, zero dependencies)
+CLI Tool to Inspect & Calculate exact osu!mania Star Rating using official `rosu-pp-py`.
 
 Usage:
     python compare_difficulty.py --map "path/to/beatmap.osz"
@@ -19,9 +17,8 @@ import zipfile
 from typing import List, Optional, Tuple
 
 from osu_mapper.dataset.difficulty_calculator import (
-    ROSU_AVAILABLE,
     calculate_osu_mania_star_rating,
-    calculate_with_rosu_pp_direct,
+    ensure_rosu_pp_installed,
 )
 
 
@@ -96,29 +93,31 @@ def parse_osu_metadata(osu_text: str) -> dict:
 
 def process_osu_content(
     osu_text: str, filename: str
-) -> Tuple[dict, Optional[float], float]:
-    """Computes SR using both rosu-pp and native python engine."""
+) -> Tuple[dict, float]:
+    """Computes SR using official rosu-pp."""
     meta = parse_osu_metadata(osu_text)
     meta["filename"] = filename
 
-    # 1. Calculate with rosu-pp
-    rosu_sr = calculate_with_rosu_pp_direct(osu_text) if ROSU_AVAILABLE else None
-
-    # 2. Calculate with native standalone python engine
-    native_sr = calculate_osu_mania_star_rating(
+    # Calculate strictly with rosu-pp
+    rosu_sr = calculate_osu_mania_star_rating(
         osu_text=osu_text,
         keys=meta["keys"],
         overall_difficulty=meta["od"],
-        force_native=True,
     )
 
-    return meta, rosu_sr, native_sr
+    return meta, rosu_sr
 
 
 def inspect_map_file(file_path: str):
     """Processes a single .osz, .osu, or folder of beatmaps."""
     if not os.path.exists(file_path):
         print(f"❌ Error: File not found: '{file_path}'")
+        return
+
+    # Ensure rosu-pp is active
+    rosu = ensure_rosu_pp_installed()
+    if rosu is None:
+        print("❌ Error: `rosu-pp-py` could not be loaded. Please run 'pip install rosu-pp-py'")
         return
 
     results = []
@@ -175,59 +174,35 @@ def inspect_map_file(file_path: str):
         return
 
     # Print Table
-    print("\n" + "=" * 90)
-    print(" ⭐ OSU!MANIA DIFFICULTY (STAR RATING) COMPARISON REPORT ⭐")
-    print("=" * 90)
+    print("\n" + "=" * 80)
+    print(" ⭐ OSU!MANIA OFFICIAL DIFFICULTY (ROSU-PP RATING) ⭐")
+    print("=" * 80)
+    print("✅ Engine: `rosu-pp-py` (Official Rust Calculator for osu!)")
+    print("-" * 80)
 
-    if ROSU_AVAILABLE:
-        print("✅ Status: `rosu-pp-py` (Official Rust Calculator) is INSTALLED and ACTIVE.")
-    else:
-        print("ℹ️ Status: `rosu-pp-py` is NOT installed in this environment.")
-        print("   👉 Run 'pip install rosu-pp-py' to see side-by-side Rust binary values.")
-    print("-" * 90)
-
-    header = f"{'Difficulty (Version)':<24} | {'Keys':<4} | {'Notes':<6} | {'LNs':<5} | {'rosu-pp':<10} | {'Native SR':<10} | {'Delta':<8}"
+    header = f"{'Difficulty (Version)':<28} | {'Keys':<4} | {'Notes':<6} | {'LNs':<6} | {'OD':<4} | {'Star Rating':<10}"
     print(header)
-    print("-" * 90)
+    print("-" * 80)
 
-    deltas = []
-    for meta, rosu_sr, native_sr in results:
-        diff_name = meta["version"][:23]
+    for meta, rosu_sr in results:
+        diff_name = meta["version"][:27]
         keys = f"{meta['keys']}K"
         notes = str(meta["notes_count"])
         lns = str(meta["ln_count"])
+        od = f"{meta['od']:.1f}"
+        sr_str = f"{rosu_sr:.2f}*"
 
-        if rosu_sr is not None:
-            rosu_str = f"{rosu_sr:.2f}*"
-            diff = native_sr - rosu_sr
-            deltas.append(abs(diff))
-            diff_str = f"{diff:+.2f}*"
-        else:
-            rosu_str = "N/A"
-            diff_str = "—"
-
-        native_str = f"{native_sr:.2f}*"
-
-        row = f"{diff_name:<24} | {keys:<4} | {notes:<6} | {lns:<5} | {rosu_str:<10} | {native_str:<10} | {diff_str:<8}"
+        row = f"{diff_name:<28} | {keys:<4} | {notes:<6} | {lns:<6} | {od:<4} | {sr_str:<10}"
         print(row)
 
-    print("=" * 90)
-
-    if deltas:
-        mean_abs_error = sum(deltas) / len(deltas)
-        max_delta = max(deltas)
-        print(f"📊 Summary Statistics:")
-        print(f"   • Compared Difficulties: {len(deltas)}")
-        print(f"   • Mean Absolute Delta:   {mean_abs_error:.2f}*")
-        print(f"   • Maximum Delta:         {max_delta:.2f}*")
-        if mean_abs_error < 0.35:
-            print("   ✅ High alignment between Native Python strain engine and official rosu-pp!")
-    print("=" * 90 + "\n")
+    print("=" * 80)
+    print(f"Total difficulties calculated: {len(results)} (All values exact 1:1 with osu! engine)")
+    print("=" * 80 + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare osu!mania Star Rating between official rosu-pp and native python engine."
+        description="Calculate official osu!mania Star Rating using rosu-pp-py."
     )
     parser.add_argument(
         "--map",
@@ -248,7 +223,6 @@ def main():
 
     target = args.map_path or args.dir
     if not target:
-        # Default check output_beatmaps if present
         if os.path.exists("output_beatmaps"):
             target = "output_beatmaps"
         else:

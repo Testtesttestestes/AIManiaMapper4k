@@ -11,3 +11,5 @@ __pycache__/
 run_outputs/
 ffmpeg/ffmpeg.exe
 sample beatmaps/
+*.whl
+vendor/
