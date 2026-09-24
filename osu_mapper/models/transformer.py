@@ -226,9 +226,9 @@ if TORCH_AVAILABLE:
             self.num_lane_states = getattr(self.config, "num_lane_states", 5)
             self.lane_state_proj = nn.Linear(4 * self.num_lane_states, self.config.d_model)
 
-            # Musical Metric & Song Structure Grid Embedding (up to 6 channels: divisor, bar_phase, is_downbeat, progress, time_to_end, energy_ratio)
+            # Musical Metric & Song Structure Grid Embedding (up to 8 channels: divisor, bar_phase, is_downbeat, progress, time_to_end, energy_ratio, meter, is_ternary)
             self.metric_proj = nn.Sequential(
-                nn.Linear(6, self.config.d_model // 2),
+                nn.Linear(8, self.config.d_model // 2),
                 nn.GELU(),
                 nn.Linear(self.config.d_model // 2, self.config.d_model),
             )
@@ -321,20 +321,16 @@ if TORCH_AVAILABLE:
             else:
                 lane_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-            # 5. Musical Grid & Song Structure Metrics (up to 6 dimensions)
+            # 5. Musical Grid & Song Structure Metrics (up to 8 dimensions)
             if grid_metrics is not None:
-                if grid_metrics.shape[-1] == 6:
+                if grid_metrics.shape[-1] == 8:
                     metric_feat = self.metric_proj(grid_metrics.float())
-                elif grid_metrics.shape[-1] == 3:
-                    # Pad legacy 3-dim [divisor, bar_phase, downbeat] to 6-dim [divisor, bar_phase, downbeat, progress, time_to_end, energy_ratio]
-                    pad = torch.zeros(B, T, 3, device=grid_metrics.device)
-                    pad[:, :, 0] = torch.linspace(0.0, 1.0, T, device=grid_metrics.device).unsqueeze(0)
-                    pad[:, :, 1] = torch.linspace(1.0, 0.0, T, device=grid_metrics.device).unsqueeze(0)
-                    pad[:, :, 2] = 1.0
-                    six_metric = torch.cat([grid_metrics.float(), pad], dim=-1)
-                    metric_feat = self.metric_proj(six_metric)
+                elif grid_metrics.shape[-1] < 8:
+                    pad = torch.zeros(B, T, 8 - grid_metrics.shape[-1], device=grid_metrics.device)
+                    feat_in = torch.cat([grid_metrics.float(), pad], dim=-1)
+                    metric_feat = self.metric_proj(feat_in)
                 else:
-                    metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
+                    metric_feat = self.metric_proj(grid_metrics[:, :, :8].float())
             else:
                 metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
