@@ -46,6 +46,52 @@ STATE_LN_HOLD = 3
 STATE_LN_RELEASE = 4
 
 
+def calculate_pattern_loss(
+    chord_logits: Any,
+    tokens: Any,
+    ln_logits: Any,
+    ln_mask: Any,
+    pred_sr: Optional[Any] = None,
+    target_sr: Optional[Any] = None,
+    chord_weights: Optional[Any] = None,
+    ln_pos_weight: Optional[Any] = None,
+    sr_loss_weight: float = 0.5,
+    ln_loss_weight: float = 1.5,
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Computes the composite loss for ManiaPatternTransformer:
+    1. Weighted Chord CrossEntropyLoss (penalizes missing active notes vs empty ticks)
+    2. Positively-weighted LN BCE loss (strictly penalizes missed hold notes/sliders)
+    3. Difficulty Consistency SmoothL1Loss (penalizes generating wrong Star Rating density)
+    """
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is required for calculate_pattern_loss.")
+
+    B, T, C = chord_logits.shape
+    criterion_chord = nn.CrossEntropyLoss(weight=chord_weights)
+    loss_chord = criterion_chord(chord_logits.view(B * T, C), tokens.view(B * T))
+
+    if ln_pos_weight is not None:
+        criterion_ln = nn.BCEWithLogitsLoss(pos_weight=ln_pos_weight)
+    else:
+        criterion_ln = nn.BCEWithLogitsLoss()
+    loss_ln = criterion_ln(ln_logits, ln_mask)
+
+    total_loss = loss_chord + ln_loss_weight * loss_ln
+    loss_dict = {
+        "loss_chord": loss_chord,
+        "loss_ln": loss_ln,
+    }
+
+    if pred_sr is not None and target_sr is not None:
+        loss_sr = F.smooth_l1_loss(pred_sr, target_sr)
+        total_loss = total_loss + sr_loss_weight * loss_sr
+        loss_dict["loss_sr"] = loss_sr
+
+    loss_dict["total_loss"] = total_loss
+    return total_loss, loss_dict
+
+
 def keys_to_token(k0: int, k1: int, k2: int, k3: int) -> int:
     """Converts 4 binary key states to a discrete token index (0 to 15)."""
     return (int(bool(k0))) | (int(bool(k1)) << 1) | (int(bool(k2)) << 2) | (int(bool(k3)) << 3)
