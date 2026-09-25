@@ -302,6 +302,39 @@ def generate_patterns_with_model3(
         tick_mel_tensor = torch.stack(tick_mel_list).to(dev)             # [num_ticks, 80]
         grid_metrics_tensor = torch.tensor(grid_metrics_list, dtype=torch.float32, device=dev)  # [num_ticks, 8]
 
+    # Pre-generate Stage 1 Algorithmic Scaffold Draft for the Neural Refiner
+    print(f"  • Generating Stage 1 Algorithmic Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
+    draft_objects = generate_patterns(
+        bpm=bpm,
+        offset_ms=offset_ms,
+        duration_ms=duration_ms,
+        star_rating=star_rating,
+    )
+    tick_time_arr = [t.time_ms for t in ticks]
+    scaffold_keys = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
+    for obj in draft_objects:
+        idx = min(num_ticks - 1, max(0, bisect.bisect_left(tick_time_arr, obj.start_time)))
+        scaffold_keys[idx, obj.column] = 1
+
+    scaffold_tokens_tensor = (
+        (scaffold_keys[:, 0] > 0).long()
+        | ((scaffold_keys[:, 1] > 0).long() << 1)
+        | ((scaffold_keys[:, 2] > 0).long() << 2)
+        | ((scaffold_keys[:, 3] > 0).long() << 3)
+    )
+
+    # Real-time progressive strain trajectory metrics: [running_nps, target_nps_ratio]
+    sr_params = get_star_rating_params(star_rating)
+    target_nps = max(0.5, float(sr_params["target_nps"]))
+    strain_metrics_tensor = torch.zeros(num_ticks, 2, dtype=torch.float32, device=dev)
+    for ti in range(num_ticks):
+        elapsed_s = max(0.001, ticks[ti].time_ms / 1000.0)
+        # estimate running density from scaffold anchors
+        run_notes = int(scaffold_tokens_tensor[:ti+1].gt(0).sum().item())
+        running_nps = run_notes / elapsed_s
+        strain_metrics_tensor[ti, 0] = float(running_nps)
+        strain_metrics_tensor[ti, 1] = float(running_nps / target_nps)
+
     # Pre-encode full tick audio representation with deep audio encoder
     print(f"  • Pre-encoding tick audio features via Bidirectional Audio Encoder...")
     with torch.no_grad():
@@ -330,6 +363,8 @@ def generate_patterns_with_model3(
 
         window_lane_states = lane_states_seq[ctx_start:end_pos].unsqueeze(0)
         window_grid_metrics = grid_metrics_tensor[ctx_start:end_pos].unsqueeze(0)
+        window_scaffold = scaffold_tokens_tensor[ctx_start:end_pos].unsqueeze(0)
+        window_strain = strain_metrics_tensor[ctx_start:end_pos].unsqueeze(0)
         window_audio_memory = full_audio_memory[:, ctx_start:end_pos]
 
         with torch.no_grad():
@@ -339,6 +374,8 @@ def generate_patterns_with_model3(
                 prev_tokens=window_prev_tokens,
                 lane_states=window_lane_states,
                 grid_metrics=window_grid_metrics,
+                scaffold_tokens=window_scaffold,
+                strain_metrics=window_strain,
                 audio_memory=window_audio_memory,
             )
             offset_in_window = cur_pos - ctx_start
@@ -359,7 +396,7 @@ def generate_patterns_with_model3(
             if tok > 0:
                 cols = token_to_keys(tok)
                 for c in cols:
-                    if (star_rating >= 2.0) and (lns[c] > 0.45):
+                    if (star_rating >= 1.8) and (lns[c] > 0.28):
                         lane_states_seq[global_idx, c] = 2  # STATE_LN_START
                         hold_ticks = min(8, num_ticks - global_idx - 1)
                         for hf in range(1, hold_ticks):
@@ -371,6 +408,13 @@ def generate_patterns_with_model3(
 
     # 3. Convert predicted tokens directly into ManiaHitObjects at exact tick timestamps
     hit_objects: List[ManiaHitObject] = []
+    
+    # Adaptive LN probability threshold based on difficulty tier
+    # At SR 2.0+ LNs are standard; weighted BCE produces calibrated probabilities
+    ln_threshold = 0.28 if star_rating >= 2.0 else 0.50
+
+    total_taps = 0
+    total_lns = 0
 
     for i, tok in enumerate(generated_tokens):
         if tok <= 0 or i >= num_ticks:
@@ -385,14 +429,21 @@ def generate_patterns_with_model3(
         cur_ln_prob = all_ln_probs[i] if i < len(all_ln_probs) else [0.0] * 4
 
         for col in active_cols:
-            is_ln = (star_rating >= 2.0) and (cur_ln_prob[col] > 0.45)
+            is_ln = (star_rating >= 1.8) and (cur_ln_prob[col] >= ln_threshold)
             if is_ln:
-                # Release at a future tick aligned to beat sustain
-                sustain_step = tick_obj.subdivisions_per_beat // 2  # 1/2 beat sustain
-                release_idx = min(num_ticks - 1, i + max(2, sustain_step))
+                # Calculate musically quantized sustain duration (1/2 beat, 3/4 beat, 1/1 beat, etc.)
+                subdivs = max(1, tick_obj.subdivisions_per_beat)
+                # Align hold tail to 1/2 beat or 1/1 beat based on probability strength
+                beat_fraction = 1.0 if cur_ln_prob[col] > 0.60 else 0.5
+                hold_step = max(2, int(round(subdivs * beat_fraction)))
+                release_idx = min(num_ticks - 1, i + hold_step)
                 end_t_ms = int(round(ticks[release_idx].time_ms))
+                if end_t_ms <= t_ms:
+                    end_t_ms = t_ms + int(round(tick_obj.beat_len_ms * 0.5))
+                total_lns += 1
             else:
                 end_t_ms = t_ms
+                total_taps += 1
 
             hit_objects.append(
                 ManiaHitObject(
@@ -404,7 +455,14 @@ def generate_patterns_with_model3(
             )
 
     hit_objects.sort(key=lambda o: (o.start_time, o.column))
-    print(f"  ✓ Neural pattern synthesis finished: generated {len(hit_objects)} hit objects (SR: {star_rating:.1f}*).")
+    total_objs = len(hit_objects)
+    duration_sec = max(0.001, duration_ms / 1000.0)
+    avg_nps = total_objs / duration_sec
+    ln_pct = (total_lns / max(1, total_objs)) * 100.0
+    print(
+        f"  ✓ Neural pattern synthesis finished: generated {total_objs} hit objects "
+        f"({total_taps} taps, {total_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS, SR: {star_rating:.1f}*)."
+    )
     return hit_objects
 
 

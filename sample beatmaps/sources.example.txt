@@ -1,0 +1,19 @@
+# ==============================================================================
+# OSU!MANIA DATASET EXTERNAL SOURCES CONFIGURATION
+# ==============================================================================
+# You can list external folders or drives containing your .osz files or osu! Songs.
+# This avoids copying gigabytes of beatmaps onto your system disk.
+#
+# Supported formats per line:
+# 1. Windows folder paths:   D:\osu!\Songs
+#                           E:\Mania_Beatmaps
+#                           C:\Users\Username\AppData\Local\osu!\Songs
+# 2. Linux / macOS paths:   /mnt/data/osu/Songs
+#                           ~/osu_exports
+# 3. Direct .osz files:     D:\downloads\my_favorite_pack.osz
+#
+# Lines starting with '#' or '//' are ignored.
+#
+# Example (uncomment and replace with your actual path):
+# D:\Games\osu!\Songs
+# E:\Beatmaps_Archive

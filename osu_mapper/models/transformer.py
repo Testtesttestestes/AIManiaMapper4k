@@ -222,6 +222,16 @@ if TORCH_AVAILABLE:
             # Autoregressive Token Embedding (Chords 0-15)
             self.token_embed = nn.Embedding(self.config.num_classes, self.config.d_model)
 
+            # Algorithmic Draft / Scaffold Beatmap Embedding (for Two-Stage & Diff-Refiner mode)
+            self.scaffold_embed = nn.Embedding(self.config.num_classes, self.config.d_model)
+
+            # Real-Time Cumulative Strain & Difficulty Trajectory Projection (2 dims: running density, target delta)
+            self.strain_proj = nn.Sequential(
+                nn.Linear(2, self.config.d_model // 2),
+                nn.GELU(),
+                nn.Linear(self.config.d_model // 2, self.config.d_model),
+            )
+
             # 5-State Physical Lane Projection: 4 lanes * 5 states = 20 one-hot inputs -> d_model
             self.num_lane_states = getattr(self.config, "num_lane_states", 5)
             self.lane_state_proj = nn.Linear(4 * self.num_lane_states, self.config.d_model)
@@ -251,6 +261,11 @@ if TORCH_AVAILABLE:
             self.chord_head = nn.Linear(self.config.d_model, self.config.num_classes)
             self.ln_head = nn.Linear(self.config.d_model, 4)            # LN trigger probability per column
             self.ln_duration_head = nn.Linear(self.config.d_model, 4)   # LN sustain tail duration in frames
+            self.sr_eval_head = nn.Sequential(
+                nn.Linear(self.config.d_model, self.config.d_model // 2),
+                nn.SiLU(),
+                nn.Linear(self.config.d_model // 2, 1),
+            )
 
         def _generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
             mask = torch.triu(torch.full((sz, sz), float("-inf"), device=device), diagonal=1)
@@ -263,8 +278,11 @@ if TORCH_AVAILABLE:
             prev_tokens: Optional[torch.Tensor] = None,
             lane_states: Optional[torch.Tensor] = None,
             grid_metrics: Optional[torch.Tensor] = None,
+            scaffold_tokens: Optional[torch.Tensor] = None,
+            strain_metrics: Optional[torch.Tensor] = None,
             audio_memory: Optional[torch.Tensor] = None,
             return_hidden: bool = False,
+            return_sr: bool = False,
             context_dropout: Optional[float] = None,
         ):
             """
@@ -273,9 +291,12 @@ if TORCH_AVAILABLE:
                 star_rating: [Batch, 1] Continuous difficulty scalar (1.0 to 9.9)
                 prev_tokens: [Batch, SeqLen] Autoregressive history of chord tokens (0-15)
                 lane_states: Optional [Batch, SeqLen, 4] integer states [0..4] or [Batch, SeqLen, 20] float one-hot
-                grid_metrics: Optional [Batch, SeqLen, 3..6] musical metric & song structure values
+                grid_metrics: Optional [Batch, SeqLen, 3..8] musical metric & song structure values
+                scaffold_tokens: Optional [Batch, SeqLen] algorithmic draft / initial template chords to refine
+                strain_metrics: Optional [Batch, SeqLen, 2] progressive density & target delta strain trajectory
                 audio_memory: Optional precomputed [Batch, SeqLen_or_Full, d_model] representation from audio_encoder
                 return_hidden: bool, if True returns latent representations
+                return_sr: bool, if True also returns predicted Star Rating [Batch, 1] from latent state
                 context_dropout: Optional override for context dropout probability
             """
             B, T = audio_mel.shape[0], audio_mel.shape[1]
@@ -308,7 +329,23 @@ if TORCH_AVAILABLE:
             else:
                 sr_feat = torch.zeros(B, 1, self.config.d_model, device=audio_mel.device)
 
-            # 4. 5-State Physical Lane Embedding (Free=0, Tap=1, LN_Start=2, LN_Hold=3, LN_Release=4)
+            # 4. Algorithmic Draft / Scaffold Beatmap Embedding
+            if scaffold_tokens is not None:
+                scaffold_feat = self.scaffold_embed(scaffold_tokens.long().clamp(0, self.config.num_classes - 1))
+            else:
+                scaffold_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
+
+            # 5. Real-Time Cumulative Strain & Difficulty Trajectory
+            if strain_metrics is not None:
+                if strain_metrics.shape[-1] == 2:
+                    strain_feat = self.strain_proj(strain_metrics.float())
+                else:
+                    pad = torch.zeros(B, T, 2 - strain_metrics.shape[-1], device=strain_metrics.device)
+                    strain_feat = self.strain_proj(torch.cat([strain_metrics.float(), pad], dim=-1))
+            else:
+                strain_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
+
+            # 6. 5-State Physical Lane Embedding (Free=0, Tap=1, LN_Start=2, LN_Hold=3, LN_Release=4)
             if lane_states is not None:
                 if lane_states.shape[-1] == 4:
                     num_states = getattr(self.config, "num_lane_states", 5)
@@ -321,7 +358,7 @@ if TORCH_AVAILABLE:
             else:
                 lane_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-            # 5. Musical Grid & Song Structure Metrics (up to 8 dimensions)
+            # 7. Musical Grid & Song Structure Metrics (up to 8 dimensions)
             if grid_metrics is not None:
                 if grid_metrics.shape[-1] == 8:
                     metric_feat = self.metric_proj(grid_metrics.float())
@@ -334,11 +371,11 @@ if TORCH_AVAILABLE:
             else:
                 metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-            # 6. Rhythm target queries
-            tgt = self.pos_encoder(tok_feat + sr_feat + lane_feat + metric_feat)
+            # 8. Rhythm target queries
+            tgt = self.pos_encoder(tok_feat + sr_feat + lane_feat + metric_feat + scaffold_feat + strain_feat)
             causal_mask = self._generate_causal_mask(T, audio_mel.device)
 
-            # 7. Cross-Attention Decoder Layers
+            # 9. Cross-Attention Decoder Layers
             hidden = tgt
             for layer in self.decoder_layers:
                 hidden = layer(hidden, memory=audio_encoded, tgt_mask=causal_mask)
@@ -346,8 +383,13 @@ if TORCH_AVAILABLE:
             if return_hidden or (star_rating is None and prev_tokens is None):
                 return hidden
 
-            # 8. Predictions
-            chord_logits = self.chord_head(hidden)
-            ln_logits = self.ln_head(hidden)
+            # 10. Predictions modulated by Star Rating feature representation
+            modulated_hidden = hidden + sr_feat
+            chord_logits = self.chord_head(modulated_hidden)
+            ln_logits = self.ln_head(modulated_hidden)
+
+            if return_sr:
+                pred_sr = self.sr_eval_head(hidden.mean(dim=1))
+                return chord_logits, ln_logits, pred_sr
 
             return chord_logits, ln_logits

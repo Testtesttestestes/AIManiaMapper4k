@@ -242,9 +242,42 @@ def train_model_3_transformer(
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,}")
 
+    # 1. Analyze training data distribution for class balancing & LN penalty
+    print("  • Calculating class frequency and Long Note sparsity on dataset...")
+    chord_counts = torch.zeros(16)
+    total_ln_active = 0
+    total_ln_frames = 0
+    for sample in train_loader.dataset:
+        toks = sample["tokens"]
+        for c in range(16):
+            chord_counts[c] += (toks == c).sum().item()
+        ln_m = sample["ln_mask"]
+        total_ln_active += (ln_m > 0.5).sum().item()
+        total_ln_frames += ln_m.numel()
+
+    # Chord class weighting: penalize missing active notes (tokens 1..15) vs empty ticks (0)
+    total_toks = chord_counts.sum().item()
+    chord_weights = torch.ones(16, device=device)
+    for c in range(16):
+        if chord_counts[c] > 0:
+            chord_weights[c] = (total_toks / (16.0 * chord_counts[c])) ** 0.5
+        else:
+            chord_weights[c] = 1.0
+    chord_weights = chord_weights / chord_weights[0]  # Normalize relative to token 0
+    chord_weights = torch.clamp(chord_weights, min=0.5, max=8.0).to(device)
+
+    # LN positive penalty weight: heavily penalize missed hold notes/sliders
+    if total_ln_active > 0:
+        ln_neg = total_ln_frames - total_ln_active
+        ln_pos_ratio = max(6.0, min(20.0, ln_neg / max(1.0, total_ln_active)))
+    else:
+        ln_pos_ratio = 12.0
+    ln_pos_weight = torch.tensor([ln_pos_ratio], device=device)
+    print(f"  • Active Note Class Multiplier: max {chord_weights.max():.2f}x | LN Penalty Weight (pos_weight): {ln_pos_ratio:.1f}x")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion_chord = nn.CrossEntropyLoss()
-    criterion_ln = nn.BCEWithLogitsLoss()
+    criterion_chord = nn.CrossEntropyLoss(weight=chord_weights)
+    criterion_ln = nn.BCEWithLogitsLoss(pos_weight=ln_pos_weight)
 
     start_epoch = 0
     best_val_loss = float("inf")
@@ -274,7 +307,10 @@ def train_model_3_transformer(
         for epoch in range(start_epoch + 1, target_total_epochs + 1):
             current_epoch = epoch
             model.train()
-            total_loss, total_correct, total_tokens = 0.0, 0, 0
+            total_loss = 0.0
+            total_correct, total_tokens = 0, 0
+            true_note_total, note_detected_total, note_exact_total = 0, 0, 0
+            ln_true_pos_total, ln_pred_pos_total, ln_hit_total = 0, 0, 0
             start_t = time.time()
 
             for batch_idx, batch in enumerate(train_loader):
@@ -284,6 +320,8 @@ def train_model_3_transformer(
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
                 lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                 grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
+                scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
+                strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
 
                 # Autoregressive target: shifted tokens seeded with prior measure context
                 prev_tok = torch.roll(tokens, shifts=1, dims=1)
@@ -300,21 +338,26 @@ def train_model_3_transformer(
                     prev_lane = None
 
                 optimizer.zero_grad()
-                chord_logits, ln_logits = model(
+                chord_logits, ln_logits, pred_sr = model(
                     audio_mel,
                     star_rating=star_rating,
                     prev_tokens=prev_tok,
                     lane_states=prev_lane,
                     grid_metrics=grid_metrics,
+                    scaffold_tokens=scaffold_tokens,
+                    strain_metrics=strain_metrics,
+                    return_sr=True,
                 )
 
-                # Chord loss (16 classes)
+                # Chord loss with class balance
                 B, T, C = chord_logits.shape
                 loss_chord = criterion_chord(chord_logits.view(B * T, C), tokens.view(B * T))
-                # LN duration loss
+                # Weighted LN loss (missed long notes are strictly penalized)
                 loss_ln = criterion_ln(ln_logits, ln_mask)
+                # Difficulty consistency loss (penalizes generating wrong difficulty density)
+                loss_sr = F.smooth_l1_loss(pred_sr, star_rating)
 
-                loss = loss_chord + 0.5 * loss_ln
+                loss = loss_chord + 1.5 * loss_ln + 0.5 * loss_sr
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -324,14 +367,39 @@ def train_model_3_transformer(
                 total_correct += (preds == tokens).sum().item()
                 total_tokens += (B * T)
 
+                # Honest note-specific metrics (excluding idle ticks)
+                is_true_note = (tokens > 0)
+                true_note_cnt = is_true_note.sum().item()
+                true_note_total += true_note_cnt
+                if true_note_cnt > 0:
+                    note_detected_total += (preds[is_true_note] > 0).sum().item()
+                    note_exact_total += (preds[is_true_note] == tokens[is_true_note]).sum().item()
+
+                # LN specific metrics
+                is_ln_true = (ln_mask > 0.5)
+                ln_pred_active = (torch.sigmoid(ln_logits) > 0.30)
+                ln_true_pos_total += is_ln_true.sum().item()
+                ln_pred_pos_total += ln_pred_active.sum().item()
+                ln_hit_total += (ln_pred_active & is_ln_true).sum().item()
+
             train_loss = total_loss / len(train_loader.dataset)
-            train_acc = (total_correct / max(1, total_tokens)) * 100.0
+            train_all_acc = (total_correct / max(1, total_tokens)) * 100.0
+            train_note_recall = (note_detected_total / max(1, true_note_total)) * 100.0
+            train_note_acc = (note_exact_total / max(1, true_note_total)) * 100.0
+            train_ln_recall = (ln_hit_total / max(1, ln_true_pos_total)) * 100.0
+            train_ln_prec = (ln_hit_total / max(1, ln_pred_pos_total)) * 100.0
+            train_ln_f1 = (2 * train_ln_prec * train_ln_recall) / max(1e-5, train_ln_prec + train_ln_recall)
             elapsed = time.time() - start_t
             samples_sec = len(train_loader.dataset) / max(0.001, elapsed)
 
             # Validation
             model.eval()
-            val_loss, val_correct, val_tokens = 0.0, 0, 0
+            val_loss = 0.0
+            val_correct, val_tokens = 0, 0
+            val_true_note, val_note_det, val_note_exact = 0, 0, 0
+            val_ln_true, val_ln_pred, val_ln_hit = 0, 0, 0
+            val_sr_err = 0.0
+
             with torch.no_grad():
                 for batch in val_loader:
                     audio_mel = batch["audio_mel"].to(device)
@@ -340,6 +408,8 @@ def train_model_3_transformer(
                     star_rating = batch["star_rating"].to(device)
                     lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                     grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
+                    scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
+                    strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
 
                     prev_tok = torch.roll(tokens, shifts=1, dims=1)
                     if "prev_tokens" in batch:
@@ -353,32 +423,69 @@ def train_model_3_transformer(
                     else:
                         prev_lane = None
 
-                    c_logits, l_logits = model(
+                    c_logits, l_logits, p_sr = model(
                         audio_mel,
                         star_rating=star_rating,
                         prev_tokens=prev_tok,
                         lane_states=prev_lane,
                         grid_metrics=grid_metrics,
+                        scaffold_tokens=scaffold_tokens,
+                        strain_metrics=strain_metrics,
+                        return_sr=True,
                     )
                     B, T, C = c_logits.shape
                     l_c = criterion_chord(c_logits.view(B * T, C), tokens.view(B * T))
                     l_l = criterion_ln(l_logits, ln_mask)
-                    val_loss += (l_c + 0.5 * l_l).item() * B
+                    l_sr = F.smooth_l1_loss(p_sr, star_rating)
+                    val_loss += (l_c + 1.5 * l_l + 0.5 * l_sr).item() * B
+                    val_sr_err += torch.abs(p_sr - star_rating).sum().item()
 
                     preds = c_logits.argmax(dim=-1)
                     val_correct += (preds == tokens).sum().item()
                     val_tokens += (B * T)
 
+                    is_true = (tokens > 0)
+                    t_cnt = is_true.sum().item()
+                    val_true_note += t_cnt
+                    if t_cnt > 0:
+                        val_note_det += (preds[is_true] > 0).sum().item()
+                        val_note_exact += (preds[is_true] == tokens[is_true]).sum().item()
+
+                    is_ln = (ln_mask > 0.5)
+                    pred_ln = (torch.sigmoid(l_logits) > 0.30)
+                    val_ln_true += is_ln.sum().item()
+                    val_ln_pred += pred_ln.sum().item()
+                    val_ln_hit += (pred_ln & is_ln).sum().item()
+
             val_loss /= len(val_loader.dataset)
-            val_acc = (val_correct / max(1, val_tokens)) * 100.0
+            val_sr_mae = val_sr_err / len(val_loader.dataset)
+            val_all_acc = (val_correct / max(1, val_tokens)) * 100.0
+            val_note_recall = (val_note_det / max(1, val_true_note)) * 100.0
+            val_note_acc = (val_note_exact / max(1, val_true_note)) * 100.0
+            val_ln_recall = (val_ln_hit / max(1, val_ln_true)) * 100.0
+            val_ln_prec = (val_ln_hit / max(1, val_ln_pred)) * 100.0
+            val_ln_f1 = (2 * val_ln_prec * val_ln_recall) / max(1e-5, val_ln_prec + val_ln_recall)
 
             print(
-                f"Epoch {epoch:02d}/{target_total_epochs:02d} [{elapsed:.1f}s | {samples_sec:.1f} smp/s] "
-                f"Train Loss: {train_loss:.4f} (Acc: {train_acc:.1f}%) | "
-                f"Val Loss: {val_loss:.4f} (Acc: {val_acc:.1f}%)"
+                f"Epoch {epoch:02d}/{target_total_epochs:02d} [{elapsed:.1f}s | {samples_sec:.1f} smp/s]\n"
+                f"  Train: Loss={train_loss:.4f} | Note Rec={train_note_recall:.1f}% | Note Acc={train_note_acc:.1f}% | LN Rec={train_ln_recall:.1f}% (LN F1={train_ln_f1:.1f}%) | All Acc={train_all_acc:.1f}%\n"
+                f"  Val:   Loss={val_loss:.4f} | Note Rec={val_note_recall:.1f}% | Note Acc={val_note_acc:.1f}% | LN Rec={val_ln_recall:.1f}% | SR MAE={val_sr_mae:.2f}* | All Acc={val_all_acc:.1f}%"
             )
 
-            record = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc}
+            record = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_note_recall": train_note_recall,
+                "train_note_acc": train_note_acc,
+                "train_ln_recall": train_ln_recall,
+                "train_ln_f1": train_ln_f1,
+                "val_loss": val_loss,
+                "val_acc": val_all_acc,
+                "val_note_recall": val_note_recall,
+                "val_note_acc": val_note_acc,
+                "val_ln_recall": val_ln_recall,
+                "val_ln_f1": val_ln_f1,
+            }
             history.append(record)
 
             # 1. Continuous checkpoint: Always save latest state to _last.pt

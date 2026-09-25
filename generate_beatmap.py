@@ -382,6 +382,14 @@ def main():
         print(f"  • Track Duration:    {analysis.duration_sec:.2f}s")
         print(f"  • Package Created:   {osz_path}")
         print(f"  • Ready to play in:  osu! (Single .osz contains all difficulties)")
+        print("-" * 65)
+        print(" 📊 ROSU-PP VALIDATED DIFFICULTY SUMMARY:")
+        for idx, (osu_text, target_s) in enumerate(zip(osu_contents, sr_list)):
+            from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
+            v_sr = calculate_osu_mania_star_rating(osu_text=osu_text, keys=4)
+            d_val = v_sr - target_s
+            diff_label = f"Diff {idx + 1}"
+            print(f"    • {diff_label:<8} | Target: {target_s:5.2f}* -> rosu Validated: {v_sr:5.2f}* (Delta: {d_val:+5.2f}*)")
         print("=" * 65 + "\n")
 
     finally:

@@ -1,5 +1,3 @@
-"""
-osu_mapper - AI auto-mapper and dataset extraction pipeline for osu!mania 4K.
-"""
+"""osu!mania 4K AI Neural Mapper package."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
