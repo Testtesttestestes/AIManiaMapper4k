@@ -122,12 +122,14 @@ def load_checkpoint_state(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
     device: Optional[torch.device] = None,
+    override_lr: Optional[float] = None,
 ) -> Tuple[int, float, Dict[str, Any]]:
     """
     Loads checkpoint state with 100% backward compatibility:
     - Restores model weights regardless of key naming format (model_state, state_dict, raw dict).
     - Restores optimizer state (momentum, Adam second moments, step count) if present.
     - Gracefully initializes optimizer if checkpoint was saved without optimizer_state.
+    - Applies custom override learning rate (--lr) upon resume if provided.
     - Restores LR scheduler state and starting epoch.
     """
     print(f"🔄 [Resume] Loading checkpoint from: {ckpt_path}")
@@ -162,20 +164,39 @@ def load_checkpoint_state(
                 best_metric = float(ckpt[k])
                 break
 
-    # 4. Optimizer state (Exact continuation without learning disruption)
+    # 4. Optimizer state (Exact continuation with optional LR override)
     if optimizer is not None and isinstance(ckpt, dict) and "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
         try:
             optimizer.load_state_dict(ckpt["optimizer_state"])
-            print("  ✓ Restored optimizer momentum, moving averages, and step states.")
+            saved_lr = optimizer.param_groups[0].get("lr", None) if optimizer.param_groups else None
+
+            if override_lr is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = override_lr
+                if saved_lr is not None and abs(saved_lr - override_lr) > 1e-12:
+                    print(f"  ⚡ Restored optimizer momentum states and updated LR: {saved_lr:.2e} -> {override_lr:.2e} (--lr applied)")
+                else:
+                    print(f"  ✓ Restored optimizer momentum, moving averages, and step states (LR: {override_lr:.2e}).")
+            else:
+                curr_lr_str = f"{saved_lr:.2e}" if saved_lr is not None else "default"
+                print(f"  ✓ Restored optimizer momentum, moving averages, and step states (LR: {curr_lr_str}).")
         except Exception as opt_err:
             print(f"  ℹ️ Notice: Optimizer state format differed ({opt_err}); continuing with fresh optimizer parameters.")
+            if override_lr is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = override_lr
     elif optimizer is not None:
+        if override_lr is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = override_lr
         print(f"  ℹ️ Legacy checkpoint detected: continuing with fresh optimizer parameters from Epoch {start_epoch}.")
 
     # 5. Scheduler state
     if scheduler is not None and isinstance(ckpt, dict) and "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
         try:
             scheduler.load_state_dict(ckpt["scheduler_state"])
+            if override_lr is not None and hasattr(scheduler, "base_lrs"):
+                scheduler.base_lrs = [override_lr for _ in scheduler.base_lrs]
             print("  ✓ Restored LR scheduler state.")
         except Exception:
             pass
@@ -193,14 +214,11 @@ def train_model_3_transformer(
     timing_source: str = "map",
     resume_path: Optional[str] = None,
     context_dropout: float = 0.20,
+    override_lr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Trains Model 3: ManiaPatternTransformer (Causal Autoregressive Pattern Generator).
-    - timing_source="map" (Default): Takes reference ground truth data directly from beatmaps (.osu),
-      preventing error compounding from Model 1 (Teacher Forcing).
-    - timing_source="model1": Evaluates/trains using Model 1 AI predicted alignment.
-    - resume_path: Resumes training exactly from previous checkpoint (weights, optimizer, epoch).
-    - context_dropout: Probability of zeroing/masking history during training to eliminate cold start.
+    Trains Model 3: ManiaPatternTransformer (Hit Object Synthesis).
+    Supports resuming training with optional custom learning rate override.
     """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 3: ManiaPatternTransformer (Hit Object Synthesis)")
@@ -236,7 +254,7 @@ def train_model_3_transformer(
     ckpt_file = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
     if ckpt_file:
         start_epoch, best_metric, ckpt_dict = load_checkpoint_state(
-            ckpt_file, model, optimizer=optimizer, device=device
+            ckpt_file, model, optimizer=optimizer, device=device, override_lr=override_lr
         )
         if best_metric < float("inf"):
             best_val_loss = best_metric
@@ -417,6 +435,7 @@ def train_model_1_sync(
     is_song_level: bool = False,
     augment: bool = True,
     resume_path: Optional[str] = None,
+    override_lr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Trains Model 1: SyncBPMOffsetModel (Audio tempo and beat synchronization).
@@ -425,7 +444,7 @@ def train_model_1_sync(
     - SpecAugment frequency band masking
     - Soft-Argmax Gaussian smoothed CrossEntropy over 301 BPM bins + Smooth L1
     - Cyclic Phase loss for downbeat offset (modulo beat length)
-    - Full resume support.
+    - Full resume support with optional LR override.
     """
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 1: SyncBPMOffsetModel (BPM & Offset Sync)")
@@ -446,7 +465,7 @@ def train_model_1_sync(
     ckpt_file = find_resume_checkpoint(checkpoint_dir, "model_1_sync", resume_path)
     if ckpt_file:
         start_epoch, best_metric, ckpt_dict = load_checkpoint_state(
-            ckpt_file, model, optimizer=optimizer, scheduler=scheduler, device=device
+            ckpt_file, model, optimizer=optimizer, scheduler=scheduler, device=device, override_lr=override_lr
         )
         if "val_bpm_mae" in ckpt_dict:
             best_val_mae = float(ckpt_dict["val_bpm_mae"])
@@ -629,6 +648,7 @@ def train_model_2_dynamics(
     checkpoint_dir: Path,
     timing_source: str = "map",
     resume_path: Optional[str] = None,
+    override_lr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Trains Model 2: DynamicsSVModel (Slider Velocity & Timing changes).
@@ -652,7 +672,7 @@ def train_model_2_dynamics(
     ckpt_file = find_resume_checkpoint(checkpoint_dir, "model_2_dynamics", resume_path)
     if ckpt_file:
         start_epoch, best_metric, ckpt_dict = load_checkpoint_state(
-            ckpt_file, model, optimizer=optimizer, device=device
+            ckpt_file, model, optimizer=optimizer, device=device, override_lr=override_lr
         )
         if best_metric < float("inf"):
             best_val_loss = best_metric
@@ -746,6 +766,7 @@ def train_model_4_evaluator(
     lr: float,
     checkpoint_dir: Path,
     resume_path: Optional[str] = None,
+    override_lr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Trains Model 4: DifficultyEvaluatorModel (Star Rating compliance validation)."""
     print("\n" + "=" * 60)
@@ -762,7 +783,7 @@ def train_model_4_evaluator(
     ckpt_file = find_resume_checkpoint(checkpoint_dir, "model_4_evaluator", resume_path)
     if ckpt_file:
         start_epoch, best_metric, ckpt_dict = load_checkpoint_state(
-            ckpt_file, model, optimizer=optimizer, device=device
+            ckpt_file, model, optimizer=optimizer, device=device, override_lr=override_lr
         )
         if best_metric < float("inf"):
             best_val_loss = best_metric
@@ -876,7 +897,7 @@ def main():
     parser.add_argument("--sync_checkpoint", type=str, default=None, help="Optional Model 1 checkpoint path when timing_source=model1")
     parser.add_argument("--epochs", "-e", type=int, default=15, help="Number of epochs to train (or additional epochs if resuming)")
     parser.add_argument("--batch_size", "-b", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: 2e-4 for fresh training, or custom override on resume)")
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument(
         "--context_dropout",
@@ -903,6 +924,11 @@ def main():
     timing_source = "map" if args.ground_truth else args.timing_source
     resume_target = args.resume_from if args.resume_from is not None else args.resume
 
+    # Resolve learning rate
+    user_lr = args.lr
+    effective_lr = user_lr if user_lr is not None else 2e-4
+    override_lr_on_resume = user_lr  # None preserves checkpoint LR, float overrides it
+
     # Create checkpoints dir
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -924,6 +950,7 @@ def main():
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
+    lr_info = f"{effective_lr} (override on resume)" if (resume_target and user_lr is not None) else (f"{effective_lr} (or from checkpoint)" if resume_target else f"{effective_lr}")
     print(f"\n[Training Configuration]")
     print(f"  Model target:      {args.model}")
     print(f"  Device:            {device}")
@@ -933,19 +960,19 @@ def main():
     print(f"  Validation samples:{val_size}")
     print(f"  Batch size:        {args.batch_size}")
     print(f"  Epochs:            {args.epochs}")
-    print(f"  Learning rate:     {args.lr}")
+    print(f"  Learning rate:     {lr_info}")
     print(f"  Checkpoints dir:   {ckpt_dir.resolve()}")
 
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
         is_song = "song_sync" in str(args.dataset).lower()
-        train_model_1_sync(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target)
+        train_model_1_sync(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target, override_lr=override_lr_on_resume)
     if target in ("2", "dynamics", "all"):
-        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target)
+        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, override_lr=override_lr_on_resume)
     if target in ("3", "transformer", "pattern", "all"):
-        train_model_3_transformer(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout)
+        train_model_3_transformer(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout, override_lr=override_lr_on_resume)
     if target in ("4", "evaluator", "sr", "all"):
-        train_model_4_evaluator(train_loader, val_loader, device, args.epochs, args.lr, ckpt_dir, resume_path=resume_target)
+        train_model_4_evaluator(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume)
 
     print("\n✅ Training procedure completed successfully!")
 
