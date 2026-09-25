@@ -16,6 +16,7 @@ from .pattern_generator import (
     generate_patterns_with_model3,
 )
 from .timing import TimingPoint, generate_timing_points
+from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
 
 
 def generate_beatmap_pipeline(
@@ -202,6 +203,16 @@ def generate_beatmap_pipeline(
         osu_str = packager.generate_osu_content(timing_points, hit_objects)
         diff_packages.append((meta, osu_str))
         osu_contents.append(osu_str)
+
+        # Exact rosu-pp Star Rating validation
+        validated_sr = calculate_osu_mania_star_rating(
+            osu_text=osu_str,
+            keys=4,
+            overall_difficulty=meta.overall_difficulty,
+        )
+        delta = validated_sr - sr
+        status_tag = "✓ EXACT" if abs(delta) <= 0.15 else ("~ CLOSE" if abs(delta) <= 0.40 else "⚠️ DEVIATION")
+        print(f"  🔍 [rosu-pp Difficulty Validation] Target: {sr:.2f}* -> Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*) [{status_tag}]")
 
     # Bundle all difficulties into single .osz archive
     final_osz = BeatmapPackager.package_multi_diff_osz(

@@ -1,8 +1,4 @@
-# osu!mania 4K AI Auto-Mapper Dependencies
 torch>=2.0.0
-torchaudio>=2.0.0
-numpy>=1.24.0
-scipy>=1.10.0
-librosa>=0.10.0
-soundfile>=0.12.1
+numpy>=1.22.0
+scipy>=1.9.0
 rosu-pp-py>=0.10.0

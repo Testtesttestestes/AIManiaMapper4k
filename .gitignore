@@ -1,15 +1,39 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
+# Python
 __pycache__/
-.pytest_cache/
-run_outputs/
-ffmpeg/ffmpeg.exe
-sample beatmaps/
-*.whl
-vendor/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# PyTorch checkpoints and heavy datasets
+*.pt
+*.pth
+dataset_processed/*.pt
+dataset_processed/*.pth
+dataset_manifest/*.csv
+dataset_manifest/*.json
+output_beatmaps/*.osz
+output_beatmaps/*.wav
+template_extracted/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.log

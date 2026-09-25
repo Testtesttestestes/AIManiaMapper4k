@@ -1,10 +1,5 @@
 """
-Timing points and Slider Velocity (SV) dynamics generator for osu!mania 4K.
-
-Generates:
-- Uninherited Timing Points (Red lines): fundamental tempo and time signature
-- Inherited Timing Points (Green lines): dynamic SV speed adjustments responding to RMS audio intensity
-- Musical Grid Snapper: snaps notes to exact fractional beat ticks (1/1, 1/2, 1/3, 1/4, 1/6, 1/8).
+Timing points, musical grid tick generator, and Slider Velocity (SV) dynamics for osu!mania 4K.
 """
 
 from __future__ import annotations
@@ -89,10 +84,8 @@ def generate_musical_grid_ticks_from_timing_points(
     """
     Constructs a deterministic sequence of musical grid decision points strictly aligned
     to all BPM changes, offsets, meters (4/4, 3/4, 6/8, etc.), and fractional beat ticks.
-    Eliminates fixed 16ms frame discretization completely.
     """
-    # 1. Extract and sort uninherited timing points (Red lines / BPM points)
-    uninherited_tps: List[Tuple[float, float, int]] = []  # (time_ms, beat_len_ms, meter)
+    uninherited_tps: List[Tuple[float, float, int]] = []
     
     for tp in timing_points:
         if isinstance(tp, TimingPoint):
@@ -104,7 +97,6 @@ def generate_musical_grid_ticks_from_timing_points(
             if len(tp) >= 3:
                 t_ms = float(tp[0])
                 b_len = float(tp[1])
-                # Check uninherited flag and meter
                 if len(tp) >= 4:
                     meter = int(tp[2]) if int(tp[2]) > 0 else 4
                     uninh = bool(tp[3])
@@ -133,7 +125,6 @@ def generate_musical_grid_ticks_from_timing_points(
         step_ms = tp_beat_len / float(subdivs)
         bar_len_ms = tp_beat_len * float(tp_meter)
 
-        # For the first timing point, start from 0 by stepping backwards along the grid
         if idx == 0:
             start_t = tp_time
             while start_t > 0:
@@ -144,11 +135,9 @@ def generate_musical_grid_ticks_from_timing_points(
 
         while current_t < section_end_ms:
             if current_t >= 0:
-                # Calculate relative offset from this timing point's origin
                 rel_t = current_t - tp_time
                 total_steps = round(rel_t / step_ms)
                 
-                # Step within measure
                 steps_per_bar = subdivs * tp_meter
                 step_in_bar = total_steps % steps_per_bar
                 if step_in_bar < 0:
@@ -157,9 +146,7 @@ def generate_musical_grid_ticks_from_timing_points(
                 beat_in_measure = step_in_bar // subdivs
                 subdiv_idx = step_in_bar % subdivs
 
-                # Classify divisor
                 if is_ternary:
-                    # 6 steps per beat: 0=1/1, (2,4)=1/3, (1,3,5)=1/6
                     if subdiv_idx == 0:
                         div = 1
                         div_frac = 1.0
@@ -170,7 +157,6 @@ def generate_musical_grid_ticks_from_timing_points(
                         div = 6
                         div_frac = 1.0 / 6.0
                 else:
-                    # 8 steps per beat: 0=1/1, 4=1/2, (2,6)=1/4, (1,3,5,7)=1/8
                     if subdiv_idx == 0:
                         div = 1
                         div_frac = 1.0
@@ -188,7 +174,6 @@ def generate_musical_grid_ticks_from_timing_points(
                 is_downbeat = (step_in_bar == 0)
                 is_beat_start = (subdiv_idx == 0)
 
-                # Avoid duplicate timestamps
                 if not ticks or abs(current_t - ticks[-1].time_ms) > (step_ms * 0.4):
                     ticks.append(
                         MusicalGridTick(
@@ -221,10 +206,6 @@ def snap_to_musical_grid(
     divisors: Tuple[int, ...] = (1, 2, 4, 3, 6, 8),
     max_snap_dist_ms: float = 24.0,
 ) -> int:
-    """
-    Snaps a continuous or frame-based timestamp strictly to the closest musical beat divisor tick.
-    Prevents micro-phase jitter (early/late notes) during rhythm game playback.
-    """
     beat_len = 60000.0 / max(1.0, bpm)
     rel_time = raw_time_ms - offset_ms
 
@@ -252,13 +233,9 @@ def generate_timing_points(
     rms_profile: Optional[List[Tuple[int, float]]] = None,
     sv_dynamic_intensity: float = 0.25,
 ) -> List[TimingPoint]:
-    """
-    Constructs uninherited BPM point and inherited SV timing points throughout the song.
-    """
     beat_length = 60000.0 / max(1.0, bpm)
     points: List[TimingPoint] = []
 
-    # 1. Uninherited base timing point (Red Line)
     base_point = TimingPoint(
         time=float(offset_ms),
         beat_length=beat_length,
@@ -271,7 +248,6 @@ def generate_timing_points(
     )
     points.append(base_point)
 
-    # 2. Inherited SV timing points (Green Lines) across bars
     measure_length_ms = beat_length * 4.0
     if rms_profile and duration_ms > measure_length_ms:
         current_time = offset_ms
