@@ -69,6 +69,49 @@ class ManiaHitObject:
             return f"{x},{y},{self.start_time},{obj_type},{hit_sound},{extras}"
 
 
+def sample_chord_tokens_with_nucleus(
+    logits: torch.Tensor,
+    star_rating: float = 3.5,
+    temperature: float = 0.75,
+    top_p: float = 0.85,
+) -> List[int]:
+    """
+    Samples 4K chord tokens using Temperature + Nucleus (Top-P) sampling.
+    Prevents greedy argmax mode collapse (which clusters all notes into Lane 0)
+    and enforces Star Rating chord size constraints.
+    """
+    # Difficulty chord mask: mask out oversized chords for lower Star Ratings
+    max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
+    
+    T, num_classes = logits.shape
+    masked_logits = logits.clone()
+    
+    for tok_idx in range(num_classes):
+        num_keys = bin(tok_idx).count("1")
+        if num_keys > max_keys:
+            masked_logits[:, tok_idx] = -1e9
+
+    scaled_logits = masked_logits / max(0.1, temperature)
+    probs = F.softmax(scaled_logits, dim=-1)
+
+    # Sort descending
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Nucleus mask: keep tokens up to cumulative top_p
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+    sorted_indices_to_remove[:, 0] = 0
+
+    for t_i in range(T):
+        indices_to_remove = sorted_indices[t_i][sorted_indices_to_remove[t_i]]
+        probs[t_i, indices_to_remove] = 0.0
+
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return sampled.cpu().tolist()
+
+
 def token_to_keys(token: int) -> List[int]:
     """Decodes a 4-bit integer token (0-15) into active 4K column indices [0..3]."""
     return [c for c in range(4) if (token >> c) & 1]
@@ -382,7 +425,12 @@ def generate_patterns_with_model3(
             new_chord_logits = chord_logits[0, offset_in_window:]
             new_ln_logits = ln_logits[0, offset_in_window:]
 
-            new_tokens = new_chord_logits.argmax(dim=-1).cpu().tolist()
+            new_tokens = sample_chord_tokens_with_nucleus(
+                logits=new_chord_logits,
+                star_rating=star_rating,
+                temperature=0.75,
+                top_p=0.85,
+            )
             new_lns = torch.sigmoid(new_ln_logits).cpu().tolist()
 
         generated_tokens.extend(new_tokens)
