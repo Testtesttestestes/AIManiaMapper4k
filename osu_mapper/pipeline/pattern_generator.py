@@ -417,8 +417,8 @@ def generate_patterns_with_model3(
                 prev_tokens=window_prev_tokens,
                 lane_states=window_lane_states,
                 grid_metrics=window_grid_metrics,
-                scaffold_tokens=window_scaffold,
-                strain_metrics=window_strain,
+                scaffold_tokens=None,
+                strain_metrics=None,
                 audio_memory=window_audio_memory,
             )
             offset_in_window = cur_pos - ctx_start
