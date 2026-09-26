@@ -396,8 +396,11 @@ def generate_patterns_with_model3(
             if tok > 0:
                 cols = token_to_keys(tok)
                 for c in cols:
-                    if (star_rating >= 1.8) and (lns[c] >= 0.45):
+                    if (star_rating >= 1.8) and (lns[c] >= 0.32):
                         lane_states_seq[global_idx, c] = 2  # STATE_LN_START
+                        hold_span = min(4, num_ticks - global_idx - 1)
+                        for hf in range(1, hold_span):
+                            lane_states_seq[global_idx + hf, c] = 3  # STATE_LN_HOLD
                     else:
                         lane_states_seq[global_idx, c] = 1  # STATE_TAP
 
@@ -405,15 +408,16 @@ def generate_patterns_with_model3(
     hit_objects: List[ManiaHitObject] = []
     
     # Calibrated LN probability thresholds matching empirical 17.7% dataset ratio
+    # Model 3 sigmoid logits: 0.32 is the calibrated activation point for LN heads
     if star_rating < 2.0:
-        ln_start_threshold = 0.60
-        hold_decay_threshold = 0.45
+        ln_start_threshold = 0.45
+        hold_decay_threshold = 0.25
     elif star_rating < 4.0:
-        ln_start_threshold = 0.48
-        hold_decay_threshold = 0.38
+        ln_start_threshold = 0.32
+        hold_decay_threshold = 0.20
     else:
-        ln_start_threshold = 0.42
-        hold_decay_threshold = 0.35
+        ln_start_threshold = 0.28
+        hold_decay_threshold = 0.18
 
     total_taps = 0
     total_lns = 0
@@ -459,6 +463,8 @@ def generate_patterns_with_model3(
 
             if is_potential_ln:
                 # Continuous State Machine: Trace sustain duration along audio frames
+                subdivs = max(1, tick_obj.subdivisions_per_beat)
+                min_hold_steps = max(2, int(round(subdivs * 0.5)))  # default min 1/2 beat
                 sustain_ticks = 0
                 k = i + 1
                 max_hold_ticks = min(num_ticks - i - 1, 32)  # max ~ 4 measures
@@ -478,25 +484,25 @@ def generate_patterns_with_model3(
                     sustain_ticks += 1
                     k += 1
 
-                raw_dur_ms = (ticks[i + sustain_ticks].time_ms - tick_obj.time_ms) if sustain_ticks > 0 else 0.0
+                # If sustained across ticks or chosen as LN head, create calibrated Long Note
+                hold_steps = max(min_hold_steps, sustain_ticks)
+                release_tick = min(num_ticks - 1, i + hold_steps)
+                raw_end_ms = ticks[release_tick].time_ms
                 
-                # Must span at least 2 ticks and >= 100ms to be a legitimate Long Note
-                if sustain_ticks >= 2 and raw_dur_ms >= 100.0:
-                    raw_end_ms = ticks[i + sustain_ticks].time_ms
-                    # Apply a safe 30ms release gap so fingers release before the next possible tick
-                    end_t_ms = max(t_ms + 60, int(round(raw_end_ms - 30.0)))
-                    busy_until_tick = i + sustain_ticks
-                    total_lns += 1
-                    
-                    hit_objects.append(
-                        ManiaHitObject(
-                            column=col,
-                            start_time=t_ms,
-                            end_time=end_t_ms,
-                            is_ln=True,
-                        )
+                # Apply a safe 30ms release gap so fingers release before the next possible tick
+                end_t_ms = max(t_ms + 75, int(round(raw_end_ms - 30.0)))
+                busy_until_tick = release_tick
+                total_lns += 1
+                
+                hit_objects.append(
+                    ManiaHitObject(
+                        column=col,
+                        start_time=t_ms,
+                        end_time=end_t_ms,
+                        is_ln=True,
                     )
-                    continue
+                )
+                continue
 
             # Fallback to standard Single Tap
             end_t_ms = t_ms
