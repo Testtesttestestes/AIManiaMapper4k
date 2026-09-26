@@ -396,61 +396,103 @@ def generate_patterns_with_model3(
             if tok > 0:
                 cols = token_to_keys(tok)
                 for c in cols:
-                    if (star_rating >= 1.8) and (lns[c] > 0.28):
+                    if (star_rating >= 1.8) and (lns[c] >= 0.45):
                         lane_states_seq[global_idx, c] = 2  # STATE_LN_START
-                        hold_ticks = min(8, num_ticks - global_idx - 1)
-                        for hf in range(1, hold_ticks):
-                            lane_states_seq[global_idx + hf, c] = 3  # STATE_LN_HOLD
-                        if (global_idx + hold_ticks) < num_ticks:
-                            lane_states_seq[global_idx + hold_ticks, c] = 4  # STATE_LN_RELEASE
                     else:
                         lane_states_seq[global_idx, c] = 1  # STATE_TAP
 
-    # 3. Convert predicted tokens directly into ManiaHitObjects at exact tick timestamps
+    # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
     
-    # Adaptive LN probability threshold based on difficulty tier
-    # At SR 2.0+ LNs are standard; weighted BCE produces calibrated probabilities
-    ln_threshold = 0.28 if star_rating >= 2.0 else 0.50
+    # Calibrated LN probability thresholds matching empirical 17.7% dataset ratio
+    if star_rating < 2.0:
+        ln_start_threshold = 0.60
+        hold_decay_threshold = 0.45
+    elif star_rating < 4.0:
+        ln_start_threshold = 0.48
+        hold_decay_threshold = 0.38
+    else:
+        ln_start_threshold = 0.42
+        hold_decay_threshold = 0.35
 
     total_taps = 0
     total_lns = 0
 
-    for i, tok in enumerate(generated_tokens):
-        if tok <= 0 or i >= num_ticks:
-            continue
+    # Process each of the 4 keys independently with Lane-Locking & Sustain-Tracking
+    for col in range(4):
+        busy_until_tick = -1
 
-        tick_obj = ticks[i]
-        t_ms = int(round(tick_obj.time_ms))
-        if t_ms >= duration_ms:
-            break
+        for i in range(num_ticks):
+            if i <= busy_until_tick:
+                # Lane is currently locked holding a Long Note; ignore collisions
+                continue
 
-        active_cols = token_to_keys(tok)
-        cur_ln_prob = all_ln_probs[i] if i < len(all_ln_probs) else [0.0] * 4
+            tok = generated_tokens[i] if i < len(generated_tokens) else 0
+            if tok <= 0:
+                continue
 
-        for col in active_cols:
-            is_ln = (star_rating >= 1.8) and (cur_ln_prob[col] >= ln_threshold)
-            if is_ln:
-                # Calculate musically quantized sustain duration (1/2 beat, 3/4 beat, 1/1 beat, etc.)
-                subdivs = max(1, tick_obj.subdivisions_per_beat)
-                # Align hold tail to 1/2 beat or 1/1 beat based on probability strength
-                beat_fraction = 1.0 if cur_ln_prob[col] > 0.60 else 0.5
-                hold_step = max(2, int(round(subdivs * beat_fraction)))
-                release_idx = min(num_ticks - 1, i + hold_step)
-                end_t_ms = int(round(ticks[release_idx].time_ms))
-                if end_t_ms <= t_ms:
-                    end_t_ms = t_ms + int(round(tick_obj.beat_len_ms * 0.5))
-                total_lns += 1
-            else:
-                end_t_ms = t_ms
-                total_taps += 1
+            active_cols = token_to_keys(tok)
+            if col not in active_cols:
+                continue
 
+            tick_obj = ticks[i]
+            t_ms = int(round(tick_obj.time_ms))
+            if t_ms >= duration_ms:
+                break
+
+            cur_ln_prob = all_ln_probs[i][col] if i < len(all_ln_probs) else 0.0
+            is_potential_ln = (star_rating >= 1.8) and (cur_ln_prob >= ln_start_threshold)
+
+            if is_potential_ln:
+                # Continuous State Machine: Trace sustain duration along audio frames
+                sustain_ticks = 0
+                k = i + 1
+                max_hold_ticks = min(num_ticks - i - 1, 32)  # max ~ 4 measures
+                
+                while sustain_ticks < max_hold_ticks:
+                    next_prob = all_ln_probs[k][col] if k < len(all_ln_probs) else 0.0
+                    next_tok = generated_tokens[k] if k < len(generated_tokens) else 0
+                    
+                    # Stop sustain if LN probability drops below decay threshold
+                    if next_prob < hold_decay_threshold:
+                        break
+                        
+                    # Stop sustain if a new distinct tap is struck on the same lane
+                    if (next_tok > 0) and (col in token_to_keys(next_tok)) and (next_prob < ln_start_threshold):
+                        break
+
+                    sustain_ticks += 1
+                    k += 1
+
+                raw_dur_ms = (ticks[i + sustain_ticks].time_ms - tick_obj.time_ms) if sustain_ticks > 0 else 0.0
+                
+                # Must span at least 2 ticks and >= 100ms to be a legitimate Long Note
+                if sustain_ticks >= 2 and raw_dur_ms >= 100.0:
+                    raw_end_ms = ticks[i + sustain_ticks].time_ms
+                    # Apply a safe 30ms release gap so fingers release before the next possible tick
+                    end_t_ms = max(t_ms + 60, int(round(raw_end_ms - 30.0)))
+                    busy_until_tick = i + sustain_ticks
+                    total_lns += 1
+                    
+                    hit_objects.append(
+                        ManiaHitObject(
+                            column=col,
+                            start_time=t_ms,
+                            end_time=end_t_ms,
+                            is_ln=True,
+                        )
+                    )
+                    continue
+
+            # Fallback to standard Single Tap
+            end_t_ms = t_ms
+            total_taps += 1
             hit_objects.append(
                 ManiaHitObject(
                     column=col,
                     start_time=t_ms,
                     end_time=end_t_ms,
-                    is_ln=is_ln,
+                    is_ln=False,
                 )
             )
 
