@@ -72,12 +72,12 @@ class ManiaHitObject:
 def sample_chord_tokens_with_nucleus(
     logits: torch.Tensor,
     star_rating: float = 3.5,
-    temperature: float = 0.75,
-    top_p: float = 0.85,
+    temperature: float = 0.70,
+    top_p: float = 0.90,
 ) -> List[int]:
     """
     Samples 4K chord tokens using Temperature + Nucleus (Top-P) sampling.
-    Calibrates active note density against Star Rating targets and prevents mode collapse.
+    Preserves natural model distribution learned from real human beatmaps.
     """
     # Difficulty chord mask: mask out oversized chords for lower Star Ratings
     max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
@@ -89,23 +89,6 @@ def sample_chord_tokens_with_nucleus(
         num_keys = bin(tok_idx).count("1")
         if num_keys > max_keys:
             masked_logits[:, tok_idx] = -1e9
-
-    # Dynamic Star Rating density calibration:
-    # Adjust idle logit so note frequency scales naturally to target Star Rating (1.0* to 9.0*)
-    if star_rating >= 6.0:
-        idle_bias = 2.8
-    elif star_rating >= 4.8:
-        idle_bias = 2.3
-    elif star_rating >= 3.8:
-        idle_bias = 1.8
-    elif star_rating >= 2.8:
-        idle_bias = 1.2
-    elif star_rating >= 1.8:
-        idle_bias = 0.6
-    else:
-        idle_bias = 0.0
-
-    masked_logits[:, 0] -= idle_bias
 
     scaled_logits = masked_logits / max(0.1, temperature)
     probs = F.softmax(scaled_logits, dim=-1)
@@ -308,6 +291,11 @@ def generate_patterns_with_model3(
     frame_ms = 16.0
 
     # 1. Generate deterministic sequence of musical grid ticks for the entire song duration
+    # In osu!mania 4K, beatmaps with SR < 5.5* use 1/4 binary & 1/3-1/6 ternary subdivisions (73ms at 205 BPM).
+    # 1/8 grid (36ms) is reserved strictly for 7.0*+ vibro/burst maps to prevent impossible 27 NPS minijacks.
+    subdiv_b = 4 if star_rating < 5.5 else 8
+    subdiv_t = 3 if star_rating < 3.5 else 6
+
     resolved_tps = timing_points or [
         TimingPoint(
             time=float(offset_ms),
@@ -321,13 +309,15 @@ def generate_patterns_with_model3(
         duration_ms=duration_ms,
         default_bpm=bpm,
         default_offset_ms=offset_ms,
+        subdiv_binary=subdiv_b,
+        subdiv_ternary=subdiv_t,
     )
     num_ticks = len(ticks)
     if num_ticks == 0:
         print("  ⚠️ Notice: No musical ticks generated; returning empty beatmap.")
         return []
 
-    print(f"  • Generated {num_ticks} deterministic musical grid ticks (1/8 & 1/6 subdivisions) across {duration_ms}ms.")
+    print(f"  • Generated {num_ticks} deterministic musical grid ticks (1/4 & 1/6 subdivisions) across {duration_ms}ms.")
 
     # 2. Extract Mel audio frames sampled at each tick timestamp
     with torch.no_grad():
@@ -407,24 +397,25 @@ def generate_patterns_with_model3(
 
     print(f"  • Generating neural 4K patterns on discrete musical ticks (SR: {star_rating:.1f}*, {num_ticks} decision steps)...")
 
-    step_size = chunk_frames
-    for cur_pos in range(0, num_ticks, step_size):
-        end_pos = min(num_ticks, cur_pos + step_size)
+    # Autoregressive generation: tick-by-tick causality with rolling context
+    ctx_len = 64
+    for cur_pos in range(num_ticks):
+        ctx_start = max(0, cur_pos - ctx_len)
+        window_len = (cur_pos + 1) - ctx_start
 
-        ctx_start = max(0, cur_pos - 128)
-        window_len = end_pos - ctx_start
-        window_mel = tick_mel_tensor[ctx_start:end_pos].unsqueeze(0)
+        window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
 
-        ctx_tokens = generated_tokens[ctx_start:cur_pos]
         window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
-        if ctx_tokens:
-            window_prev_tokens[0, :len(ctx_tokens)] = torch.tensor(ctx_tokens, dtype=torch.int64, device=dev)
+        if cur_pos > ctx_start:
+            window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
+                generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
+            )
 
-        window_lane_states = lane_states_seq[ctx_start:end_pos].unsqueeze(0)
-        window_grid_metrics = grid_metrics_tensor[ctx_start:end_pos].unsqueeze(0)
-        window_scaffold = scaffold_tokens_tensor[ctx_start:end_pos].unsqueeze(0)
-        window_strain = strain_metrics_tensor[ctx_start:end_pos].unsqueeze(0)
-        window_audio_memory = full_audio_memory[:, ctx_start:end_pos]
+        window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
 
         with torch.no_grad():
             chord_logits, ln_logits = model(
@@ -437,36 +428,32 @@ def generate_patterns_with_model3(
                 strain_metrics=window_strain,
                 audio_memory=window_audio_memory,
             )
-            offset_in_window = cur_pos - ctx_start
-            new_chord_logits = chord_logits[0, offset_in_window:]
-            new_ln_logits = ln_logits[0, offset_in_window:]
+            cur_chord_logits = chord_logits[0, -1:].clone()
+            cur_ln_logits = ln_logits[0, -1:].clone()
 
             new_tokens = sample_chord_tokens_with_nucleus(
-                logits=new_chord_logits,
+                logits=cur_chord_logits,
                 star_rating=star_rating,
-                temperature=0.75,
-                top_p=0.85,
+                temperature=0.70,
+                top_p=0.90,
             )
-            new_lns = torch.sigmoid(new_ln_logits).cpu().tolist()
+            new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()[0]
+            tok = new_tokens[0]
 
-        generated_tokens.extend(new_tokens)
-        all_ln_probs.extend(new_lns)
+        generated_tokens.append(tok)
+        all_ln_probs.append(new_lns)
 
         # Update lane state sequence for future autoregressive context
-        for local_idx, (tok, lns) in enumerate(zip(new_tokens, new_lns)):
-            global_idx = cur_pos + local_idx
-            if global_idx >= num_ticks:
-                break
-            if tok > 0:
-                cols = token_to_keys(tok)
-                for c in cols:
-                    if (star_rating >= 1.8) and (lns[c] >= 0.32):
-                        lane_states_seq[global_idx, c] = 2  # STATE_LN_START
-                        hold_span = min(4, num_ticks - global_idx - 1)
-                        for hf in range(1, hold_span):
-                            lane_states_seq[global_idx + hf, c] = 3  # STATE_LN_HOLD
-                    else:
-                        lane_states_seq[global_idx, c] = 1  # STATE_TAP
+        if tok > 0:
+            cols = token_to_keys(tok)
+            for c in cols:
+                if (star_rating >= 1.8) and (new_lns[c] >= 0.35):
+                    lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
+                    hold_span = min(4, num_ticks - cur_pos - 1)
+                    for hf in range(1, hold_span):
+                        lane_states_seq[cur_pos + hf, c] = 3  # STATE_LN_HOLD
+                else:
+                    lane_states_seq[cur_pos, c] = 1  # STATE_TAP
 
     # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
@@ -487,8 +474,12 @@ def generate_patterns_with_model3(
     total_lns = 0
 
     # Process each of the 4 keys independently with Lane-Locking & Sustain-Tracking
+    # Minimum physical gap between notes on the SAME column to prevent unplayable minijacks
+    min_col_gap_ms = 45 if star_rating >= 6.0 else (60 if star_rating >= 3.5 else 120)
+
     for col in range(4):
         busy_until_tick = -1
+        last_note_end_ms = -1000
 
         for i in range(num_ticks):
             if i <= busy_until_tick:
@@ -522,6 +513,10 @@ def generate_patterns_with_model3(
             if t_ms >= duration_ms:
                 break
 
+            # Debounce protection: enforce physical ergonomics on the same column
+            if t_ms - last_note_end_ms < min_col_gap_ms:
+                continue
+
             cur_ln_prob = all_ln_probs[i][col] if i < len(all_ln_probs) else 0.0
             is_potential_ln = (star_rating >= 1.8) and (cur_ln_prob >= ln_start_threshold)
 
@@ -554,6 +549,7 @@ def generate_patterns_with_model3(
                     # Apply a safe 30ms release gap so fingers release before the next possible tick
                     end_t_ms = max(t_ms + 75, int(round(raw_end_ms - 30.0)))
                     busy_until_tick = release_tick
+                    last_note_end_ms = end_t_ms
                     total_lns += 1
                     
                     hit_objects.append(
@@ -568,6 +564,7 @@ def generate_patterns_with_model3(
 
             # Fallback to standard Single Tap
             end_t_ms = t_ms
+            last_note_end_ms = t_ms
             total_taps += 1
             hit_objects.append(
                 ManiaHitObject(
