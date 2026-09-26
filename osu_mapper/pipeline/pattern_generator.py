@@ -77,8 +77,7 @@ def sample_chord_tokens_with_nucleus(
 ) -> List[int]:
     """
     Samples 4K chord tokens using Temperature + Nucleus (Top-P) sampling.
-    Prevents greedy argmax mode collapse (which clusters all notes into Lane 0)
-    and enforces Star Rating chord size constraints.
+    Calibrates active note density against Star Rating targets and prevents mode collapse.
     """
     # Difficulty chord mask: mask out oversized chords for lower Star Ratings
     max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
@@ -90,6 +89,21 @@ def sample_chord_tokens_with_nucleus(
         num_keys = bin(tok_idx).count("1")
         if num_keys > max_keys:
             masked_logits[:, tok_idx] = -1e9
+
+    # Star Rating density calibration: adjust idle token logit so note density matches difficulty
+    # Higher Star Ratings require higher density (streams, bursts, chordjacks)
+    if star_rating >= 6.0:
+        idle_bias = 1.6
+    elif star_rating >= 4.5:
+        idle_bias = 1.2
+    elif star_rating >= 3.5:
+        idle_bias = 0.8
+    elif star_rating >= 2.5:
+        idle_bias = 0.4
+    else:
+        idle_bias = 0.0
+
+    masked_logits[:, 0] -= idle_bias
 
     scaled_logits = masked_logits / max(0.1, temperature)
     probs = F.softmax(scaled_logits, dim=-1)
@@ -455,17 +469,17 @@ def generate_patterns_with_model3(
     # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
     
-    # Calibrated LN probability thresholds matching empirical 17.7% dataset ratio
-    # Model 3 sigmoid logits: 0.32 is the calibrated activation point for LN heads
+    # Calibrated LN probability thresholds matching empirical 15-20% dataset ratio
+    # Model 3 was trained with pos_weight=12.0, so genuine LN activations are >= 0.60
     if star_rating < 2.0:
-        ln_start_threshold = 0.45
-        hold_decay_threshold = 0.25
+        ln_start_threshold = 0.75
+        hold_decay_threshold = 0.45
     elif star_rating < 4.0:
-        ln_start_threshold = 0.32
-        hold_decay_threshold = 0.20
+        ln_start_threshold = 0.65
+        hold_decay_threshold = 0.35
     else:
-        ln_start_threshold = 0.28
-        hold_decay_threshold = 0.18
+        ln_start_threshold = 0.58
+        hold_decay_threshold = 0.30
 
     total_taps = 0
     total_lns = 0
@@ -511,8 +525,6 @@ def generate_patterns_with_model3(
 
             if is_potential_ln:
                 # Continuous State Machine: Trace sustain duration along audio frames
-                subdivs = max(1, tick_obj.subdivisions_per_beat)
-                min_hold_steps = max(2, int(round(subdivs * 0.5)))  # default min 1/2 beat
                 sustain_ticks = 0
                 k = i + 1
                 max_hold_ticks = min(num_ticks - i - 1, 32)  # max ~ 4 measures
@@ -532,25 +544,25 @@ def generate_patterns_with_model3(
                     sustain_ticks += 1
                     k += 1
 
-                # If sustained across ticks or chosen as LN head, create calibrated Long Note
-                hold_steps = max(min_hold_steps, sustain_ticks)
-                release_tick = min(num_ticks - 1, i + hold_steps)
-                raw_end_ms = ticks[release_tick].time_ms
-                
-                # Apply a safe 30ms release gap so fingers release before the next possible tick
-                end_t_ms = max(t_ms + 75, int(round(raw_end_ms - 30.0)))
-                busy_until_tick = release_tick
-                total_lns += 1
-                
-                hit_objects.append(
-                    ManiaHitObject(
-                        column=col,
-                        start_time=t_ms,
-                        end_time=end_t_ms,
-                        is_ln=True,
+                # If the note genuinely sustains for >= 2 ticks in audio, emit a calibrated Long Note
+                if sustain_ticks >= 2:
+                    release_tick = min(num_ticks - 1, i + sustain_ticks)
+                    raw_end_ms = ticks[release_tick].time_ms
+                    
+                    # Apply a safe 30ms release gap so fingers release before the next possible tick
+                    end_t_ms = max(t_ms + 75, int(round(raw_end_ms - 30.0)))
+                    busy_until_tick = release_tick
+                    total_lns += 1
+                    
+                    hit_objects.append(
+                        ManiaHitObject(
+                            column=col,
+                            start_time=t_ms,
+                            end_time=end_t_ms,
+                            is_ln=True,
+                        )
                     )
-                )
-                continue
+                    continue
 
             # Fallback to standard Single Tap
             end_t_ms = t_ms
