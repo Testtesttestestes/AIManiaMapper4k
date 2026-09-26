@@ -90,16 +90,18 @@ def sample_chord_tokens_with_nucleus(
         if num_keys > max_keys:
             masked_logits[:, tok_idx] = -1e9
 
-    # Star Rating density calibration: adjust idle token logit so note density matches difficulty
-    # Higher Star Ratings require higher density (streams, bursts, chordjacks)
+    # Dynamic Star Rating density calibration:
+    # Adjust idle logit so note frequency scales naturally to target Star Rating (1.0* to 9.0*)
     if star_rating >= 6.0:
-        idle_bias = 1.6
-    elif star_rating >= 4.5:
+        idle_bias = 2.8
+    elif star_rating >= 4.8:
+        idle_bias = 2.3
+    elif star_rating >= 3.8:
+        idle_bias = 1.8
+    elif star_rating >= 2.8:
         idle_bias = 1.2
-    elif star_rating >= 3.5:
-        idle_bias = 0.8
-    elif star_rating >= 2.5:
-        idle_bias = 0.4
+    elif star_rating >= 1.8:
+        idle_bias = 0.6
     else:
         idle_bias = 0.0
 
@@ -431,8 +433,8 @@ def generate_patterns_with_model3(
                 prev_tokens=window_prev_tokens,
                 lane_states=window_lane_states,
                 grid_metrics=window_grid_metrics,
-                scaffold_tokens=None,
-                strain_metrics=None,
+                scaffold_tokens=window_scaffold,
+                strain_metrics=window_strain,
                 audio_memory=window_audio_memory,
             )
             offset_in_window = cur_pos - ctx_start
@@ -470,16 +472,16 @@ def generate_patterns_with_model3(
     hit_objects: List[ManiaHitObject] = []
     
     # Calibrated LN probability thresholds matching empirical 15-20% dataset ratio
-    # Model 3 was trained with pos_weight=12.0, so genuine LN activations are >= 0.60
+    # Model 3 was trained with pos_weight=12.0: 0.38-0.44 captures natural vocal/synth sustains
     if star_rating < 2.0:
-        ln_start_threshold = 0.75
-        hold_decay_threshold = 0.45
+        ln_start_threshold = 0.55
+        hold_decay_threshold = 0.28
     elif star_rating < 4.0:
-        ln_start_threshold = 0.65
-        hold_decay_threshold = 0.35
+        ln_start_threshold = 0.44
+        hold_decay_threshold = 0.22
     else:
-        ln_start_threshold = 0.58
-        hold_decay_threshold = 0.30
+        ln_start_threshold = 0.38
+        hold_decay_threshold = 0.19
 
     total_taps = 0
     total_lns = 0
@@ -544,8 +546,8 @@ def generate_patterns_with_model3(
                     sustain_ticks += 1
                     k += 1
 
-                # If the note genuinely sustains for >= 2 ticks in audio, emit a calibrated Long Note
-                if sustain_ticks >= 2:
+                # If the note sustains across subsequent ticks, emit a calibrated Long Note
+                if sustain_ticks >= 1:
                     release_tick = min(num_ticks - 1, i + sustain_ticks)
                     raw_end_ms = ticks[release_tick].time_ms
                     
