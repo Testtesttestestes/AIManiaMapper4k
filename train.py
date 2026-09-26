@@ -204,19 +204,24 @@ def load_checkpoint_state(
     return start_epoch, best_metric, ckpt if isinstance(ckpt, dict) else {}
 
 
-def compute_online_scaffold_and_strain(
+def compute_multi_scenario_scaffold_and_strain(
     tokens: torch.Tensor,
     star_rating: torch.Tensor,
     grid_metrics: Optional[torch.Tensor] = None,
+    audio_mel: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Synthesizes real-time strain trajectory metrics and algorithmic scaffold draft tokens
-    on-the-fly, ensuring 100% gradient activity across scaffold_embed and strain_proj layers.
+    Synthesizes diverse realistic Multi-Scenario training inputs:
+      Scenario A (35%): Algorithmic Heuristic Debris (Stage 1 downbeat/grid draft)
+      Scenario B (35%): Extreme Neural/Human Debris (Spam bursts, wrong lanes, density drift)
+      Scenario C (15%): Sparse / Blank Scaffold (forces model to reconstruct from pure audio)
+      Scenario D (15%): Softly Perturbed Scaffold (cues with minor deviations)
+    Ensures the model functions as a robust Garbage-to-Master-Map converter.
     """
     B, T = tokens.shape
     device = tokens.device
 
-    # 1. Real-time Strain Trajectory Metrics [B, T, 2]: [running_density, target_ratio]
+    # 1. Target Strain Trajectory Metrics [B, T, 2]: [running_density, target_ratio]
     is_note = tokens.gt(0).float()
     cum_notes = torch.cumsum(is_note, dim=1)
     time_steps = torch.arange(1, T + 1, device=device, dtype=torch.float32).unsqueeze(0).expand(B, T)
@@ -225,11 +230,66 @@ def compute_online_scaffold_and_strain(
     density_ratio = (running_density / target_density).clamp(max=5.0)
     strain_metrics = torch.stack([running_density, density_ratio], dim=-1)
 
-    # 2. Algorithmic Rhythm Scaffold Draft [B, T] with 25% noise regularization
-    scaffold_tokens = tokens.clone()
-    perturb_mask = (torch.rand(B, T, device=device) < 0.25)
-    random_tokens = torch.randint(0, 16, (B, T), device=device)
-    scaffold_tokens[perturb_mask] = random_tokens[perturb_mask]
+    # 2. Multi-Scenario Scaffold Generator
+    scaffold_tokens = torch.zeros(B, T, dtype=torch.int64, device=device)
+
+    for b in range(B):
+        scenario_choice = torch.rand(1).item()
+        sr = float(star_rating[b].item()) if star_rating.ndim > 1 else float(star_rating[b])
+
+        if scenario_choice < 0.35:
+            # Scenario A: Algorithmic Heuristic Debris (Downbeat / 1/4 Grid placement)
+            if grid_metrics is not None:
+                # Use downbeats & energy from grid_metrics [T, 8]
+                is_downbeat = grid_metrics[b, :, 2] > 0.5
+                div_frac = grid_metrics[b, :, 0]
+                is_quarter = (div_frac % 0.25 < 0.05) | (div_frac % 0.25 > 0.95)
+                
+                # Assign chords based on SR
+                chord_size = 1 if sr < 2.5 else (2 if sr < 5.0 else 3)
+                basic_pattern = torch.zeros(T, dtype=torch.int64, device=device)
+                
+                # Single notes on quarters, doubles on downbeats
+                for t in range(T):
+                    if is_downbeat[t]:
+                        basic_pattern[t] = 3 if chord_size >= 2 else 1  # 0011 or 0001
+                    elif is_quarter[t] and (t % 2 == 0):
+                        basic_pattern[t] = 1 << (t % 4)
+                
+                scaffold_tokens[b] = basic_pattern
+            else:
+                # Simple periodic 1/4 fallback
+                basic_pattern = torch.zeros(T, dtype=torch.int64, device=device)
+                basic_pattern[::4] = 1
+                basic_pattern[::8] = 3
+                scaffold_tokens[b] = basic_pattern
+
+        elif scenario_choice < 0.70:
+            # Scenario B: Extreme Neural / Debris Garbage (Spam bursts, wrong lanes, erratic density)
+            debris = tokens[b].clone()
+            # Randomly inject 40-70% noise, duplicate notes, and spam bursts
+            noise_rate = torch.empty(1).uniform_(0.40, 0.75).item()
+            noise_mask = torch.rand(T, device=device) < noise_rate
+            debris[noise_mask] = torch.randint(0, 16, (noise_mask.sum(),), device=device)
+            
+            # Inject uncoordinated minijacks (repeated identical tokens)
+            if torch.rand(1).item() < 0.5:
+                jack_span = torch.randint(4, 16, (1,)).item()
+                start_j = torch.randint(0, max(1, T - jack_span), (1,)).item()
+                debris[start_j : start_j + jack_span] = 1 << torch.randint(0, 4, (1,)).item()
+
+            scaffold_tokens[b] = debris
+
+        elif scenario_choice < 0.85:
+            # Scenario C: Sparse / Blank Scaffold (Force pure Audio -> Beatmap synthesis)
+            scaffold_tokens[b] = torch.zeros(T, dtype=torch.int64, device=device)
+
+        else:
+            # Scenario D: Softly Perturbed Scaffold (15% noise)
+            clean_draft = tokens[b].clone()
+            soft_noise = torch.rand(T, device=device) < 0.15
+            clean_draft[soft_noise] = torch.randint(0, 16, (soft_noise.sum(),), device=device)
+            scaffold_tokens[b] = clean_draft
 
     return scaffold_tokens, strain_metrics
 
@@ -353,18 +413,25 @@ def train_model_3_transformer(
                 scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
                 strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
                 if scaffold_tokens is None or strain_metrics is None:
-                    synth_scaffold, synth_strain = compute_online_scaffold_and_strain(tokens, star_rating, grid_metrics)
+                    synth_scaffold, synth_strain = compute_multi_scenario_scaffold_and_strain(tokens, star_rating, grid_metrics, audio_mel)
                     if scaffold_tokens is None:
                         scaffold_tokens = synth_scaffold
                     if strain_metrics is None:
                         strain_metrics = synth_strain
 
-                # Autoregressive target: shifted tokens seeded with prior measure context
+                # Multi-Scenario History Injection (Scheduled Sampling with Model Error / Debris)
+                # 50% Clean Gold History, 50% Noisy/Debris History (Trains model to recover from mistakes)
                 prev_tok = torch.roll(tokens, shifts=1, dims=1)
                 if "prev_tokens" in batch:
                     prev_tok[:, 0] = batch["prev_tokens"].to(device)[:, -1]
                 else:
                     prev_tok[:, 0] = 0
+
+                noise_history_mask = (torch.rand(B, T, device=device) < 0.35)
+                # Roll history noise only on 60% of batches
+                if torch.rand(1).item() < 0.60:
+                    prev_tok = prev_tok.clone()
+                    prev_tok[noise_history_mask] = torch.randint(0, 16, (noise_history_mask.sum(),), device=device)
 
                 # Shifted lane states for autoregression
                 if lane_states is not None:
@@ -464,7 +531,7 @@ def train_model_3_transformer(
                     scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
                     strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
                     if scaffold_tokens is None or strain_metrics is None:
-                        synth_scaffold, synth_strain = compute_online_scaffold_and_strain(tokens, star_rating, grid_metrics)
+                        synth_scaffold, synth_strain = compute_multi_scenario_scaffold_and_strain(tokens, star_rating, grid_metrics, audio_mel)
                         if scaffold_tokens is None:
                             scaffold_tokens = synth_scaffold
                         if strain_metrics is None:
