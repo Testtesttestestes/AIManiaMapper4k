@@ -436,7 +436,21 @@ def generate_patterns_with_model3(
                 continue
 
             tick_obj = ticks[i]
-            t_ms = int(round(tick_obj.time_ms))
+            base_ms = tick_obj.time_ms
+            
+            # Dynamic Transient Micro-Alignment (Sub-tick precision to audio onsets)
+            center_frame = max(0, min(orig_total_mel_frames - 1, int(round(base_ms / frame_ms))))
+            best_offset_ms = 0.0
+            max_local_e = -1.0
+            for f_off in (-1, 0, 1):
+                f_idx = center_frame + f_off
+                if 0 <= f_idx < len(frame_energies_t):
+                    val = float(frame_energies_t[f_idx].item())
+                    if val > max_local_e:
+                        max_local_e = val
+                        best_offset_ms = f_off * (frame_ms * 0.25)  # sub-tick micro-offset +/- 4ms
+            
+            t_ms = int(round(base_ms + best_offset_ms))
             if t_ms >= duration_ms:
                 break
 
