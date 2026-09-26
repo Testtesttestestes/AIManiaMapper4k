@@ -406,6 +406,7 @@ def train_model_3_transformer(
             for batch_idx, batch in enumerate(train_loader):
                 audio_mel = batch["audio_mel"].to(device)       # [B, T, 80]
                 tokens = batch["tokens"].to(device)             # [B, T]
+                B, T = tokens.shape
                 ln_mask = batch["ln_mask"].to(device)           # [B, T, 4]
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
                 lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
