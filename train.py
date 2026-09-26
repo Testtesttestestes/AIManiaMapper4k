@@ -350,6 +350,8 @@ def train_model_3_transformer(
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
                 lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                 grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
+                scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
+                strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
                 if scaffold_tokens is None or strain_metrics is None:
                     synth_scaffold, synth_strain = compute_online_scaffold_and_strain(tokens, star_rating, grid_metrics)
                     if scaffold_tokens is None:
@@ -459,6 +461,8 @@ def train_model_3_transformer(
                     star_rating = batch["star_rating"].to(device)
                     lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                     grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
+                    scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
+                    strain_metrics = batch["strain_metrics"].to(device) if "strain_metrics" in batch else None
                     if scaffold_tokens is None or strain_metrics is None:
                         synth_scaffold, synth_strain = compute_online_scaffold_and_strain(tokens, star_rating, grid_metrics)
                         if scaffold_tokens is None:
