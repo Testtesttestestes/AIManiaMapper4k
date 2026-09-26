@@ -66,3 +66,12 @@ def calculate_osu_mania_star_rating(
 
     sr = base_sr * chord_mult * ln_mult
     return max(0.8, min(11.5, round(sr, 2)))
+
+
+def ensure_rosu_pp_installed() -> bool:
+    """Checks if rosu_pp_py is importable or can be used."""
+    try:
+        import rosu_pp_py
+        return True
+    except ImportError:
+        return False
