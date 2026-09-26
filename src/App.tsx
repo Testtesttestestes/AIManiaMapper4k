@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   Music,
   Database,
@@ -10,14 +10,9 @@ import {
   RotateCcw,
   Sliders,
   Sparkles,
-  Layers,
-  Activity,
-  FileCode,
   Zap,
-  TrendingUp,
   BarChart3,
   Search,
-  ExternalLink,
 } from "lucide-react";
 import { SAMPLE_MANIFEST, ExtractedBeatmap } from "./data/sampleManifest";
 import { GeneratedNote, BeatmapGenerationSettings } from "./types";

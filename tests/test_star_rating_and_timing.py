@@ -103,7 +103,7 @@ class TestStarRatingAndTiming(unittest.TestCase):
     def test_osu_mania_strain_calculator(self):
         """Test the strain-based difficulty calculation for mania patterns."""
         from osu_mapper.dataset.difficulty_calculator import ensure_rosu_pp_installed
-        if ensure_rosu_pp_installed() is None:
+        if not ensure_rosu_pp_installed():
             self.skipTest("rosu-pp-py is not installed in this environment")
 
         # 1. Very sparse map (slow 1 note per sec)
