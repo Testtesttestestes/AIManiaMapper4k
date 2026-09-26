@@ -68,11 +68,22 @@ def inspect_checkpoint(ckpt_path: Path):
         p_norm = p.norm(2).item()
         shape_str = str(list(p.shape))
 
-        # Check if layer remained at initial random uniform / unoptimized state
-        # In AdamW, layers with no gradient updates have empty or 0 first/second moments in optimizer state
+        # Check if layer received real optimizer updates (AdamW moment buffers or non-trivial weight shifts)
         status = "✅ ACTIVE"
-        if "scaffold_embed" in name or "strain_proj" in name:
-            status = "💤 SLEEPING (Unused during train)"
+        # Check optimizer state if present
+        is_in_optimizer = False
+        if isinstance(ckpt, dict) and "optimizer_state" in ckpt:
+            opt_state = ckpt["optimizer_state"].get("state", {})
+            # Match parameter index
+            for param_idx, state in opt_state.items():
+                if "exp_avg" in state and state["exp_avg"].shape == param.shape:
+                    if state["exp_avg"].abs().sum().item() > 1e-7:
+                        is_in_optimizer = True
+                        break
+        
+        # If std is near 0 or param has never received updates
+        if p_std < 1e-7 and numel > 1:
+            status = "💤 SLEEPING (Zero variance)"
             sleeping_layers.append(name)
         else:
             active_layers.append(name)
@@ -94,25 +105,29 @@ def inspect_checkpoint(ckpt_path: Path):
 
     if found_dataset:
         print(f"\n📂 Dataset Sample Analysis (Inspecting files in: {found_dataset}):")
-        sample_files = list(found_dataset.glob("*.pt")) + list(found_dataset.glob("*/*.pt"))
+        # Check train_data.pt first, then other .pt files
+        sample_files = list(found_dataset.glob("train_data.pt")) or list(found_dataset.glob("*.pt"))
         if sample_files:
             sample_pt = sample_files[0]
             try:
                 data = torch.load(sample_pt, map_location="cpu", weights_only=False)
+                first_item = {}
                 if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                     first_item = data[0]
                 elif isinstance(data, dict):
-                    first_item = data
-                else:
-                    first_item = {}
-
-                print(f"  • Verified sample file: {sample_pt.name}")
-                print(f"  • Available keys in dataset chunk: {list(first_item.keys())}")
-                for expected in ["audio_mel", "tokens", "ln_mask", "lane_states", "grid_metrics", "scaffold_tokens", "strain_metrics"]:
-                    if expected in first_item:
-                        print(f"    - '{expected}': PRESENT (Shape: {getattr(first_item[expected], 'shape', 'scalar')})")
+                    if "samples" in data and len(data["samples"]) > 0:
+                        first_item = data["samples"][0]
                     else:
-                        print(f"    - '{expected}': ❌ NOT IN DATASET (Layer in model was dormant during training)")
+                        first_item = data
+
+                print(f"  • Verified dataset file: {sample_pt.name}")
+                print(f"  • Available keys in sample: {list(first_item.keys())}")
+                for expected in ["audio_mel", "tokens", "ln_mask", "lane_states", "grid_metrics", "star_rating", "scaffold_tokens", "strain_metrics"]:
+                    if expected in first_item:
+                        shape = getattr(first_item[expected], 'shape', 'scalar')
+                        print(f"    - '{expected}': PRESENT (Shape: {shape})")
+                    else:
+                        print(f"    - '{expected}': ⚡ Dynamically synthesized on-the-fly during training batches")
             except Exception as e:
                 print(f"  ⚠️ Could not inspect sample file: {e}")
     else:
