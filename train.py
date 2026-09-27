@@ -161,35 +161,53 @@ def stratified_difficulty_split(
     return SubsetDataset(full_dataset, train_indices), SubsetDataset(full_dataset, val_indices)
 
 
-def get_device(requested: str = "auto") -> torch.device:
-    """Resolves target compute device: cuda, mps, or cpu."""
+def get_device(
+    requested: str = "auto",
+    gpus: str = "auto",
+    multi_gpu: bool = False,
+) -> Tuple[torch.device, List[int]]:
+    """Resolves target compute device and multi-GPU device IDs."""
     req = requested.lower()
-    if req in ("cuda", "gpu"):
-        if torch.cuda.is_available():
-            dev = torch.device("cuda")
-            print(f"[Device] Using GPU: {torch.cuda.get_device_name(0)}")
-            return dev
-        print("[Device Warning] CUDA GPU requested but not available. Falling back to CPU.")
-        return torch.device("cpu")
-    elif req == "mps":
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if req == "cpu" or not torch.cuda.is_available():
+        if req == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             print("[Device] Using Apple Silicon MPS GPU")
-            return torch.device("mps")
-        print("[Device Warning] MPS requested but not available. Falling back to CPU.")
-        return torch.device("cpu")
-    elif req == "cpu":
+            return torch.device("mps"), []
         print(f"[Device] Using CPU ({os.cpu_count() or 1} cores detected)")
-        return torch.device("cpu")
-    else:  # auto
-        if torch.cuda.is_available():
-            print(f"[Device] Auto-selected CUDA GPU: {torch.cuda.get_device_name(0)}")
-            return torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            print("[Device] Auto-selected Apple Silicon MPS GPU")
-            return torch.device("mps")
-        else:
-            print(f"[Device] Auto-selected CPU ({os.cpu_count() or 1} cores)")
-            return torch.device("cpu")
+        return torch.device("cpu"), []
+
+    num_gpus = torch.cuda.device_count()
+    print(f"\n🖥️  [CUDA Devices Detected: {num_gpus}]")
+    for i in range(num_gpus):
+        props = torch.cuda.get_device_properties(i)
+        vram_gb = props.total_memory / (1024 ** 3)
+        print(f"  • GPU {i}: {props.name} ({vram_gb:.1f} GB VRAM)")
+
+    device_ids: List[int] = []
+    gpus_req = str(gpus).lower().strip()
+    if gpus_req in ("all", "all_gpus") or multi_gpu or (gpus_req == "auto" and num_gpus > 1 and multi_gpu):
+        device_ids = list(range(num_gpus))
+    elif gpus_req not in ("auto", "none", "0"):
+        try:
+            device_ids = [int(x.strip()) for x in gpus_req.split(",") if x.strip()]
+        except Exception:
+            device_ids = [0]
+    else:
+        device_ids = [0]
+
+    primary_device = torch.device(f"cuda:{device_ids[0]}")
+    if len(device_ids) > 1:
+        print(f"  🚀 Multi-GPU Acceleration Active across {len(device_ids)} GPUs: {device_ids} (PyTorch DataParallel)\n")
+    else:
+        print(f"  ✓ Single GPU mode: GPU {device_ids[0]} ({torch.cuda.get_device_name(device_ids[0])})\n")
+
+    return primary_device, device_ids
+
+
+def wrap_model_multi_gpu(model: nn.Module, device_ids: List[int]) -> nn.Module:
+    """Wraps model in DataParallel if multiple GPU devices are targeted."""
+    if len(device_ids) > 1 and torch.cuda.is_available():
+        return nn.DataParallel(model, device_ids=device_ids)
+    return model
 
 
 def find_resume_checkpoint(checkpoint_dir: Path, model_prefix: str, resume_arg: Optional[str] = None) -> Optional[Path]:
@@ -251,7 +269,19 @@ def load_checkpoint_state(
         raise ValueError(f"Unrecognized checkpoint format in {ckpt_path}")
 
     if state_dict is not None:
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        # Clean prefix if saved with or without DataParallel / DDP
+        target_keys = set(model.state_dict().keys())
+        has_module_prefix_in_model = any(k.startswith("module.") for k in target_keys)
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("module.") and not has_module_prefix_in_model:
+                cleaned_state_dict[k[7:]] = v
+            elif not k.startswith("module.") and has_module_prefix_in_model:
+                cleaned_state_dict["module." + k] = v
+            else:
+                cleaned_state_dict[k] = v
+
+        missing_keys, unexpected_keys = model.load_state_dict(cleaned_state_dict, strict=False)
         if missing_keys:
             print(f"  ⚡ Warm-start loaded backbone weights ({len(missing_keys)} new layer weight(s) initialized cleanly: {missing_keys[:3]}...).")
         else:
@@ -391,6 +421,7 @@ def train_model_3_transformer(
     resume_path: Optional[str] = None,
     context_dropout: float = 0.20,
     override_lr: Optional[float] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Trains Model 3: ManiaPatternTransformer (Hit Object Synthesis).
@@ -414,8 +445,9 @@ def train_model_3_transformer(
         dropout=0.1,
         context_dropout=context_dropout,
     )
-    model = ManiaPatternTransformer(cfg).to(device)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    raw_model = ManiaPatternTransformer(cfg).to(device)
+    model = wrap_model_multi_gpu(raw_model, device_ids or [])
+    total_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,}")
 
     # 1. Analyze training data distribution for class balancing & LN penalty
@@ -722,10 +754,11 @@ def train_model_3_transformer(
             history.append(record)
 
             # 1. Continuous checkpoint: Always save latest state to _last.pt
+            model_to_save = model.module if hasattr(model, "module") else model
             last_ckpt_path = checkpoint_dir / "model_3_transformer_last.pt"
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": model_to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "config": cfg,
                 "best_val_loss": best_val_loss,
@@ -739,7 +772,7 @@ def train_model_3_transformer(
                 best_ckpt_path = checkpoint_dir / "model_3_transformer_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_to_save.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "config": cfg,
                     "best_val_loss": best_val_loss,
@@ -750,10 +783,11 @@ def train_model_3_transformer(
 
     except KeyboardInterrupt:
         print(f"\n🛑 [Paused] Training safely paused by user at Epoch {current_epoch}.")
+        model_to_save = model.module if hasattr(model, "module") else model
         pause_path = checkpoint_dir / "model_3_transformer_last.pt"
         torch.save({
             "epoch": current_epoch,
-            "model_state": model.state_dict(),
+            "model_state": model_to_save.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": cfg,
             "best_val_loss": best_val_loss,
@@ -776,6 +810,7 @@ def train_model_1_sync(
     augment: bool = True,
     resume_path: Optional[str] = None,
     override_lr: Optional[float] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Trains Model 1: SyncBPMOffsetModel (Audio tempo and beat synchronization).
@@ -792,7 +827,8 @@ def train_model_1_sync(
     print(f"  Augmentation: {'Speed Perturbation [0.75..1.35x] + SpecAugment' if augment else 'Disabled'}")
     print("=" * 60)
 
-    model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256).to(device)
+    raw_model = SyncBPMOffsetModel(audio_dim=80, hidden_dim=256).to(device)
+    model = wrap_model_multi_gpu(raw_model, device_ids or [])
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
@@ -935,10 +971,11 @@ def train_model_1_sync(
             history.append({"epoch": epoch, "val_loss": val_loss, "val_bpm_mae": val_mae, "val_phase_mae": val_phase_mae})
 
             # Save continuous latest checkpoint
+            model_to_save = model.module if hasattr(model, "module") else model
             last_path = checkpoint_dir / "model_1_sync_last.pt"
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": model_to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "val_bpm_mae": val_mae,
@@ -953,7 +990,7 @@ def train_model_1_sync(
                 best_path = checkpoint_dir / "model_1_sync_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_to_save.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
                     "val_bpm_mae": val_mae,
@@ -964,10 +1001,11 @@ def train_model_1_sync(
 
     except KeyboardInterrupt:
         print(f"\n🛑 [Paused] Training paused by user at Epoch {current_epoch}.")
+        model_to_save = model.module if hasattr(model, "module") else model
         pause_path = checkpoint_dir / "model_1_sync_last.pt"
         torch.save({
             "epoch": current_epoch,
-            "model_state": model.state_dict(),
+            "model_state": model_to_save.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "val_bpm_mae": best_val_mae,
@@ -989,6 +1027,7 @@ def train_model_2_dynamics(
     timing_source: str = "map",
     resume_path: Optional[str] = None,
     override_lr: Optional[float] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Trains Model 2: DynamicsSVModel (Slider Velocity & Timing changes).
@@ -1002,7 +1041,8 @@ def train_model_2_dynamics(
     print(f"  Timing & Data Source: {source_desc}")
     print("=" * 60)
 
-    model = DynamicsSVModel(audio_dim=80, hidden_dim=128).to(device)
+    raw_model = DynamicsSVModel(audio_dim=80, hidden_dim=128).to(device)
+    model = wrap_model_multi_gpu(raw_model, device_ids or [])
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     start_epoch = 0
@@ -1061,10 +1101,11 @@ def train_model_2_dynamics(
             print(f"Epoch {epoch:02d}/{target_total_epochs:02d} [{elapsed:.1f}s] Train SV MSE: {train_loss:.4f} | Val SV MSE: {val_loss:.4f}")
             history.append({"epoch": epoch, "val_loss": val_loss})
 
+            model_to_save = model.module if hasattr(model, "module") else model
             last_path = checkpoint_dir / "model_2_dynamics_last.pt"
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": model_to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "history": history,
@@ -1075,7 +1116,7 @@ def train_model_2_dynamics(
                 best_path = checkpoint_dir / "model_2_dynamics_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_to_save.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "best_val_loss": best_val_loss,
                     "history": history,
@@ -1084,10 +1125,11 @@ def train_model_2_dynamics(
 
     except KeyboardInterrupt:
         print(f"\n🛑 [Paused] Training paused by user at Epoch {current_epoch}.")
+        model_to_save = model.module if hasattr(model, "module") else model
         pause_path = checkpoint_dir / "model_2_dynamics_last.pt"
         torch.save({
             "epoch": current_epoch,
-            "model_state": model.state_dict(),
+            "model_state": model_to_save.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
             "history": history,
@@ -1107,13 +1149,15 @@ def train_model_4_evaluator(
     checkpoint_dir: Path,
     resume_path: Optional[str] = None,
     override_lr: Optional[float] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Trains Model 4: DifficultyEvaluatorModel (Star Rating compliance validation)."""
     print("\n" + "=" * 60)
     print("▶ TRAINING MODEL 4: DifficultyEvaluatorModel (Star Rating Validator)")
     print("=" * 60)
 
-    model = DifficultyEvaluatorModel(num_classes=16, token_dim=64, hidden_dim=128).to(device)
+    raw_model = DifficultyEvaluatorModel(num_classes=16, token_dim=64, hidden_dim=128).to(device)
+    model = wrap_model_multi_gpu(raw_model, device_ids or [])
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     start_epoch = 0
@@ -1183,10 +1227,11 @@ def train_model_4_evaluator(
             )
             history.append({"epoch": epoch, "val_sr_mae": val_mae})
 
+            model_to_save = model.module if hasattr(model, "module") else model
             last_path = checkpoint_dir / "model_4_evaluator_last.pt"
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": model_to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "history": history,
@@ -1197,7 +1242,7 @@ def train_model_4_evaluator(
                 best_path = checkpoint_dir / "model_4_evaluator_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_to_save.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "best_val_loss": best_val_loss,
                     "history": history,
@@ -1206,10 +1251,11 @@ def train_model_4_evaluator(
 
     except KeyboardInterrupt:
         print(f"\n🛑 [Paused] Training paused by user at Epoch {current_epoch}.")
+        model_to_save = model.module if hasattr(model, "module") else model
         pause_path = checkpoint_dir / "model_4_evaluator_last.pt"
         torch.save({
             "epoch": current_epoch,
-            "model_state": model.state_dict(),
+            "model_state": model_to_save.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
             "history": history,
@@ -1221,7 +1267,7 @@ def train_model_4_evaluator(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train osu!mania 4K AI models on CPU or GPU with seamless checkpoint resuming.")
+    parser = argparse.ArgumentParser(description="Train osu!mania 4K AI models on CPU, Single GPU, or Multi-GPU with seamless checkpoint resuming.")
     parser.add_argument(
         "--model",
         "-m",
@@ -1230,6 +1276,8 @@ def main():
         help="Model choice: 1 (sync), 2 (dynamics), 3 (transformer), 4 (evaluator), or all",
     )
     parser.add_argument("--device", "-d", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--gpus", type=str, default="auto", help="GPUs to target: 'all', 'auto', '0,1,2', or '0'")
+    parser.add_argument("--multi_gpu", action="store_true", help="Enable Multi-GPU Parallel Acceleration across all detected GPUs (PyTorch DataParallel)")
     parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--timing_source", "-t", type=str, choices=["map", "model1"], default="map", help="Data/Timing source for Model 2 & 3: 'map' (Original beatmap ground truth) or 'model1' (Cascaded AI Sync)")
@@ -1273,8 +1321,8 @@ def main():
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve device
-    device = get_device(args.device)
+    # Resolve device & Multi-GPU
+    device, device_ids = get_device(args.device, gpus=args.gpus, multi_gpu=args.multi_gpu)
 
     # Load dataset with Stratified Difficulty Splitting
     full_dataset = ManiaDataset(args.dataset)
@@ -1289,7 +1337,9 @@ def main():
     lr_info = f"{effective_lr} (override on resume)" if (resume_target and user_lr is not None) else (f"{effective_lr} (or from checkpoint)" if resume_target else f"{effective_lr}")
     print(f"\n[Training Configuration]")
     print(f"  Model target:      {args.model}")
-    print(f"  Device:            {device}")
+    print(f"  Primary Device:    {device}")
+    if len(device_ids) > 1:
+        print(f"  Multi-GPU Engines: {device_ids} (Parallel Training active)")
     print(f"  Data Source (M2/3):{timing_source.upper()} ({'Original Map Ground Truth' if timing_source == 'map' else 'Model 1 AI Sync'})")
     print(f"  Resume Mode:       {'ENABLED (' + str(resume_target) + ')' if resume_target else 'Disabled (Fresh start)'}")
     print(f"  Train samples:     {train_size}")
@@ -1302,13 +1352,13 @@ def main():
     target = str(args.model).lower()
     if target in ("1", "sync", "all"):
         is_song = "song_sync" in str(args.dataset).lower()
-        train_model_1_sync(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target, override_lr=override_lr_on_resume)
+        train_model_1_sync(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
     if target in ("2", "dynamics", "all"):
-        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, override_lr=override_lr_on_resume)
+        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
     if target in ("3", "transformer", "pattern", "all"):
-        train_model_3_transformer(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout, override_lr=override_lr_on_resume)
+        train_model_3_transformer(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout, override_lr=override_lr_on_resume, device_ids=device_ids)
     if target in ("4", "evaluator", "sr", "all"):
-        train_model_4_evaluator(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume)
+        train_model_4_evaluator(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
 
     print("\n✅ Training procedure completed successfully!")
 
