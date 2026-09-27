@@ -40,9 +40,9 @@ def generate_beatmap_pipeline(
     temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
-    note_conf_thresh: float = 0.25,
+    note_conf_thresh: float = 0.0,
     ln_conf_thresh: float = 0.78,
-    silence_gate: float = 0.15,
+    silence_gate: float = 0.0,
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
