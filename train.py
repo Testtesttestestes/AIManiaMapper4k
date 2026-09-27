@@ -232,27 +232,45 @@ def compute_multi_scenario_scaffold_and_strain(
     strain_metrics = torch.stack([running_density, density_ratio], dim=-1)
 
     # 2. Multi-Scenario Acoustic Scaffold Generator (Zero Ground-Truth Leakage)
-    # 60% Real Acoustic Onset Scaffold, 25% Pure Zero Scaffold (Audio-Only), 15% Noisy Acoustic Scaffold
+    # Scenario A (35%): Stage 1 Acoustic Onset Scaffold
+    # Scenario B (35%): Extreme Debris & Spam (Heavy noise 40-70%, uncoordinated minijack bursts, spam clusters)
+    # Scenario C (15%): Blank Scaffold (Pure Audio-to-Pattern synthesis)
+    # Scenario D (15%): Soft Draft (Acoustic scaffold with mild 15% noise)
     acoustic_scaffold = compute_acoustic_onset_scaffold(audio_mel, grid_metrics, star_rating)
     scaffold_tokens = torch.zeros(B, T, dtype=torch.int64, device=device)
 
     for b in range(B):
         scenario_choice = torch.rand(1).item()
 
-        if scenario_choice < 0.60:
+        if scenario_choice < 0.35:
             # Scenario A: Standard Acoustic Spectral Onset Scaffold
             scaffold_tokens[b] = acoustic_scaffold[b]
 
+        elif scenario_choice < 0.70:
+            # Scenario B: Extreme Debris & Spam (Injected into acoustic scaffold, NOT ground truth)
+            debris = acoustic_scaffold[b].clone()
+            noise_rate = torch.empty(1).uniform_(0.40, 0.75).item()
+            noise_mask = torch.rand(T, device=device) < noise_rate
+            debris[noise_mask] = torch.randint(0, 16, (noise_mask.sum(),), device=device)
+
+            # Inject uncoordinated minijacks (repeated identical tokens in a single column)
+            if torch.rand(1).item() < 0.5:
+                jack_span = torch.randint(4, 16, (1,)).item()
+                start_j = torch.randint(0, max(1, T - jack_span), (1,)).item()
+                debris[start_j : start_j + jack_span] = 1 << torch.randint(0, 4, (1,)).item()
+
+            scaffold_tokens[b] = debris
+
         elif scenario_choice < 0.85:
-            # Scenario B: Pure Zero Scaffold (Forces model to perform direct Audio-to-Pattern synthesis)
+            # Scenario C: Blank Scaffold (Forces model to synthesize 100% from audio)
             scaffold_tokens[b] = torch.zeros(T, dtype=torch.int64, device=device)
 
         else:
-            # Scenario C: Perturbed Acoustic Scaffold (Simulates timing jitter / noise in onset detector)
-            noisy = acoustic_scaffold[b].clone()
-            jitter_mask = (torch.rand(T, device=device) < 0.20)
-            noisy[jitter_mask] = torch.randint(0, 16, (jitter_mask.sum(),), device=device)
-            scaffold_tokens[b] = noisy
+            # Scenario D: Soft Draft (15% jitter)
+            soft = acoustic_scaffold[b].clone()
+            soft_mask = torch.rand(T, device=device) < 0.15
+            soft[soft_mask] = torch.randint(0, 16, (soft_mask.sum(),), device=device)
+            scaffold_tokens[b] = soft
 
     return scaffold_tokens, strain_metrics
 
