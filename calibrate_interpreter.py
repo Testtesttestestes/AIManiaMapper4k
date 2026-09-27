@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from osu_mapper.models.transformer import ManiaPatternTransformer, TransformerConfig
+from osu_mapper.pipeline.onset_scaffold import compute_acoustic_onset_scaffold
 
 
 def build_algorithmic_scaffold_from_grid(
@@ -87,9 +88,14 @@ def evaluate_sample_with_thresholds(
         mean_e = frame_energies.mean(dim=-1, keepdim=True).clamp(min=1e-4)
         energy_ratio = (frame_energies / mean_e).squeeze(0)   # [T]
 
-    # Build Stage 1 scaffold if enabled
+    # Build Stage 1 Acoustic Onset Scaffold if enabled
     if use_scaffold:
-        scaffold_tokens = build_algorithmic_scaffold_from_grid(grid_metrics, sr_val, energy_ratio, device)
+        scaffold_tokens = compute_acoustic_onset_scaffold(
+            audio_mel=mel,
+            grid_metrics=grid_metrics,
+            star_rating=star_rating,
+            silence_threshold=silence_gate,
+        )
     else:
         scaffold_tokens = torch.zeros(1, T, dtype=torch.int64, device=device)
 
