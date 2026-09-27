@@ -1,10 +1,9 @@
 """
 Acoustic Onset-Driven Algorithmic Scaffold Generator.
-Computes deterministic rhythm scaffolds strictly from audio spectral flux,
-energy transients, and timing grid metrics without any ground-truth leakage.
+Fully vectorized PyTorch implementation for ultra-fast GPU training and inference (0 Python loops).
 """
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 try:
     import torch
@@ -23,6 +22,7 @@ def compute_acoustic_onset_scaffold(
 ) -> Any:
     """
     Generates an acoustic rhythm scaffold directly from audio spectral features and grid metrics.
+    100% Vectorized in PyTorch (zero CPU-GPU synchronization bottlenecks).
 
     Args:
         audio_mel: [B, T, 80] Log-mel spectrogram
@@ -35,12 +35,11 @@ def compute_acoustic_onset_scaffold(
     """
     if not TORCH_AVAILABLE or torch is None:
         return None
+
     B, T, D = audio_mel.shape
     device = audio_mel.device
-    scaffold = torch.zeros(B, T, dtype=torch.int64, device=device)
 
-    # 1. Compute spectral energy and spectral flux (transient attacks)
-    # Exponentiate log-mel to linear power domain
+    # 1. Compute spectral energy and spectral flux in linear power domain
     linear_mel = audio_mel.exp()
     frame_energy = linear_mel.mean(dim=-1)                                 # [B, T]
     mean_energy = frame_energy.mean(dim=-1, keepdim=True).clamp(min=1e-4)   # [B, 1]
@@ -53,63 +52,46 @@ def compute_acoustic_onset_scaffold(
     mean_flux = flux.mean(dim=-1, keepdim=True).clamp(min=1e-4)           # [B, 1]
     rel_flux = flux / mean_flux                                            # [B, T]
 
-    # Multi-band energy (Low: kick/bass 0..20, Mid: snare/vocal 20..60, High: cymbals/hihats 60..80)
+    # Multi-band energy (Low: kick/bass 0..20)
     low_band = linear_mel[:, :, :20].mean(dim=-1)                         # [B, T]
     low_flux = torch.zeros_like(low_band)
     low_flux[:, 1:] = (low_band[:, 1:] - low_band[:, :-1]).clamp(min=0.0)
     rel_low_flux = low_flux / (low_flux.mean(dim=-1, keepdim=True).clamp(min=1e-4))
 
-    for b in range(B):
-        sr = float(star_rating[b].item()) if star_rating.ndim > 1 else float(star_rating[b])
+    # Star rating & onset sensitivity
+    sr_tensor = star_rating.view(B, 1) if star_rating.ndim == 1 else star_rating[:, :1]  # [B, 1]
+    onset_sens = (1.8 - (sr_tensor * 0.15)).clamp(min=0.5)                                # [B, 1]
 
-        # Difficulty parameters
-        max_chord = 1 if sr < 2.0 else (2 if sr < 4.0 else (3 if sr < 6.0 else 4))
-        onset_sens = max(0.5, 1.8 - (sr * 0.15))   # Lower threshold for higher SR
+    # Active mask based on audio transients
+    not_silent = (rel_energy >= silence_threshold)                                        # [B, T]
+    has_strong_onset = (rel_flux > onset_sens) | (rel_low_flux > (onset_sens * 1.2))
 
-        gm = grid_metrics[b] if grid_metrics is not None else None
-        
-        for t in range(T):
-            e_val = float(rel_energy[b, t].item())
-            f_val = float(rel_flux[b, t].item())
-            lf_val = float(rel_low_flux[b, t].item())
+    if grid_metrics is not None:
+        is_downbeat = (grid_metrics[:, :, 2] > 0.5)                                       # [B, T]
+        div_f = grid_metrics[:, :, 0]                                                     # [B, T]
+        is_beat = (div_f < 0.05) | (div_f > 0.95)
+        has_rhythm_pulse = (is_downbeat & (rel_energy > 0.4)) | (is_beat & (rel_energy > 0.6) & (rel_flux > 0.8))
+    else:
+        is_downbeat = torch.zeros(B, T, dtype=torch.bool, device=device)
+        has_rhythm_pulse = torch.zeros(B, T, dtype=torch.bool, device=device)
 
-            # Silence Gating: zero notes during quiet / break / intro sections
-            if e_val < silence_threshold:
-                continue
+    active_mask = not_silent & (has_strong_onset | has_rhythm_pulse)                      # [B, T]
 
-            is_downbeat = False
-            is_beat = False
-            is_half = False
+    # Vectorized chord / lane assignment
+    t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+    lane_idx = (t_idx * 3 + (rel_low_flux > 1.2).long()) % 4                              # [B, T]
+    single_token = (1 << lane_idx)                                                         # [B, T]
 
-            if gm is not None:
-                is_downbeat = bool(gm[t, 2].item() > 0.5)
-                div_f = float(gm[t, 0].item())
-                is_beat = (div_f < 0.05) or (div_f > 0.95)
-                is_half = abs(div_f - 0.5) < 0.05
+    # Chords on downbeats / heavy kicks
+    t_even = ((t_idx % 2) == 0)
+    chord_token = torch.where(t_even, torch.full_like(single_token, 9), torch.full_like(single_token, 6)) # 9=1001, 6=0110
+    triple_chord = torch.full_like(single_token, 11)                                      # 11=1011
 
-            # Onset detection condition: strong audio transient or downbeat with audio presence
-            has_strong_onset = (f_val > onset_sens) or (lf_val > onset_sens * 1.2)
-            has_rhythm_pulse = (is_downbeat and e_val > 0.4) or (is_beat and e_val > 0.6 and f_val > 0.8)
+    is_heavy = (is_downbeat | (rel_low_flux > 1.8)) & (rel_energy > 0.8) & (sr_tensor >= 2.0)
+    is_triple = is_heavy & (sr_tensor >= 5.0) & (rel_low_flux > 2.5)
 
-            if not (has_strong_onset or has_rhythm_pulse):
-                continue
+    base_tokens = torch.where(is_heavy, chord_token, single_token)
+    base_tokens = torch.where(is_triple, triple_chord, base_tokens)
 
-            # Determine lane & chord pattern based on musical intensity
-            lane_idx = (t * 3 + (1 if lf_val > 1.2 else 0)) % 4
-            
-            # Chord size selection
-            if (is_downbeat or lf_val > 1.8) and max_chord >= 2 and e_val > 0.8:
-                # 2-note chord (e.g. columns 0 and 3 or 1 and 2)
-                if t % 2 == 0:
-                    chord_tok = 9   # 1001 (cols 0, 3)
-                else:
-                    chord_tok = 6   # 0110 (cols 1, 2)
-                if max_chord >= 3 and sr >= 5.0 and lf_val > 2.5:
-                    chord_tok = 11  # 1011 (cols 0, 1, 3)
-            else:
-                # Single note
-                chord_tok = 1 << lane_idx
-
-            scaffold[b, t] = chord_tok
-
+    scaffold = torch.where(active_mask, base_tokens, torch.zeros_like(base_tokens))
     return scaffold
