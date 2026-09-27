@@ -22,8 +22,10 @@ except ImportError:
 
 try:
     import torch
+    import torch.nn.functional as F
 except ImportError:
     torch = None  # type: ignore
+    F = None  # type: ignore
 
 from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
 from osu_mapper.pipeline.timing import (
