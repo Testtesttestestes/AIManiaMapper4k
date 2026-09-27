@@ -301,10 +301,19 @@ def generate_patterns_with_model3(
     frame_ms = 16.0
 
     # 1. Generate deterministic sequence of musical grid ticks for the entire song duration
-    # In osu!mania 4K, beatmaps with SR < 5.5* use 1/4 binary & 1/3-1/6 ternary subdivisions (73ms at 205 BPM).
-    # 1/8 grid (36ms) is reserved strictly for 7.0*+ vibro/burst maps to prevent impossible 27 NPS minijacks.
-    subdiv_b = 4 if star_rating < 5.5 else 8
-    subdiv_t = 3 if star_rating < 3.5 else 6
+    # Strictly aligned to osu!mania Ranking Criteria difficulty divisors:
+    # - Easy/Normal (SR < 2.5*): Subdivisions strictly limited to 1/1 & 1/2 (White & Red ticks only, 0 blue ticks).
+    # - Hard/Insane (2.5* <= SR < 6.0*): Standard 1/4 binary & 1/3 ternary subdivisions (White, Red, Blue).
+    # - Extra/Expert (SR >= 6.0*): Dense 1/8 bursts and 1/6 streams.
+    if star_rating < 2.5:
+        subdiv_b = 2
+        subdiv_t = 1
+    elif star_rating < 6.0:
+        subdiv_b = 4
+        subdiv_t = 3 if star_rating < 3.8 else 6
+    else:
+        subdiv_b = 8
+        subdiv_t = 6
 
     resolved_tps = timing_points or [
         TimingPoint(
@@ -509,21 +518,7 @@ def generate_patterns_with_model3(
                 continue
 
             tick_obj = ticks[i]
-            base_ms = tick_obj.time_ms
-            
-            # Dynamic Transient Micro-Alignment (Sub-tick precision to audio onsets)
-            center_frame = max(0, min(orig_total_mel_frames - 1, int(round(base_ms / frame_ms))))
-            best_offset_ms = 0.0
-            max_local_e = -1.0
-            for f_off in (-1, 0, 1):
-                f_idx = center_frame + f_off
-                if 0 <= f_idx < len(frame_energies_t):
-                    val = float(frame_energies_t[f_idx].item())
-                    if val > max_local_e:
-                        max_local_e = val
-                        best_offset_ms = f_off * (frame_ms * 0.25)  # sub-tick micro-offset +/- 4ms
-            
-            t_ms = int(round(base_ms + best_offset_ms))
+            t_ms = int(round(tick_obj.time_ms))
             if t_ms >= duration_ms:
                 break
 
