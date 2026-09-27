@@ -33,7 +33,7 @@ from osu_mapper.dataset.feature_extractor import (
 )
 from osu_mapper.pipeline import generate_beatmap_pipeline
 from osu_mapper.pipeline.audio import create_synthetic_click_wav
-from osu_mapper.pipeline.timing import TimingPoint
+from osu_mapper.pipeline.timing import TimingPoint, parse_timing_point_line
 
 
 def list_available_dataset_songs() -> List[dict]:
@@ -119,26 +119,15 @@ def parse_template_osu_text(osu_text: str) -> Tuple[dict, List[TimingPoint]]:
     primary_offset = None
 
     for t_str in timing_lines:
-        parts = t_str.split(",")
-        if len(parts) < 2:
+        tp = parse_timing_point_line(t_str)
+        if tp is None:
             continue
-        try:
-            t_ms = float(parts[0])
-            beat_len = float(parts[1])
-            uninherited = 1 if (len(parts) <= 6 or parts[6].strip() == "1") else 0
-            
-            timing_points.append(TimingPoint(
-                time=t_ms,
-                beat_length=beat_len,
-                uninherited=uninherited,
-            ))
+        timing_points.append(tp)
 
-            # First uninherited line defines base BPM and song offset
-            if uninherited == 1 and beat_len > 0 and primary_bpm is None:
-                primary_bpm = round(60000.0 / beat_len, 2)
-                primary_offset = int(round(t_ms))
-        except (ValueError, IndexError):
-            continue
+        # First uninherited line defines base BPM and song offset
+        if tp.uninherited == 1 and tp.beat_length > 0 and primary_bpm is None:
+            primary_bpm = round(60000.0 / tp.beat_length, 2)
+            primary_offset = int(round(tp.time))
 
     if primary_bpm is not None:
         meta["bpm"] = primary_bpm
