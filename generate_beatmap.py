@@ -27,6 +27,7 @@ import zipfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
 from osu_mapper.dataset.feature_extractor import (
     find_ffmpeg,
     parse_osu_for_training,
@@ -37,39 +38,108 @@ from osu_mapper.pipeline.timing import TimingPoint, parse_timing_point_line
 
 
 def list_available_dataset_songs() -> List[dict]:
-    """Finds all available sample beatmaps and returns song info."""
+    """Finds all available sample beatmaps from manifest, osz archives, and text pointer files."""
     manifest_p = Path("dataset_manifest/manifest.json")
     songs = []
+    seen_sources = set()
+
     if manifest_p.exists():
         try:
             with open(manifest_p, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 for idx, item in enumerate(data.get("beatmaps", [])):
+                    src = item.get("source_osz", "")
+                    if src and Path(src).exists():
+                        seen_sources.add(str(Path(src).resolve()))
                     songs.append({
-                        "index": idx + 1,
+                        "index": len(songs) + 1,
                         "title": item.get("title", "Unknown Title"),
                         "artist": item.get("artist", "Unknown Artist"),
                         "bpm": item.get("bpm", 0.0),
                         "offset_ms": item.get("offset_ms", 0),
-                        "source_osz": item.get("source_osz", ""),
+                        "source_osz": src,
                         "osu_file": item.get("osu_file_name", ""),
                     })
         except Exception:
             pass
 
-    if not songs:
-        # Fallback to scanning sample beatmaps
-        osz_files = sorted(glob.glob("sample beatmaps/*.osz"))
-        for idx, osz in enumerate(osz_files):
-            songs.append({
-                "index": idx + 1,
-                "title": Path(osz).stem,
-                "artist": "Sample Beatmap",
-                "bpm": 0.0,
-                "offset_ms": 0,
-                "source_osz": osz,
-                "osu_file": "",
-            })
+    # Resolve from sample beatmaps directory and pointer text files
+    resolved_osz, resolved_folders = resolve_beatmap_sources("sample beatmaps")
+
+    # Process discovered .osz files
+    for osz_path in resolved_osz:
+        if str(osz_path.resolve()) in seen_sources:
+            continue
+        seen_sources.add(str(osz_path.resolve()))
+        title = osz_path.stem
+        artist = "Unknown Artist"
+        bpm = 0.0
+        offset_ms = 0
+        try:
+            with zipfile.ZipFile(osz_path, "r") as zf:
+                osu_names = [n for n in zf.namelist() if n.lower().endswith(".osu")]
+                if osu_names:
+                    try:
+                        c = zf.read(osu_names[0]).decode("utf-8", errors="ignore")
+                    except UnicodeDecodeError:
+                        c = zf.read(osu_names[0]).decode("latin-1", errors="ignore")
+                    meta, tps = parse_template_osu_text(c)
+                    if meta.get("title"):
+                        title = meta["title"]
+                    if meta.get("artist"):
+                        artist = meta["artist"]
+                    if meta.get("bpm"):
+                        bpm = meta["bpm"]
+                    if meta.get("offset_ms"):
+                        offset_ms = meta["offset_ms"]
+        except Exception:
+            pass
+
+        songs.append({
+            "index": len(songs) + 1,
+            "title": title,
+            "artist": artist,
+            "bpm": bpm,
+            "offset_ms": offset_ms,
+            "source_osz": str(osz_path.resolve()),
+            "osu_file": "",
+        })
+
+    # Process discovered song folders
+    for folder_path in resolved_folders:
+        if str(folder_path.resolve()) in seen_sources:
+            continue
+        seen_sources.add(str(folder_path.resolve()))
+        title = folder_path.name
+        artist = "Unknown Artist"
+        bpm = 0.0
+        offset_ms = 0
+        osu_files = list(folder_path.glob("*.osu"))
+        if osu_files:
+            try:
+                c = osu_files[0].read_text(encoding="utf-8", errors="ignore")
+                meta, tps = parse_template_osu_text(c)
+                if meta.get("title"):
+                    title = meta["title"]
+                if meta.get("artist"):
+                    artist = meta["artist"]
+                if meta.get("bpm"):
+                    bpm = meta["bpm"]
+                if meta.get("offset_ms"):
+                    offset_ms = meta["offset_ms"]
+            except Exception:
+                pass
+
+        songs.append({
+            "index": len(songs) + 1,
+            "title": title,
+            "artist": artist,
+            "bpm": bpm,
+            "offset_ms": offset_ms,
+            "source_osz": str(folder_path.resolve()),
+            "osu_file": str(osu_files[0].resolve()) if osu_files else "",
+        })
+
     return songs
 
 
@@ -296,6 +366,22 @@ def main():
                 audio_cand = osu_p.parent / audio_cand_name
                 if audio_cand.exists():
                     audio_path = str(audio_cand.resolve())
+        elif Path(template_target).is_dir():
+            folder_p = Path(template_target)
+            osu_files = list(folder_p.glob("*.osu"))
+            if osu_files:
+                osu_text = osu_files[0].read_text(encoding="utf-8", errors="ignore")
+                parsed_meta, template_timing_points = parse_template_osu_text(osu_text)
+                template_meta.update(parsed_meta)
+                audio_cand_name = parsed_meta.get("audio_filename") or parsed_meta.get("AudioFilename")
+                if audio_cand_name and (folder_p / audio_cand_name).exists():
+                    audio_path = str((folder_p / audio_cand_name).resolve())
+                else:
+                    for ext in ("*.mp3", "*.ogg", "*.wav", "*.flac"):
+                        cands = list(folder_p.glob(ext))
+                        if cands:
+                            audio_path = str(cands[0].resolve())
+                            break
 
     # 4. Synthetic fallback if no audio provided
     if not audio_path or args.synthetic:
