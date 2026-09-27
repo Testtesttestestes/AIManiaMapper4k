@@ -265,11 +265,12 @@ def generate_patterns_with_model3(
     chunk_frames: int = 128,
     warmup_lead_in_frames: int = 64,
     timing_points: Optional[List[TimingPoint]] = None,
-    temperature: float = 0.0,
+    temperature: float = 0.30,
     top_p: float = 0.90,
     greedy: bool = False,
-    note_conf_thresh: float = 0.45,
+    note_conf_thresh: float = 0.25,
     ln_conf_thresh: float = 0.78,
+    silence_gate: float = 0.15,
 ) -> List[ManiaHitObject]:
     """
     Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
@@ -388,6 +389,7 @@ def generate_patterns_with_model3(
         audio_mel=tick_mel_tensor.unsqueeze(0),
         grid_metrics=grid_metrics_tensor.unsqueeze(0),
         star_rating=sr_tensor,
+        silence_threshold=silence_gate,
     ).squeeze(0)
 
     # Real-time progressive strain trajectory metrics matching training distribution [B, T, 2]
@@ -437,7 +439,7 @@ def generate_patterns_with_model3(
 
         # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet intros
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
-        if cur_energy_ratio < 0.20:
+        if cur_energy_ratio < silence_gate:
             generated_tokens.append(0)
             all_ln_probs.append([0.0, 0.0, 0.0, 0.0])
             continue
