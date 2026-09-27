@@ -59,6 +59,81 @@ class ManiaDataset(Dataset):
         return self.chunks[idx]
 
 
+class SubsetDataset(Dataset):
+    def __init__(self, full_dataset: ManiaDataset, indices: List[int]):
+        self.full_dataset = full_dataset
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return self.full_dataset[self.indices[idx]]
+
+
+def stratified_difficulty_split(
+    full_dataset: ManiaDataset,
+    val_split: float = 0.10,
+    seed: int = 42,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Stratified Star Rating Difficulty Splitter:
+    Groups chunks into discrete SR bins to guarantee that every difficulty tier
+    (including 5.5* - 7.0*+ maps) is proportionally represented in the training set
+    and NEVER completely starved into validation.
+    """
+    import random
+    rng = random.Random(seed)
+
+    bins: Dict[str, List[int]] = {
+        "Easy (1.0 - 2.5*)": [],
+        "Normal (2.5 - 3.75*)": [],
+        "Hard (3.75 - 4.75*)": [],
+        "Insane (4.75 - 5.75*)": [],
+        "Extra (5.75 - 7.0*)": [],
+        "Master (7.0*+)": [],
+    }
+
+    for idx, chunk in enumerate(full_dataset.chunks):
+        sr = float(chunk["star_rating"].item()) if "star_rating" in chunk else 3.5
+        if sr < 2.5:
+            bins["Easy (1.0 - 2.5*)"].append(idx)
+        elif sr < 3.75:
+            bins["Normal (2.5 - 3.75*)"].append(idx)
+        elif sr < 4.75:
+            bins["Hard (3.75 - 4.75*)"].append(idx)
+        elif sr < 5.75:
+            bins["Insane (4.75 - 5.75*)"].append(idx)
+        elif sr < 7.0:
+            bins["Extra (5.75 - 7.0*)"].append(idx)
+        else:
+            bins["Master (7.0*+)"].append(idx)
+
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+
+    print("\n📊 [Dataset Stratified Difficulty Split]")
+    for bin_name, idxs in bins.items():
+        if not idxs:
+            continue
+        rng.shuffle(idxs)
+        v_count = max(1, int(round(len(idxs) * val_split))) if len(idxs) > 1 else 0
+        t_count = len(idxs) - v_count
+        val_indices.extend(idxs[:v_count])
+        train_indices.extend(idxs[v_count:])
+        print(f"  • {bin_name:<22} -> Train: {t_count:>4} samples | Val: {v_count:>3} samples (Total: {len(idxs)})")
+
+    if not train_indices:
+        train_indices = list(range(len(full_dataset)))
+        val_indices = []
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+
+    print(f"  ✓ Balanced Stratified Split: {len(train_indices)} train / {len(val_indices)} val samples.\n")
+    return SubsetDataset(full_dataset, train_indices), SubsetDataset(full_dataset, val_indices)
+
+
 def get_device(requested: str = "auto") -> torch.device:
     """Resolves target compute device: cuda, mps, or cpu."""
     req = requested.lower()
@@ -149,8 +224,11 @@ def load_checkpoint_state(
         raise ValueError(f"Unrecognized checkpoint format in {ckpt_path}")
 
     if state_dict is not None:
-        model.load_state_dict(state_dict)
-        print("  ✓ Restored model weights successfully.")
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f"  ⚡ Warm-start loaded backbone weights ({len(missing_keys)} new layer weight(s) initialized cleanly: {missing_keys[:3]}...).")
+        else:
+            print("  ✓ Restored all model weights successfully.")
 
     # 2. Starting epoch
     start_epoch = 0
@@ -390,6 +468,7 @@ def train_model_3_transformer(
                 B, T = tokens.shape
                 ln_mask = batch["ln_mask"].to(device)           # [B, T, 4]
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
+                multiscale_audio = batch["multiscale_audio"].to(device) if "multiscale_audio" in batch else None
                 lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                 grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
                 scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
@@ -431,6 +510,7 @@ def train_model_3_transformer(
                     grid_metrics=grid_metrics,
                     scaffold_tokens=scaffold_tokens,
                     strain_metrics=strain_metrics,
+                    multiscale_audio=multiscale_audio,
                     return_sr=True,
                 )
 
@@ -508,6 +588,7 @@ def train_model_3_transformer(
                     tokens = batch["tokens"].to(device)
                     ln_mask = batch["ln_mask"].to(device)
                     star_rating = batch["star_rating"].to(device)
+                    multiscale_audio = batch["multiscale_audio"].to(device) if "multiscale_audio" in batch else None
                     lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                     grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
                     scaffold_tokens = batch["scaffold_tokens"].to(device) if "scaffold_tokens" in batch else None
@@ -539,6 +620,7 @@ def train_model_3_transformer(
                         grid_metrics=grid_metrics,
                         scaffold_tokens=scaffold_tokens,
                         strain_metrics=strain_metrics,
+                        multiscale_audio=multiscale_audio,
                         return_sr=True,
                     )
                     B, T, C = c_logits.shape
@@ -1167,15 +1249,11 @@ def main():
     # Resolve device
     device = get_device(args.device)
 
-    # Load dataset
+    # Load dataset with Stratified Difficulty Splitting
     full_dataset = ManiaDataset(args.dataset)
-    val_size = max(1, int(len(full_dataset) * args.val_split))
-    train_size = len(full_dataset) - val_size
-    train_set, val_set = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
+    train_set, val_set = stratified_difficulty_split(full_dataset, val_split=args.val_split)
+    train_size = len(train_set)
+    val_size = len(val_set)
 
     # Dataloaders (num_workers=0 for instant in-memory access and cross-platform compatibility)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)

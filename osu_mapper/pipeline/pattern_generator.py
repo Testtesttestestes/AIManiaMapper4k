@@ -79,26 +79,42 @@ def sample_chord_tokens_with_nucleus(
     note_conf_thresh: float = 0.0,
 ) -> List[int]:
     """
-    Unconstrained Neural Chord Decoder:
-    Direct raw neural network output without artificial chord limits or forced overrides.
+    Difficulty-Conditioned Neural Chord Decoder:
+    Calibrates decision boundary with Star Rating so high difficulties (5.0* - 7.0*+)
+    reliably trigger dense jumpstreams/chords without being suppressed by raw background idle frequency.
     """
     T, num_classes = logits.shape
     out_tokens: List[int] = []
 
+    # Calibrated active activation threshold scaled to Star Rating:
+    # 1.0* -> 0.52 (very conservative, strictly downbeats/singles)
+    # 3.0* -> 0.38 (standard rhythm)
+    # 4.5* -> 0.28 (dense streams)
+    # 6.0* -> 0.18 (fast bursts, 1/4 jumpstreams)
+    # 7.5*+ -> 0.12 (dense handstreams/chordstreams)
+    calibrated_active_thresh = max(0.10, min(0.55, 0.60 - (float(star_rating) - 1.0) * 0.075))
+    if note_conf_thresh > 0.0:
+        calibrated_active_thresh = max(calibrated_active_thresh, note_conf_thresh)
+
     for t_i in range(T):
         step_logits = logits[t_i : t_i + 1].clone()
-
-        if note_conf_thresh > 0.0:
-            probs_raw = F.softmax(step_logits, dim=-1)
-            p_active = 1.0 - probs_raw[0, 0]
-            if float(p_active.item()) < note_conf_thresh:
-                out_tokens.append(0)
-                continue
+        probs_raw = F.softmax(step_logits, dim=-1)
+        p_active = float((1.0 - probs_raw[0, 0]).item())
 
         if greedy or temperature <= 0.05:
-            out_tokens.append(int(step_logits.argmax(dim=-1).item()))
+            if step_logits[0].argmax().item() > 0:
+                out_tokens.append(int(step_logits[0].argmax().item()))
+            elif p_active >= calibrated_active_thresh:
+                active_best = int(step_logits[0, 1:].argmax().item()) + 1
+                out_tokens.append(active_best)
+            else:
+                out_tokens.append(0)
         else:
             scaled_logits = step_logits / max(0.1, temperature)
+            if star_rating >= 4.0:
+                boost = (star_rating - 3.5) * 0.35
+                scaled_logits[0, 1:] += boost
+
             probs = F.softmax(scaled_logits, dim=-1)
             sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
@@ -329,7 +345,7 @@ def generate_patterns_with_model3(
 
     print(f"  • Generated {num_ticks} full-resolution musical grid ticks (1/8 & 1/6 precision) across {duration_ms}ms.")
 
-    # 2. Extract Mel audio frames sampled at each tick timestamp
+    # 2. Extract Mel audio frames sampled at each tick timestamp & Multi-Scale Audio Pyramid
     with torch.no_grad():
         frame_energies_t = audio_mel.exp().mean(dim=-1)
         mean_energy_val = float(frame_energies_t.mean().item()) if frame_energies_t.numel() > 0 else 1.0
@@ -337,6 +353,7 @@ def generate_patterns_with_model3(
 
         tick_mel_list = []
         grid_metrics_list = []
+        tick_times_arr = np.array([t_obj.time_ms for t_obj in ticks], dtype=np.float32)
 
         for i, t_obj in enumerate(ticks):
             f = max(0, min(orig_total_mel_frames - 1, int(round(t_obj.time_ms / frame_ms))))
@@ -360,6 +377,10 @@ def generate_patterns_with_model3(
 
         tick_mel_tensor = torch.stack(tick_mel_list).to(dev)             # [num_ticks, 80]
         grid_metrics_tensor = torch.tensor(grid_metrics_list, dtype=torch.float32, device=dev)  # [num_ticks, 8]
+
+        # Multi-scale pyramid: Micro (±50ms), Meso (±10s), Macro (±25s) with genuine silence padding outside track
+        from osu_mapper.dataset.feature_extractor import compute_multiscale_pyramid_features
+        multiscale_pyramid_tensor = compute_multiscale_pyramid_features(audio_mel, tick_times_arr, frame_ms=frame_ms).to(dev)
 
     # Pre-generate Stage 1 Acoustic Onset Scaffold for the Neural Refiner
     print(f"  • Generating Stage 1 Acoustic Onset Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
@@ -416,6 +437,7 @@ def generate_patterns_with_model3(
         strain_metrics_tensor[cur_pos, 0] = float(running_density)
         strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
 
+        window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
         window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
@@ -439,6 +461,7 @@ def generate_patterns_with_model3(
                 scaffold_tokens=window_scaffold,
                 strain_metrics=window_strain,
                 audio_memory=window_audio_memory,
+                multiscale_audio=window_multiscale,
             )
             cur_chord_logits = chord_logits[0, -1:].clone()
             cur_ln_logits = ln_logits[0, -1:].clone()

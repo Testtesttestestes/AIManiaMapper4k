@@ -306,8 +306,16 @@ class ManiaPatternTransformer(BaseModule):
             nn.Linear(self.config.d_model // 2, self.config.d_model),
         )
 
-        # Direct Local Audio Patch Projection (Log-Mel + Delta + Onset Flux strictly at tick t)
-        # Guarantees local acoustic grounding: suppresses hallucinations in quiet intro/breaks
+        # Multi-Scale Pyramid Audio Projection (Micro 240 + Meso 96 + Macro 32 = 368 dims)
+        # Deep acoustic grounding: local transients + 10s phrase energy/slope + 25s song structure/boundary
+        self.multiscale_audio_proj = nn.Sequential(
+            nn.Linear(368, self.config.d_model),
+            nn.LayerNorm(self.config.d_model),
+            nn.GELU(),
+            nn.Linear(self.config.d_model, self.config.d_model),
+        )
+
+        # Direct Local Micro Patch Projection (Log-Mel + Delta + Onset Flux strictly at tick t = 240 dims)
         self.local_audio_proj = nn.Sequential(
             nn.Linear(self.config.audio_dim * 3, self.config.d_model),
             nn.LayerNorm(self.config.d_model),
@@ -353,6 +361,7 @@ class ManiaPatternTransformer(BaseModule):
         scaffold_tokens: Optional[torch.Tensor] = None,
         strain_metrics: Optional[torch.Tensor] = None,
         audio_memory: Optional[torch.Tensor] = None,
+        multiscale_audio: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
         return_sr: bool = False,
         context_dropout: Optional[float] = None,
@@ -443,8 +452,12 @@ class ManiaPatternTransformer(BaseModule):
         else:
             metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-        # 8. Local Audio Patch at tick t (Instantaneous physical acoustic signal strictly at tick t)
-        if audio_mel.shape[-1] == self.config.audio_dim:
+        # 8. Hierarchical Multi-Scale Audio Grounding (Micro tick t + Meso ±10s + Macro ±25s)
+        if multiscale_audio is not None and multiscale_audio.shape[-1] == 368:
+            local_audio_feat = self.multiscale_audio_proj(multiscale_audio)
+        elif audio_mel.shape[-1] == 368:
+            local_audio_feat = self.multiscale_audio_proj(audio_mel)
+        elif audio_mel.shape[-1] == self.config.audio_dim:
             prev_mel = F.pad(audio_mel[:, :-1, :], (0, 0, 1, 0))
             delta = audio_mel - prev_mel
             flux = F.relu(delta)
