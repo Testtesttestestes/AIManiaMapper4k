@@ -76,36 +76,24 @@ def sample_chord_tokens_with_nucleus(
     temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
-    note_conf_thresh: float = 0.45,
+    note_conf_thresh: float = 0.0,
 ) -> List[int]:
     """
-    Samples 4K chord tokens with confidence thresholding:
-    - If note_conf_thresh > 0.0: enforces P(active note) >= note_conf_thresh, eliminating low-confidence noise.
-    - If greedy=True or temperature <= 0.05: uses direct deterministic ArgMax on active tokens.
-    - If temperature > 0.05: uses Temperature + Nucleus (Top-P) sampling.
+    Unconstrained Neural Chord Decoder:
+    Direct raw neural network output without artificial chord limits or forced overrides.
     """
     T, num_classes = logits.shape
-    probs_raw = F.softmax(logits, dim=-1)
-    p_active = 1.0 - probs_raw[:, 0]
-
-    # Difficulty chord mask: mask out oversized chords for lower Star Ratings
-    max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
-    
-    masked_logits = logits.clone()
-    for tok_idx in range(num_classes):
-        num_keys = bin(tok_idx).count("1")
-        if num_keys > max_keys:
-            masked_logits[:, tok_idx] = -1e9
-
     out_tokens: List[int] = []
-    for t_i in range(T):
-        if (note_conf_thresh > 0.0) and (float(p_active[t_i].item()) < note_conf_thresh):
-            out_tokens.append(0)
-            continue
 
-        step_logits = masked_logits[t_i : t_i + 1].clone()
+    for t_i in range(T):
+        step_logits = logits[t_i : t_i + 1].clone()
+
         if note_conf_thresh > 0.0:
-            step_logits[0, 0] = -1e9  # Active condition met; choose best non-zero chord
+            probs_raw = F.softmax(step_logits, dim=-1)
+            p_active = 1.0 - probs_raw[0, 0]
+            if float(p_active.item()) < note_conf_thresh:
+                out_tokens.append(0)
+                continue
 
         if greedy or temperature <= 0.05:
             out_tokens.append(int(step_logits.argmax(dim=-1).item()))
@@ -265,12 +253,12 @@ def generate_patterns_with_model3(
     chunk_frames: int = 128,
     warmup_lead_in_frames: int = 64,
     timing_points: Optional[List[TimingPoint]] = None,
-    temperature: float = 0.30,
+    temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
-    note_conf_thresh: float = 0.25,
+    note_conf_thresh: float = 0.0,
     ln_conf_thresh: float = 0.78,
-    silence_gate: float = 0.15,
+    silence_gate: float = 0.0,
 ) -> List[ManiaHitObject]:
     """
     Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
@@ -313,20 +301,10 @@ def generate_patterns_with_model3(
     sr_tensor = torch.tensor([[star_rating]], dtype=torch.float32, device=dev)
     frame_ms = 16.0
 
-    # 1. Generate deterministic sequence of musical grid ticks for the entire song duration
-    # Strictly aligned to osu!mania Ranking Criteria difficulty divisors:
-    # - Easy/Normal (SR < 2.5*): Subdivisions strictly limited to 1/1 & 1/2 (White & Red ticks only, 0 blue ticks).
-    # - Hard/Insane (2.5* <= SR < 6.0*): Standard 1/4 binary & 1/3 ternary subdivisions (White, Red, Blue).
-    # - Extra/Expert (SR >= 6.0*): Dense 1/8 bursts and 1/6 streams.
-    if star_rating < 2.5:
-        subdiv_b = 2
-        subdiv_t = 1
-    elif star_rating < 6.0:
-        subdiv_b = 4
-        subdiv_t = 3 if star_rating < 3.8 else 6
-    else:
-        subdiv_b = 8
-        subdiv_t = 6
+    # 1. Generate full-resolution musical grid ticks (1/8 straight & 1/6 triplet subdivisions)
+    # Allows model to freely place notes at any 1/1, 1/2, 1/4, 1/6, 1/8 timestamp across the track.
+    subdiv_b = 8
+    subdiv_t = 6
 
     resolved_tps = timing_points or [
         TimingPoint(
@@ -349,7 +327,7 @@ def generate_patterns_with_model3(
         print("  ⚠️ Notice: No musical ticks generated; returning empty beatmap.")
         return []
 
-    print(f"  • Generated {num_ticks} deterministic musical grid ticks (1/4 & 1/6 subdivisions) across {duration_ms}ms.")
+    print(f"  • Generated {num_ticks} full-resolution musical grid ticks (1/8 & 1/6 precision) across {duration_ms}ms.")
 
     # 2. Extract Mel audio frames sampled at each tick timestamp
     with torch.no_grad():
@@ -506,12 +484,9 @@ def generate_patterns_with_model3(
     total_lns = 0
 
     # Process each of the 4 keys independently with Lane-Locking & Sustain-Tracking
-    # Minimum physical gap between notes on the SAME column to prevent unplayable minijacks
-    min_col_gap_ms = 45 if star_rating >= 6.0 else (60 if star_rating >= 3.5 else 120)
-
+    # Pure unconstrained mapping: all notes predicted by the model are emitted directly as-is
     for col in range(4):
         busy_until_tick = -1
-        last_note_end_ms = -1000
 
         for i in range(num_ticks):
             if i <= busy_until_tick:
@@ -530,10 +505,6 @@ def generate_patterns_with_model3(
             t_ms = int(round(tick_obj.time_ms))
             if t_ms >= duration_ms:
                 break
-
-            # Debounce protection: enforce physical ergonomics on the same column
-            if t_ms - last_note_end_ms < min_col_gap_ms:
-                continue
 
             cur_ln_prob = all_ln_probs[i][col] if i < len(all_ln_probs) else 0.0
             is_potential_ln = (star_rating >= 1.8) and (cur_ln_prob >= ln_start_threshold)
