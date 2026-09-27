@@ -118,5 +118,44 @@ class TestStarRatingAndTiming(unittest.TestCase):
         self.assertGreater(sr_stream, sr_sparse, "Streams must be harder than sparse notes")
 
 
+    def test_multi_bpm_grid_switching_in_algorithmic_generator(self):
+        """Verify that generate_patterns switches rhythm grid seamlessly when BPM changes."""
+        from osu_mapper.pipeline.timing import TimingPoint
+
+        # Section 1: 0ms to 10000ms at 120 BPM (500ms beat length)
+        # Section 2: 10000ms to 20000ms at 240 BPM (250ms beat length)
+        # Section 3: 20000ms to 30000ms at 180 BPM (333.33ms beat length)
+        tp1 = TimingPoint(time=0, beat_length=500.0, uninherited=1)
+        tp2 = TimingPoint(time=10000, beat_length=250.0, uninherited=1)
+        tp3 = TimingPoint(time=20000, beat_length=333.33, uninherited=1)
+
+        tps = [tp1, tp2, tp3]
+        objects = generate_patterns(
+            bpm=120.0,
+            offset_ms=0,
+            duration_ms=30000,
+            star_rating=3.0,
+            timing_points=tps,
+            seed=42,
+        )
+
+        sec1_notes = [o.start_time for o in objects if o.start_time < 10000]
+        sec2_notes = [o.start_time for o in objects if 10000 <= o.start_time < 20000]
+        sec3_notes = [o.start_time for o in objects if 20000 <= o.start_time < 30000]
+
+        # Check section 1 notes are aligned to 120 BPM grid (multiples of 125ms = 1/4 beat)
+        for t in sec1_notes:
+            self.assertEqual(t % 125, 0, f"Section 1 note at {t}ms not aligned to 120 BPM 1/4 grid!")
+
+        # Check section 2 notes are aligned to 240 BPM grid (multiples of 62.5ms = 1/4 beat relative to 10000ms)
+        for t in sec2_notes:
+            rel_t = t - 10000
+            rem = rel_t % 62.5
+            self.assertTrue(rem < 1.0 or rem > 61.5, f"Section 2 note at {t}ms (rel {rel_t}ms) not aligned to 240 BPM grid!")
+
+        # Check section 3 notes are aligned to 20000ms offset
+        self.assertTrue(any(abs(t - 20000) <= 2 for t in sec3_notes), "Must have notes anchored at section 3 timing point 20000ms")
+
+
 if __name__ == "__main__":
     unittest.main()

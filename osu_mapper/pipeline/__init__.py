@@ -186,6 +186,7 @@ def generate_beatmap_pipeline(
                 duration_ms=audio_analysis.duration_ms,
                 star_rating=sr,
                 onsets_ms=audio_analysis.onsets_ms,
+                timing_points=timing_points,
                 seed=seed + idx,
             )
 

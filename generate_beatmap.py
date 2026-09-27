@@ -221,9 +221,10 @@ def main():
     parser.add_argument(
         "--sr", "--star-rating", "--diffs", "--difficulties",
         type=str,
-        default="3.5",
+        nargs="*",
+        default=["3.5"],
         dest="star_rating",
-        help="Target Star Rating(s). Accepts single value or comma-separated list with 2 decimal precision (e.g. --sr '2.0, 2.75, 3.5, 4.25, 5.0')",
+        help="Target Star Rating(s). Accepts single value, space-separated, or comma-separated list (e.g. --sr '2.0, 2.75, 3.5, 4.25, 5.0' or --sr 2.0 2.75 3.5)",
     )
     parser.add_argument("--title", type=str, default=None, help="Song title override")
     parser.add_argument("--artist", type=str, default=None, help="Song artist override")
@@ -316,14 +317,19 @@ def main():
     wav_target = work_dir / "converted_audio.wav"
     effective_wav = convert_audio_to_wav(audio_path, wav_target)
 
-    # Parse Star Rating(s): single float or comma-separated list
-    sr_input = str(args.star_rating).strip()
+    # Parse Star Rating(s): accepts comma-separated strings, space-separated lists, or single floats
+    raw_sr_items = args.star_rating if isinstance(args.star_rating, list) else [args.star_rating]
+    sr_list = []
     try:
-        sr_list = [round(float(s.strip()), 2) for s in sr_input.split(",") if s.strip()]
+        for item in raw_sr_items:
+            for sub in str(item).replace(",", " ").split():
+                sub_clean = sub.strip()
+                if sub_clean:
+                    sr_list.append(round(float(sub_clean), 2))
         if not sr_list:
             sr_list = [3.50]
     except ValueError as val_err:
-        print(f"❌ [Error] Invalid --sr value '{args.star_rating}'. Please provide numbers like --sr '2.0, 2.75, 3.5, 4.25': {val_err}")
+        print(f"❌ [Error] Invalid --sr value '{args.star_rating}'. Please provide numbers like --sr \"2.0, 2.75, 3.5, 4.25\": {val_err}")
         sys.exit(1)
 
     # Resolve metadata

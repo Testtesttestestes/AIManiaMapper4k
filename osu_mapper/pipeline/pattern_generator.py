@@ -593,61 +593,101 @@ def generate_patterns(
     duration_ms: int,
     star_rating: float = 3.5,
     onsets_ms: Optional[List[int]] = None,
+    timing_points: Optional[List[TimingPoint]] = None,
     seed: int = 42,
 ) -> List[ManiaHitObject]:
     """
     Algorithmic generator conditioned strictly on requested Star Rating (1.0* to 9.9*).
-    Strictly synchronizes to musical beat grid ticks without floating micro-jitter.
+    Strictly synchronizes to musical beat grid ticks across ALL timing points and BPM changes.
     """
     rng = random.Random(seed)
     params = get_star_rating_params(star_rating)
-    beat_length = 60000.0 / max(1.0, bpm)
-    step_1_4 = beat_length / 4.0
-    step_1_2 = beat_length / 2.0
+    sr = params["star_rating"]
 
-    onset_set: List[int] = sorted(onsets_ms) if onsets_ms else []
+    # 1. Generate full sequence of musical grid ticks across all timing points
+    ticks = generate_musical_grid_ticks_from_timing_points(
+        timing_points=timing_points if timing_points else [],
+        duration_ms=duration_ms,
+        default_bpm=bpm,
+        default_offset_ms=float(offset_ms),
+        subdiv_binary=8,
+        subdiv_ternary=6,
+    )
 
-    # Determine rhythm grid steps based on Star Rating
+    # Filter ticks to active audio range
+    valid_ticks = [t for t in ticks if 0 <= t.time_ms <= duration_ms]
+    if not valid_ticks:
+        return []
+
+    # Fast lookup for tick properties by time_ms
+    tick_by_time: Dict[int, MusicalGridTick] = {}
+    for t_obj in valid_ticks:
+        t_int = int(round(t_obj.time_ms))
+        tick_by_time[t_int] = t_obj
+
+    # 2. Select active grid events conditioned on Star Rating
     grid_events: List[int] = []
-    num_1_4_steps = int((duration_ms - offset_ms) / step_1_4)
-    easy_step_mod = 8 if beat_length < 450 else 4
 
-    for step_idx in range(max(0, num_1_4_steps)):
-        t_grid = int(round(offset_ms + step_idx * step_1_4))
-        if t_grid >= duration_ms:
-            break
+    for t_obj in valid_ticks:
+        t_ms = int(round(t_obj.time_ms))
+        is_downbeat = t_obj.is_downbeat
+        is_1_1 = t_obj.is_beat_start
+        is_1_2 = (t_obj.divisor == 2) or (t_obj.divisor_fraction == 0.5)
+        is_1_4 = (t_obj.divisor == 4) or (t_obj.divisor_fraction == 0.25)
+        is_1_8 = (t_obj.divisor == 8) or (t_obj.divisor_fraction == 0.125)
+        is_ternary_sub = (t_obj.divisor in (3, 6))
 
-        is_1_1 = (step_idx % 4 == 0)
-        is_1_2 = (step_idx % 2 == 0)
-        is_easy_beat = (step_idx % easy_step_mod == 0)
-
-        should_place = False
-        if params["star_rating"] < 1.8:
-            should_place = is_easy_beat
-        elif params["star_rating"] < 3.0:
+        # Easy map (1.0* - 1.8*): Downbeats or every 2nd beat (measure/half-measure pulses)
+        if sr < 1.8:
+            easy_mod = 2 if t_obj.beat_len_ms < 450 else 1
+            if is_downbeat:
+                should_place = True
+            elif is_1_1 and (t_obj.beat_in_measure % easy_mod == 0):
+                should_place = True
+            else:
+                should_place = False
+        elif sr < 3.0:
             if is_1_1:
                 should_place = True
             elif is_1_2:
                 should_place = rng.random() < params["subdiv_1_2_prob"]
-            else:
+            elif is_1_4 or is_ternary_sub:
                 should_place = rng.random() < params["subdiv_1_4_prob"]
-        else:
+            else:
+                should_place = False
+        elif sr < 5.0:
             if is_1_1 or is_1_2:
                 should_place = True
-            else:
+            elif is_1_4 or is_ternary_sub:
                 should_place = rng.random() < params["subdiv_1_4_prob"]
+            elif is_1_8:
+                should_place = rng.random() < params["subdiv_1_8_prob"]
+            else:
+                should_place = False
+        else:  # High SR (5.0*+)
+            if is_1_1 or is_1_2:
+                should_place = True
+            elif is_1_4 or is_ternary_sub:
+                should_place = rng.random() < max(0.85, params["subdiv_1_4_prob"])
+            elif is_1_8:
+                should_place = rng.random() < params["subdiv_1_8_prob"]
+            else:
+                should_place = False
 
         if should_place:
-            grid_events.append(t_grid)
+            grid_events.append(t_ms)
 
-    # For moderate to high SR (>= 3.5*), also capture isolated sharp audio transients
-    if params["star_rating"] >= 3.5 and onset_set:
-        for onset in onset_set:
-            if offset_ms <= onset < duration_ms:
-                grid_events.append(onset)
+    # For SR >= 3.5*, also incorporate sharp audio transients/onsets
+    if sr >= 3.5 and onsets_ms:
+        for onset in onsets_ms:
+            if 0 <= onset <= duration_ms:
+                grid_events.append(int(round(onset)))
 
     active_timestamps = sorted(list(set(grid_events)))
+    if not active_timestamps:
+        return []
 
+    # 3. 4K Lane distribution, Chord sizes, and Long Note generation
     column_busy_until = [0, 0, 0, 0]
     last_note_time = [-9999, -9999, -9999, -9999]
     last_note_global = -9999
@@ -658,6 +698,13 @@ def generate_patterns(
     for i, t in enumerate(active_timestamps):
         if (t - last_note_global) < (min_gap // 2):
             continue
+
+        # Get local timing info for this timestamp
+        local_tick = tick_by_time.get(t)
+        local_beat_len = local_tick.beat_len_ms if local_tick else (60000.0 / max(1.0, bpm))
+        local_is_downbeat = local_tick.is_downbeat if local_tick else False
+        local_step_1_2 = local_beat_len / 2.0
+        local_step_1_4 = local_beat_len / 4.0
 
         r = rng.random()
         w = params["chord_weights"]
@@ -672,9 +719,8 @@ def generate_patterns(
 
         chord_size = min(max_chord, raw_chord)
 
-        dist_to_beat = abs((t - offset_ms) % beat_length)
-        is_downbeat = dist_to_beat < 15.0 or abs(dist_to_beat - beat_length) < 15.0
-        if not is_downbeat and chord_size > 2 and params["star_rating"] < 6.0:
+        # Restrict large chords to downbeats on lower-to-mid difficulties
+        if not local_is_downbeat and chord_size > 2 and sr < 6.0:
             chord_size = min(2, chord_size)
 
         available_cols = [c for c in range(4) if column_busy_until[c] <= t]
@@ -685,19 +731,19 @@ def generate_patterns(
         available_cols.sort(key=lambda c: (last_note_time[c], rng.random()))
         chosen_cols = available_cols[:actual_chord_size]
 
-        can_have_ln = (params["star_rating"] >= 2.0) and (rng.random() < params["ln_prob"])
-        next_time = active_timestamps[i + 1] if (i + 1) < len(active_timestamps) else (t + int(beat_length))
+        can_have_ln = (sr >= 2.0) and (rng.random() < params["ln_prob"])
+        next_time = active_timestamps[i + 1] if (i + 1) < len(active_timestamps) else (t + int(local_beat_len))
         
         gap_to_next = max(0, next_time - t)
-        if gap_to_next >= int(beat_length * 1.5):
-            hold_len = int(round(beat_length))
-        elif gap_to_next >= int(beat_length):
-            hold_len = int(round(step_1_2 + step_1_4))
+        if gap_to_next >= int(local_beat_len * 1.5):
+            hold_len = int(round(local_beat_len))
+        elif gap_to_next >= int(local_beat_len):
+            hold_len = int(round(local_step_1_2 + local_step_1_4))
         else:
-            hold_len = int(round(step_1_2))
+            hold_len = int(round(local_step_1_2))
 
         for c_idx, col in enumerate(chosen_cols):
-            is_ln = can_have_ln and (c_idx == 0) and (hold_len >= int(step_1_2))
+            is_ln = can_have_ln and (c_idx == 0) and (hold_len >= int(local_step_1_2))
             end_t = min(duration_ms, t + hold_len) if is_ln else t
 
             hit_objects.append(
