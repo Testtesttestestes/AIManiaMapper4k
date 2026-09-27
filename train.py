@@ -43,13 +43,40 @@ from osu_mapper.pipeline.onset_scaffold import compute_acoustic_onset_scaffold
 
 
 class ManiaDataset(Dataset):
-    """Loads preprocessed training chunks from PyTorch tensor file."""
+    """Loads preprocessed training chunks from single PyTorch tensor file or partitioned shard directory."""
     def __init__(self, data_path: str | Path):
         self.path = Path(data_path)
         if not self.path.exists():
-            raise FileNotFoundError(f"Dataset file not found at '{self.path}'. Run 'python3 prepare_dataset.py' first.")
-        print(f"[Dataset] Loading '{self.path}' into memory...")
-        self.chunks: List[Dict[str, torch.Tensor]] = torch.load(self.path, weights_only=False)
+            raise FileNotFoundError(f"Dataset path not found at '{self.path}'. Run 'python prepare_dataset.py' first.")
+
+        self.chunks: List[Dict[str, torch.Tensor]] = []
+
+        if self.path.is_file():
+            print(f"[Dataset] Loading '{self.path}' into memory...")
+            self.chunks = torch.load(self.path, weights_only=False)
+        else:
+            # Check for sharded parts: train_data_part_*.pt or train_data.pt
+            shards = sorted(list(self.path.glob("train_data_part_*.pt")))
+            if shards:
+                print(f"[Dataset] Loading {len(shards)} dataset shards from '{self.path}'...")
+                for s_i, shard in enumerate(shards):
+                    shard_data = torch.load(shard, weights_only=False)
+                    self.chunks.extend(shard_data)
+                    print(f"  • Shard {s_i + 1}/{len(shards)}: {shard.name} ({len(shard_data)} samples, total: {len(self.chunks)})")
+            elif (self.path / "train_data.pt").exists():
+                main_file = self.path / "train_data.pt"
+                print(f"[Dataset] Loading '{main_file}' into memory...")
+                self.chunks = torch.load(main_file, weights_only=False)
+            else:
+                all_pts = sorted(list(self.path.glob("*.pt")))
+                if all_pts:
+                    for pt_file in all_pts:
+                        if "song_sync" in pt_file.name:
+                            continue
+                        self.chunks.extend(torch.load(pt_file, weights_only=False))
+                else:
+                    raise FileNotFoundError(f"No .pt tensor dataset files or shards found in '{self.path}'.")
+
         print(f"[Dataset] Successfully loaded {len(self.chunks)} training samples.")
 
     def __len__(self) -> int:

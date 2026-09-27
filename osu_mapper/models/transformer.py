@@ -53,16 +53,20 @@ def calculate_pattern_loss(
     ln_mask: Any,
     pred_sr: Optional[Any] = None,
     target_sr: Optional[Any] = None,
+    pred_time_deltas: Optional[Any] = None,
+    target_time_deltas: Optional[Any] = None,
     chord_weights: Optional[Any] = None,
     ln_pos_weight: Optional[Any] = None,
     sr_loss_weight: float = 0.5,
     ln_loss_weight: float = 1.5,
+    delta_loss_weight: float = 0.5,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Computes the composite loss for ManiaPatternTransformer:
     1. Weighted Chord CrossEntropyLoss (penalizes missing active notes vs empty ticks)
     2. Positively-weighted LN BCE loss (strictly penalizes missed hold notes/sliders)
     3. Difficulty Consistency SmoothL1Loss (penalizes generating wrong Star Rating density)
+    4. Continuous Time-Delta SmoothL1Loss (penalizes mispredicting continuous step forward jumps in ms)
     """
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for calculate_pattern_loss.")
@@ -87,6 +91,11 @@ def calculate_pattern_loss(
         loss_sr = F.smooth_l1_loss(pred_sr, target_sr)
         total_loss = total_loss + sr_loss_weight * loss_sr
         loss_dict["loss_sr"] = loss_sr
+
+    if pred_time_deltas is not None and target_time_deltas is not None:
+        loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
+        total_loss = total_loss + delta_loss_weight * loss_delta
+        loss_dict["loss_delta"] = loss_delta
 
     loss_dict["total_loss"] = total_loss
     return total_loss, loss_dict
@@ -341,6 +350,11 @@ class ManiaPatternTransformer(BaseModule):
         self.chord_head = nn.Linear(self.config.d_model, self.config.num_classes)
         self.ln_head = nn.Linear(self.config.d_model, 4)            # LN trigger probability per column
         self.ln_duration_head = nn.Linear(self.config.d_model, 4)   # LN sustain tail duration in frames
+        self.time_delta_head = nn.Sequential(                       # Continuous Time Advance Step Head (\Delta t in ms)
+            nn.Linear(self.config.d_model, self.config.d_model // 2),
+            nn.GELU(),
+            nn.Linear(self.config.d_model // 2, 1),
+        )
         self.sr_eval_head = nn.Sequential(
             nn.Linear(self.config.d_model, self.config.d_model // 2),
             nn.SiLU(),
@@ -364,6 +378,7 @@ class ManiaPatternTransformer(BaseModule):
         multiscale_audio: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
         return_sr: bool = False,
+        return_time_delta: bool = False,
         context_dropout: Optional[float] = None,
     ):
         """
@@ -484,6 +499,13 @@ class ManiaPatternTransformer(BaseModule):
         modulated_hidden = hidden + sr_feat
         chord_logits = self.chord_head(modulated_hidden)
         ln_logits = self.ln_head(modulated_hidden)
+
+        if return_time_delta:
+            pred_time_deltas = F.softplus(self.time_delta_head(modulated_hidden))
+            if return_sr:
+                pred_sr = self.sr_eval_head(hidden.mean(dim=1))
+                return chord_logits, ln_logits, pred_sr, pred_time_deltas
+            return chord_logits, ln_logits, pred_time_deltas
 
         if return_sr:
             pred_sr = self.sr_eval_head(hidden.mean(dim=1))

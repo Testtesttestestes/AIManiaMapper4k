@@ -398,13 +398,31 @@ def process_archives(
         except Exception as err:
             print(f"  [Error] Failed processing folder '{sdir.name}': {err}")
 
-    # Stack or save dataset
-    dataset_file = out_path / "train_data.pt"
-    song_sync_file = out_path / "song_sync_data.pt"
+    # Sharded save to avoid 2GB/3GB single-stream torch.save / zipfile container limits
     meta_file = out_path / "metadata.json"
+    song_sync_file = out_path / "song_sync_data.pt"
 
-    print(f"\n[Packaging] Saving {len(chunks_list)} training chunks to '{dataset_file}' (Timing Source: {timing_source.upper()})...")
-    torch.save(chunks_list, dataset_file)
+    shard_size = 15000
+    total_chunks = len(chunks_list)
+    shard_files: List[str] = []
+
+    print(f"\n[Packaging] Saving {total_chunks} training chunks to '{out_path}' (Timing Source: {timing_source.upper()})...")
+
+    if total_chunks <= shard_size:
+        dataset_file = out_path / "train_data.pt"
+        torch.save(chunks_list, dataset_file)
+        shard_files.append("train_data.pt")
+        print(f"  ✓ Saved single shard: {dataset_file.name} ({dataset_file.stat().st_size / (1024 * 1024):.1f} MB)")
+    else:
+        num_shards = (total_chunks + shard_size - 1) // shard_size
+        for s_idx in range(num_shards):
+            s_start = s_idx * shard_size
+            s_end = min(total_chunks, (s_idx + 1) * shard_size)
+            shard_fname = f"train_data_part_{s_idx:03d}.pt"
+            shard_path = out_path / shard_fname
+            torch.save(chunks_list[s_start:s_end], shard_path)
+            shard_files.append(shard_fname)
+            print(f"  ✓ Shard {s_idx + 1}/{num_shards}: '{shard_fname}' ({s_end - s_start} samples, {shard_path.stat().st_size / (1024 * 1024):.1f} MB)")
 
     if song_sync_list:
         print(f"[Packaging] Saving {len(song_sync_list)} song-level sync profiles to '{song_sync_file}'...")
@@ -422,18 +440,19 @@ def process_archives(
         "hop_size": hop_size,
         "n_mels": n_mels,
         "sample_rate": target_sr,
+        "shards": shard_files,
         "items": metadata_records,
     }
 
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"Dataset preparation complete:")
+    print(f"\nDataset preparation complete:")
     print(f"  - Total archives processed: {len(osz_files)}")
     print(f"  - Valid 4K mania diffs:    {total_diffs}")
     print(f"  - Timing source strategy:  {timing_source.upper()} ({'Original Map Ground Truth' if timing_source == 'map' else 'Cascaded Model 1'})")
-    print(f"  - Training chunks created: {len(chunks_list)} (align_mode='{align_mode}')")
-    print(f"  - Output binary tensor:    {dataset_file} ({dataset_file.stat().st_size / (1024 * 1024):.1f} MB)")
+    print(f"  - Training chunks created: {total_chunks} across {len(shard_files)} shard(s)")
+    print(f"  - Output directory:        {out_path}")
     print(f"  - Metadata manifest:       {meta_file}")
     return summary
 
