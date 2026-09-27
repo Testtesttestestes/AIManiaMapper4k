@@ -39,6 +39,7 @@ from osu_mapper.models import (
     SyncBPMOffsetModel,
     TransformerConfig,
 )
+from osu_mapper.pipeline.onset_scaffold import compute_acoustic_onset_scaffold
 
 
 class ManiaDataset(Dataset):
@@ -230,66 +231,28 @@ def compute_multi_scenario_scaffold_and_strain(
     density_ratio = (running_density / target_density).clamp(max=5.0)
     strain_metrics = torch.stack([running_density, density_ratio], dim=-1)
 
-    # 2. Multi-Scenario Scaffold Generator
+    # 2. Multi-Scenario Acoustic Scaffold Generator (Zero Ground-Truth Leakage)
+    # 60% Real Acoustic Onset Scaffold, 25% Pure Zero Scaffold (Audio-Only), 15% Noisy Acoustic Scaffold
+    acoustic_scaffold = compute_acoustic_onset_scaffold(audio_mel, grid_metrics, star_rating)
     scaffold_tokens = torch.zeros(B, T, dtype=torch.int64, device=device)
 
     for b in range(B):
         scenario_choice = torch.rand(1).item()
-        sr = float(star_rating[b].item()) if star_rating.ndim > 1 else float(star_rating[b])
 
-        if scenario_choice < 0.35:
-            # Scenario A: Algorithmic Heuristic Debris (Downbeat / 1/4 Grid placement)
-            if grid_metrics is not None:
-                # Use downbeats & energy from grid_metrics [T, 8]
-                is_downbeat = grid_metrics[b, :, 2] > 0.5
-                div_frac = grid_metrics[b, :, 0]
-                is_quarter = (div_frac % 0.25 < 0.05) | (div_frac % 0.25 > 0.95)
-                
-                # Assign chords based on SR
-                chord_size = 1 if sr < 2.5 else (2 if sr < 5.0 else 3)
-                basic_pattern = torch.zeros(T, dtype=torch.int64, device=device)
-                
-                # Single notes on quarters, doubles on downbeats
-                for t in range(T):
-                    if is_downbeat[t]:
-                        basic_pattern[t] = 3 if chord_size >= 2 else 1  # 0011 or 0001
-                    elif is_quarter[t] and (t % 2 == 0):
-                        basic_pattern[t] = 1 << (t % 4)
-                
-                scaffold_tokens[b] = basic_pattern
-            else:
-                # Simple periodic 1/4 fallback
-                basic_pattern = torch.zeros(T, dtype=torch.int64, device=device)
-                basic_pattern[::4] = 1
-                basic_pattern[::8] = 3
-                scaffold_tokens[b] = basic_pattern
-
-        elif scenario_choice < 0.70:
-            # Scenario B: Extreme Neural / Debris Garbage (Spam bursts, wrong lanes, erratic density)
-            debris = tokens[b].clone()
-            # Randomly inject 40-70% noise, duplicate notes, and spam bursts
-            noise_rate = torch.empty(1).uniform_(0.40, 0.75).item()
-            noise_mask = torch.rand(T, device=device) < noise_rate
-            debris[noise_mask] = torch.randint(0, 16, (noise_mask.sum(),), device=device)
-            
-            # Inject uncoordinated minijacks (repeated identical tokens)
-            if torch.rand(1).item() < 0.5:
-                jack_span = torch.randint(4, 16, (1,)).item()
-                start_j = torch.randint(0, max(1, T - jack_span), (1,)).item()
-                debris[start_j : start_j + jack_span] = 1 << torch.randint(0, 4, (1,)).item()
-
-            scaffold_tokens[b] = debris
+        if scenario_choice < 0.60:
+            # Scenario A: Standard Acoustic Spectral Onset Scaffold
+            scaffold_tokens[b] = acoustic_scaffold[b]
 
         elif scenario_choice < 0.85:
-            # Scenario C: Sparse / Blank Scaffold (Force pure Audio -> Beatmap synthesis)
+            # Scenario B: Pure Zero Scaffold (Forces model to perform direct Audio-to-Pattern synthesis)
             scaffold_tokens[b] = torch.zeros(T, dtype=torch.int64, device=device)
 
         else:
-            # Scenario D: Softly Perturbed Scaffold (15% noise)
-            clean_draft = tokens[b].clone()
-            soft_noise = torch.rand(T, device=device) < 0.15
-            clean_draft[soft_noise] = torch.randint(0, 16, (soft_noise.sum(),), device=device)
-            scaffold_tokens[b] = clean_draft
+            # Scenario C: Perturbed Acoustic Scaffold (Simulates timing jitter / noise in onset detector)
+            noisy = acoustic_scaffold[b].clone()
+            jitter_mask = (torch.rand(T, device=device) < 0.20)
+            noisy[jitter_mask] = torch.randint(0, 16, (jitter_mask.sum(),), device=device)
+            scaffold_tokens[b] = noisy
 
     return scaffold_tokens, strain_metrics
 

@@ -26,6 +26,7 @@ from osu_mapper.pipeline.timing import (
     generate_musical_grid_ticks_from_timing_points,
     snap_to_musical_grid,
 )
+from osu_mapper.pipeline.onset_scaffold import compute_acoustic_onset_scaffold
 
 try:
     import numpy as np
@@ -381,26 +382,13 @@ def generate_patterns_with_model3(
         tick_mel_tensor = torch.stack(tick_mel_list).to(dev)             # [num_ticks, 80]
         grid_metrics_tensor = torch.tensor(grid_metrics_list, dtype=torch.float32, device=dev)  # [num_ticks, 8]
 
-    # Pre-generate Stage 1 Algorithmic Scaffold Draft for the Neural Refiner
-    print(f"  • Generating Stage 1 Algorithmic Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
-    draft_objects = generate_patterns(
-        bpm=bpm,
-        offset_ms=offset_ms,
-        duration_ms=duration_ms,
-        star_rating=star_rating,
-    )
-    tick_time_arr = [t.time_ms for t in ticks]
-    scaffold_keys = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
-    for obj in draft_objects:
-        idx = min(num_ticks - 1, max(0, bisect.bisect_left(tick_time_arr, obj.start_time)))
-        scaffold_keys[idx, obj.column] = 1
-
-    scaffold_tokens_tensor = (
-        (scaffold_keys[:, 0] > 0).long()
-        | ((scaffold_keys[:, 1] > 0).long() << 1)
-        | ((scaffold_keys[:, 2] > 0).long() << 2)
-        | ((scaffold_keys[:, 3] > 0).long() << 3)
-    )
+    # Pre-generate Stage 1 Acoustic Onset Scaffold for the Neural Refiner
+    print(f"  • Generating Stage 1 Acoustic Onset Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
+    scaffold_tokens_tensor = compute_acoustic_onset_scaffold(
+        audio_mel=tick_mel_tensor.unsqueeze(0),
+        grid_metrics=grid_metrics_tensor.unsqueeze(0),
+        star_rating=sr_tensor,
+    ).squeeze(0)
 
     # Real-time progressive strain trajectory metrics matching training distribution [B, T, 2]
     # strain_metrics = [running_density (notes/tick in 0.05-0.40), density_ratio (running / target)]
