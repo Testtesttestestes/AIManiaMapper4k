@@ -230,9 +230,11 @@ def main():
     parser.add_argument("--synthetic", action="store_true", help="Generate a synthetic test track if no audio provided")
     parser.add_argument("--duration", type=float, default=30.0, help="Duration in seconds for synthetic audio")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for generation")
-    parser.add_argument("--temperature", "--temp", type=float, default=0.0, help="Sampling temperature: 0.0=Greedy ArgMax (highest 80+% fidelity to training data), 0.35=low-entropy, 0.70=balanced")
+    parser.add_argument("--temperature", "--temp", type=float, default=0.0, help="Sampling temperature: 0.0=Greedy ArgMax, 0.30=low-entropy")
     parser.add_argument("--top_p", "--top-p", type=float, default=0.90, help="Nucleus Top-P cumulative probability threshold (default: 0.90)")
-    parser.add_argument("--greedy", action="store_true", help="Force deterministic ArgMax decoding (exact match to training evaluation)")
+    parser.add_argument("--greedy", action="store_true", help="Force deterministic ArgMax decoding")
+    parser.add_argument("--conf", "--confidence", type=float, default=0.45, help="Active Note Confidence Threshold P(active) in [0.0..1.0] (default: 0.45). Suppresses low-confidence phantom spam.")
+    parser.add_argument("--ln_conf", "--ln-thresh", type=float, default=0.78, help="Long Note sustain threshold (default: 0.78)")
 
     args = parser.parse_args()
 
@@ -372,6 +374,8 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             greedy=args.greedy or (args.temperature <= 0.05),
+            note_conf_thresh=args.conf,
+            ln_conf_thresh=args.ln_conf,
         )
 
         print("\n" + "=" * 65)

@@ -1,14 +1,14 @@
 """
-Automated Interpreter Calibration & Tuning Tool.
-Tests the neural interpreter against real human ground-truth beatmaps from the dataset,
-measures rhythmic precision, silence handling, chord density, and Star Rating deviation,
-and performs grid search / optimization to find the exact parameters that maximize fidelity.
+Automated Multi-Parameter Interpreter Calibration Tool.
+Performs comprehensive multi-dimensional optimization across:
+1. Note Confidence Threshold (P_active vs P_idle) - eliminates low-confidence phantom spam
+2. Long Note (LN) Sustain Threshold - tunes slider duration and density
+3. Acoustic Silence Gate - suppresses notes during quiet passages and song breaks
+4. Sampling Temperature & Top-P Nucleus - balances deterministic precision with musical variance
 """
 
 import argparse
-import math
-import os
-import sys
+import itertools
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -18,18 +18,17 @@ import torch.nn.functional as F
 from osu_mapper.models.transformer import ManiaPatternTransformer, TransformerConfig
 
 
-def evaluate_sample(
+def evaluate_sample_with_thresholds(
     model: ManiaPatternTransformer,
     sample: Dict[str, Any],
     device: torch.device,
     silence_gate: float = 0.25,
-    chord_threshold: float = 0.0,
+    note_conf_thresh: float = 0.50,
+    ln_thresh: float = 0.78,
     temperature: float = 0.0,
     top_p: float = 0.90,
-    ln_threshold: float = 0.78,
-    use_scaffold: bool = False,
 ) -> Dict[str, float]:
-    """Evaluates a single validation chunk against ground truth human mapping."""
+    """Evaluates a single validation chunk against ground truth human mapping with full confidence gating."""
     mel = sample["audio_mel"].unsqueeze(0).to(device)       # [1, T, 80]
     tokens = sample["tokens"].unsqueeze(0).to(device)         # [1, T]
     ln_mask = sample["ln_mask"].unsqueeze(0).to(device)       # [1, T, 4]
@@ -50,8 +49,8 @@ def evaluate_sample(
         mean_e = frame_energies.mean(dim=-1, keepdim=True).clamp(min=1e-4)
         energy_ratio = (frame_energies / mean_e).squeeze(0)   # [T]
 
-    # Progressive autoregressive decoding
     generated_tokens: List[int] = []
+    generated_lns: List[List[float]] = []
     target_density = max(0.05, sr_val / 10.0)
 
     with torch.no_grad():
@@ -77,42 +76,65 @@ def evaluate_sample(
             strain_window[0, :, 1] = ratio
 
             w_grid = grid_metrics[:, ctx_start : cur_pos + 1] if grid_metrics is not None else None
-            w_scaffold = tokens[:, ctx_start : cur_pos + 1] if use_scaffold else None
             w_audio_mem = full_audio_memory[:, ctx_start : cur_pos + 1]
 
-            # Silence Gating: if audio energy is below threshold, suppress notes
+            # 1. Acoustic Silence Gate: if audio energy is in noise floor, strictly suppress notes
             e_ratio_val = float(energy_ratio[cur_pos].item())
             if e_ratio_val < silence_gate:
                 generated_tokens.append(0)
+                generated_lns.append([0.0, 0.0, 0.0, 0.0])
                 continue
 
-            chord_logits, ln_logits, pred_sr = model(
+            chord_logits, ln_logits, _ = model(
                 window_mel,
                 star_rating=star_rating,
                 prev_tokens=window_prev,
                 grid_metrics=w_grid,
-                scaffold_tokens=w_scaffold,
                 strain_metrics=strain_window,
                 audio_memory=w_audio_mem,
                 return_sr=True,
             )
 
-            cur_logits = chord_logits[0, -1]  # [16]
+            cur_logits = chord_logits[0, -1]       # [16]
+            cur_ln_raw = ln_logits[0, -1]          # [4]
+            cur_ln_probs = torch.sigmoid(cur_ln_raw).cpu().tolist()
 
-            if temperature <= 0.05:
-                pred_token = int(cur_logits.argmax().item())
+            # Softmax over all 16 chord options
+            probs_16 = F.softmax(cur_logits, dim=-1)
+            p_idle = float(probs_16[0].item())
+            p_active = 1.0 - p_idle
+
+            # 2. Active Note Confidence Thresholding:
+            # If the model's total confidence that *any* note should exist is below note_conf_thresh, force 0
+            if p_active < note_conf_thresh:
+                pred_token = 0
             else:
-                probs = F.softmax(cur_logits / max(0.1, temperature), dim=-1)
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                mask = cum_probs > top_p
-                mask[1:] = mask[:-1].clone()
-                mask[0] = False
-                probs[sorted_indices[mask]] = 0.0
-                probs = probs / probs.sum().clamp(min=1e-8)
-                pred_token = int(torch.multinomial(probs, 1).item())
+                active_logits = cur_logits.clone()
+                active_logits[0] = -1e9  # Suppress idle token since p_active exceeded threshold
+
+                # SR Chord mask (prevent illegal chords on lower difficulties)
+                max_k = 1 if sr_val < 1.8 else (2 if sr_val < 3.5 else (3 if sr_val < 5.0 else 4))
+                for t_i in range(1, 16):
+                    k_cnt = bin(t_i).count("1")
+                    if k_cnt > max_k:
+                        active_logits[t_i] = -1e9
+
+                if temperature <= 0.05:
+                    pred_token = int(active_logits.argmax().item())
+                else:
+                    scaled = active_logits / max(0.1, temperature)
+                    p_act = F.softmax(scaled, dim=-1)
+                    s_probs, s_idx = torch.sort(p_act, descending=True)
+                    c_probs = torch.cumsum(s_probs, dim=-1)
+                    mask = c_probs > top_p
+                    mask[1:] = mask[:-1].clone()
+                    mask[0] = False
+                    p_act[s_idx[mask]] = 0.0
+                    p_act = p_act / p_act.sum().clamp(min=1e-8)
+                    pred_token = int(torch.multinomial(p_act, 1).item())
 
             generated_tokens.append(pred_token)
+            generated_lns.append(cur_ln_probs)
 
     pred_arr = torch.tensor(generated_tokens, dtype=torch.int64, device=device)
     true_arr = tokens.squeeze(0)
@@ -123,19 +145,29 @@ def evaluate_sample(
     true_cnt = int(true_is_note.sum().item())
     pred_cnt = int(pred_is_note.sum().item())
 
-    # Rhythm note precision & recall
+    # Rhythm precision, recall and F1-score
     hit_notes = int((pred_is_note & true_is_note).sum().item())
     note_recall = (hit_notes / max(1, true_cnt))
     note_precision = (hit_notes / max(1, pred_cnt))
     rhythm_f1 = (2 * note_precision * note_recall) / max(1e-6, (note_precision + note_recall))
 
-    # Silence Accuracy: correctly identifying zero notes when human has zero notes
+    # Silence Cleanliness (zero false-positive spam during human pauses)
     true_silence = (true_arr == 0)
     pred_silence = (pred_arr == 0)
     silence_acc = int((pred_silence & true_silence).sum().item()) / max(1, int(true_silence.sum().item()))
 
-    # Exact 4K chord match on active beats
+    # Exact 4K chord matching
     exact_4k = int((pred_arr[true_is_note] == true_arr[true_is_note]).sum().item()) / max(1, true_cnt)
+
+    # LN Recall & Precision
+    pred_ln_tensor = torch.tensor(generated_lns, dtype=torch.float32, device=device) > ln_thresh
+    true_ln_tensor = ln_mask.squeeze(0) > 0.5
+    ln_true_cnt = int(true_ln_tensor.sum().item())
+    ln_pred_cnt = int(pred_ln_tensor.sum().item())
+    ln_hits = int((pred_ln_tensor & true_ln_tensor).sum().item())
+    ln_recall = (ln_hits / max(1, ln_true_cnt)) if ln_true_cnt > 0 else 1.0
+    ln_prec = (ln_hits / max(1, ln_pred_cnt)) if ln_pred_cnt > 0 else 1.0
+    ln_f1 = (2 * ln_prec * ln_recall) / max(1e-6, (ln_prec + ln_recall))
 
     return {
         "sr": sr_val,
@@ -146,21 +178,44 @@ def evaluate_sample(
         "rhythm_f1": rhythm_f1,
         "silence_acc": silence_acc,
         "exact_4k": exact_4k,
+        "ln_f1": ln_f1,
     }
 
 
-def run_calibration_grid(
+def run_full_calibration_search(
     dataset_path: str,
     checkpoint_path: str,
     num_samples: int = 12,
     device_str: str = "auto",
 ):
     dev = torch.device("cuda" if torch.cuda.is_available() and device_str == "auto" else "cpu")
-    print(f"🔧 Loading dataset from: {dataset_path}")
+
+    ds_p = Path(dataset_path)
+    if not ds_p.exists():
+        candidates = [
+            Path("dataset_processed/train_data.pt"),
+            Path("dataset_processed/val_data.pt"),
+            Path("train_data.pt"),
+            Path("val_data.pt"),
+            Path("dataset/train_data.pt"),
+            Path("dataset/val_data.pt"),
+            Path("data/train_data.pt"),
+        ]
+        found = False
+        for c in candidates:
+            if c.exists():
+                ds_p = c
+                found = True
+                print(f"💡 Auto-detected existing dataset: {ds_p}")
+                break
+        if not found:
+            raise FileNotFoundError(f"Could not find dataset file at '{dataset_path}'. Please pass --dataset path/to/train_data.pt")
+
+    print(f"🔧 Loading dataset from: {ds_p}")
     try:
-        dataset = torch.load(dataset_path, map_location="cpu", weights_only=False)
+        dataset = torch.load(ds_p, map_location="cpu", weights_only=False)
     except TypeError:
-        dataset = torch.load(dataset_path, map_location="cpu")
+        dataset = torch.load(ds_p, map_location="cpu")
 
     print(f"🧠 Loading Model 3 Checkpoint: {checkpoint_path}")
     cfg = TransformerConfig(
@@ -182,79 +237,93 @@ def run_calibration_grid(
     step = max(1, len(dataset) // num_samples)
     samples = [dataset[i * step] for i in range(min(num_samples, len(dataset)))]
 
-    print("\n" + "=" * 90)
-    print(" 🧪 CALIBRATING INTERPRETER: TESTING SILENCE GATING & RHYTHMIC COHERENCE")
-    print("=" * 90)
+    print("\n" + "=" * 115)
+    print(" 🧪 COMPREHENSIVE MULTI-DIMENSIONAL CALIBRATION ON REAL HUMAN BEATMAPS")
+    print("=" * 115)
+    print(f"{'CONF THRESH':<12} | {'SILENCE':<8} | {'TEMP':<5} | {'LN THRESH':<10} | {'RHYTHM F1':<10} | {'SILENCE CLEAN':<14} | {'PRECISION':<10} | {'SCORE':<7}")
+    print("-" * 115)
 
-    silence_gates = [0.10, 0.20, 0.30, 0.40, 0.50]
-    temperatures = [0.0, 0.35, 0.70]
+    # Grid of parameters
+    conf_thresholds = [0.35, 0.45, 0.55, 0.65]
+    silence_gates = [0.15, 0.25, 0.35]
+    temperatures = [0.0, 0.30]
+    ln_thresholds = [0.70, 0.80]
 
     best_score = -1.0
     best_config = {}
 
-    for gate in silence_gates:
-        for temp in temperatures:
-            tot_f1, tot_silence, tot_exact, tot_recall, tot_prec = 0.0, 0.0, 0.0, 0.0, 0.0
+    for conf, gate, temp, ln_t in itertools.product(conf_thresholds, silence_gates, temperatures, ln_thresholds):
+        tot_f1, tot_silence, tot_exact, tot_recall, tot_prec, tot_ln = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-            for s in samples:
-                res = evaluate_sample(
-                    model=model,
-                    sample=s,
-                    device=dev,
-                    silence_gate=gate,
-                    temperature=temp,
-                )
-                tot_f1 += res["rhythm_f1"]
-                tot_silence += res["silence_acc"]
-                tot_exact += res["exact_4k"]
-                tot_recall += res["note_recall"]
-                tot_prec += res["note_precision"]
-
-            n = len(samples)
-            avg_f1 = (tot_f1 / n) * 100.0
-            avg_silence = (tot_silence / n) * 100.0
-            avg_exact = (tot_exact / n) * 100.0
-            avg_rec = (tot_recall / n) * 100.0
-            avg_prec = (tot_prec / n) * 100.0
-
-            # Composite Fidelity Score (Balances note precision, recall, and zero-spam in silence)
-            composite_score = (avg_f1 * 0.50) + (avg_silence * 0.35) + (avg_exact * 0.15)
-
-            status = "⭐ NEW BEST" if composite_score > best_score else ""
-            print(
-                f"Gate={gate:.2f} | Temp={temp:.2f} -> "
-                f"Rhythm F1: {avg_f1:5.1f}% | Silence Clean: {avg_silence:5.1f}% | "
-                f"Recall: {avg_rec:5.1f}% | Prec: {avg_prec:5.1f}% | {status}"
+        for s in samples:
+            res = evaluate_sample_with_thresholds(
+                model=model,
+                sample=s,
+                device=dev,
+                silence_gate=gate,
+                note_conf_thresh=conf,
+                ln_thresh=ln_t,
+                temperature=temp,
             )
+            tot_f1 += res["rhythm_f1"]
+            tot_silence += res["silence_acc"]
+            tot_exact += res["exact_4k"]
+            tot_recall += res["note_recall"]
+            tot_prec += res["note_precision"]
+            tot_ln += res["ln_f1"]
 
-            if composite_score > best_score:
-                best_score = composite_score
-                best_config = {
-                    "silence_gate": gate,
-                    "temperature": temp,
-                    "rhythm_f1": avg_f1,
-                    "silence_acc": avg_silence,
-                    "recall": avg_rec,
-                    "precision": avg_prec,
-                }
+        n = len(samples)
+        avg_f1 = (tot_f1 / n) * 100.0
+        avg_silence = (tot_silence / n) * 100.0
+        avg_exact = (tot_exact / n) * 100.0
+        avg_rec = (tot_recall / n) * 100.0
+        avg_prec = (tot_prec / n) * 100.0
+        avg_ln = (tot_ln / n) * 100.0
 
-    print("=" * 90)
-    print(f" 🏆 OPTIMAL INTERPRETER CONFIGURATION FOUND:")
-    print(f"  • Silence Energy Gate:    {best_config['silence_gate']:.2f}")
-    print(f"  • Sampling Temperature:   {best_config['temperature']:.2f}")
-    print(f"  • Rhythmic F1-Score:      {best_config['rhythm_f1']:.1f}%")
-    print(f"  • Silence Cleanliness:    {best_config['silence_acc']:.1f}% (No spam in quiet/break sections)")
-    print("=" * 90 + "\n")
+        # Balanced Composite Optimization Score
+        composite_score = (avg_f1 * 0.45) + (avg_silence * 0.35) + (avg_prec * 0.10) + (avg_ln * 0.10)
+
+        marker = "⭐ BEST" if composite_score > best_score else ""
+        print(
+            f"{conf:<12.2f} | {gate:<8.2f} | {temp:<5.2f} | {ln_t:<10.2f} | "
+            f"{avg_f1:<9.1f}% | {avg_silence:<13.1f}% | {avg_prec:<9.1f}% | {composite_score:<6.1f} {marker}"
+        )
+
+        if composite_score > best_score:
+            best_score = composite_score
+            best_config = {
+                "conf": conf,
+                "silence": gate,
+                "temp": temp,
+                "ln_thresh": ln_t,
+                "f1": avg_f1,
+                "silence_clean": avg_silence,
+                "precision": avg_prec,
+                "recall": avg_rec,
+                "ln_f1": avg_ln,
+                "score": composite_score,
+            }
+
+    print("=" * 115)
+    print(f" 🏆 OPTIMAL MULTI-PARAM INTERPRETER CONFIGURATION:")
+    print(f"  • Note Confidence Threshold (P_active):  {best_config['conf']:.2f}")
+    print(f"  • Silence Energy Gate (Noise Floor):     {best_config['silence']:.2f}")
+    print(f"  • Long Note Sustain Threshold:           {best_config['ln_thresh']:.2f}")
+    print(f"  • Sampling Temperature:                  {best_config['temp']:.2f}")
+    print(f"  • Verified Rhythm F1-Score:              {best_config['f1']:.1f}%")
+    print(f"  • Silence Cleanliness:                   {best_config['silence_clean']:.1f}% (Zero phantom notes)")
+    print(f"  • Note Placement Precision:              {best_config['precision']:.1f}%")
+    print("=" * 115 + "\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calibrate Interpreter on Real Ground Truth Beatmaps")
-    parser.add_argument("--dataset", type=str, default="dataset_processed/val_data.pt", help="Path to val_data.pt or train_data.pt")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/model_3_transformer_best.pt", help="Path to model checkpoint")
-    parser.add_argument("--num_samples", type=int, default=15, help="Number of real songs to calibrate over")
+    parser = argparse.ArgumentParser(description="Multi-Parameter Interpreter Calibration")
+    parser.add_argument("--dataset", type=str, default="dataset_processed/train_data.pt", help="Path to train_data.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/model_3_transformer_best.pt", help="Path to checkpoint")
+    parser.add_argument("--num_samples", type=int, default=12, help="Number of real ground-truth songs to calibrate over")
     args = parser.parse_args()
 
-    run_calibration_grid(
+    run_full_calibration_search(
         dataset_path=args.dataset,
         checkpoint_path=args.checkpoint,
         num_samples=args.num_samples,
