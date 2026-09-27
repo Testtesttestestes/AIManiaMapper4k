@@ -75,47 +75,56 @@ def sample_chord_tokens_with_nucleus(
     temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
+    note_conf_thresh: float = 0.45,
 ) -> List[int]:
     """
-    Samples 4K chord tokens.
-    - If greedy=True or temperature <= 0.05: uses direct deterministic ArgMax
-      (the exact mathematical decoding that produces 80+% exact match from training).
+    Samples 4K chord tokens with confidence thresholding:
+    - If note_conf_thresh > 0.0: enforces P(active note) >= note_conf_thresh, eliminating low-confidence noise.
+    - If greedy=True or temperature <= 0.05: uses direct deterministic ArgMax on active tokens.
     - If temperature > 0.05: uses Temperature + Nucleus (Top-P) sampling.
     """
+    T, num_classes = logits.shape
+    probs_raw = F.softmax(logits, dim=-1)
+    p_active = 1.0 - probs_raw[:, 0]
+
     # Difficulty chord mask: mask out oversized chords for lower Star Ratings
     max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
     
-    T, num_classes = logits.shape
     masked_logits = logits.clone()
-    
     for tok_idx in range(num_classes):
         num_keys = bin(tok_idx).count("1")
         if num_keys > max_keys:
             masked_logits[:, tok_idx] = -1e9
 
-    if greedy or temperature <= 0.05:
-        # Deterministic maximum-likelihood (Argmax) matching validation metrics
-        return masked_logits.argmax(dim=-1).cpu().tolist()
-
-    scaled_logits = masked_logits / max(0.1, temperature)
-    probs = F.softmax(scaled_logits, dim=-1)
-
-    # Sort descending
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-    # Nucleus mask: keep tokens up to cumulative top_p
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-    sorted_indices_to_remove[:, 0] = 0
-
+    out_tokens: List[int] = []
     for t_i in range(T):
-        indices_to_remove = sorted_indices[t_i][sorted_indices_to_remove[t_i]]
-        probs[t_i, indices_to_remove] = 0.0
+        if (note_conf_thresh > 0.0) and (float(p_active[t_i].item()) < note_conf_thresh):
+            out_tokens.append(0)
+            continue
 
-    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    return sampled.cpu().tolist()
+        step_logits = masked_logits[t_i : t_i + 1].clone()
+        if note_conf_thresh > 0.0:
+            step_logits[0, 0] = -1e9  # Active condition met; choose best non-zero chord
+
+        if greedy or temperature <= 0.05:
+            out_tokens.append(int(step_logits.argmax(dim=-1).item()))
+        else:
+            scaled_logits = step_logits / max(0.1, temperature)
+            probs = F.softmax(scaled_logits, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = 0
+
+            indices_to_remove = sorted_indices[0][sorted_indices_to_remove[0]]
+            probs[0, indices_to_remove] = 0.0
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            sampled = int(torch.multinomial(probs, num_samples=1).item())
+            out_tokens.append(sampled)
+
+    return out_tokens
 
 
 def token_to_keys(token: int) -> List[int]:
@@ -258,6 +267,8 @@ def generate_patterns_with_model3(
     temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
+    note_conf_thresh: float = 0.45,
+    ln_conf_thresh: float = 0.78,
 ) -> List[ManiaHitObject]:
     """
     Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
@@ -463,6 +474,7 @@ def generate_patterns_with_model3(
                 temperature=temperature,
                 top_p=top_p,
                 greedy=greedy,
+                note_conf_thresh=note_conf_thresh,
             )
             new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()[0]
             tok = new_tokens[0]

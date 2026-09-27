@@ -40,6 +40,8 @@ def generate_beatmap_pipeline(
     temperature: float = 0.0,
     top_p: float = 0.90,
     greedy: bool = False,
+    note_conf_thresh: float = 0.45,
+    ln_conf_thresh: float = 0.78,
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
@@ -176,6 +178,8 @@ def generate_beatmap_pipeline(
                     temperature=temperature,
                     top_p=top_p,
                     greedy=greedy,
+                    note_conf_thresh=note_conf_thresh,
+                    ln_conf_thresh=ln_conf_thresh,
                 )
                 used_neural = True
                 print(f"✨ [Model 3 Transformer] Successfully generated {len(hit_objects)} neural hit objects.")
