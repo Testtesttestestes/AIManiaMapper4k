@@ -436,6 +436,13 @@ def generate_patterns_with_model3(
         window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
 
+        # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet intros
+        cur_energy_ratio = grid_metrics_list[cur_pos][5]
+        if cur_energy_ratio < 0.20:
+            generated_tokens.append(0)
+            all_ln_probs.append([0.0, 0.0, 0.0, 0.0])
+            continue
+
         with torch.no_grad():
             chord_logits, ln_logits = model(
                 window_mel,
