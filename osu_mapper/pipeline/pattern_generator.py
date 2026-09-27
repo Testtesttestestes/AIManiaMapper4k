@@ -372,17 +372,17 @@ def generate_patterns_with_model3(
         | ((scaffold_keys[:, 3] > 0).long() << 3)
     )
 
-    # Real-time progressive strain trajectory metrics: [running_nps, target_nps_ratio]
-    sr_params = get_star_rating_params(star_rating)
-    target_nps = max(0.5, float(sr_params["target_nps"]))
+    # Real-time progressive strain trajectory metrics matching training distribution [B, T, 2]
+    # strain_metrics = [running_density (notes/tick in 0.05-0.40), density_ratio (running / target)]
+    target_density = max(0.05, float(star_rating) / 10.0)
     strain_metrics_tensor = torch.zeros(num_ticks, 2, dtype=torch.float32, device=dev)
     for ti in range(num_ticks):
-        elapsed_s = max(0.001, ticks[ti].time_ms / 1000.0)
-        # estimate running density from scaffold anchors
+        time_steps = ti + 1
         run_notes = int(scaffold_tokens_tensor[:ti+1].gt(0).sum().item())
-        running_nps = run_notes / elapsed_s
-        strain_metrics_tensor[ti, 0] = float(running_nps)
-        strain_metrics_tensor[ti, 1] = float(running_nps / target_nps)
+        running_density = run_notes / max(1, time_steps)
+        density_ratio = min(5.0, running_density / target_density)
+        strain_metrics_tensor[ti, 0] = float(running_density)
+        strain_metrics_tensor[ti, 1] = float(density_ratio)
 
     # Pre-encode full tick audio representation with deep audio encoder
     print(f"  • Pre-encoding tick audio features via Bidirectional Audio Encoder...")
@@ -447,7 +447,7 @@ def generate_patterns_with_model3(
         if tok > 0:
             cols = token_to_keys(tok)
             for c in cols:
-                if (star_rating >= 1.8) and (new_lns[c] >= 0.35):
+                if (star_rating >= 1.8) and (new_lns[c] >= 0.78):
                     lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
                     hold_span = min(4, num_ticks - cur_pos - 1)
                     for hf in range(1, hold_span):
@@ -459,16 +459,19 @@ def generate_patterns_with_model3(
     hit_objects: List[ManiaHitObject] = []
     
     # Calibrated LN probability thresholds matching empirical 15-20% dataset ratio
-    # Model 3 was trained with pos_weight=12.0: 0.38-0.44 captures natural vocal/synth sustains
-    if star_rating < 2.0:
-        ln_start_threshold = 0.55
-        hold_decay_threshold = 0.28
-    elif star_rating < 4.0:
-        ln_start_threshold = 0.44
-        hold_decay_threshold = 0.22
+    # Model 3 was trained with pos_weight=6.6: threshold in 0.76-0.85 captures true vocal/synth sustains
+    if star_rating < 1.8:
+        ln_start_threshold = 0.95
+        hold_decay_threshold = 0.85
+    elif star_rating < 3.5:
+        ln_start_threshold = 0.82
+        hold_decay_threshold = 0.60
+    elif star_rating < 5.0:
+        ln_start_threshold = 0.78
+        hold_decay_threshold = 0.52
     else:
-        ln_start_threshold = 0.38
-        hold_decay_threshold = 0.19
+        ln_start_threshold = 0.74
+        hold_decay_threshold = 0.45
 
     total_taps = 0
     total_lns = 0
