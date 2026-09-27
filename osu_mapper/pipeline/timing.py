@@ -42,11 +42,28 @@ class TimingPoint:
         self.uninherited = 1 if (uninherited is True or uninherited == 1) else 0
         self.effects = int(effects)
 
+    @property
+    def is_kiai(self) -> bool:
+        """Returns True if Kiai Time effect (bit 0) is enabled."""
+        return bool(self.effects & 1)
+
+    @property
+    def omit_first_bar_line(self) -> bool:
+        """Returns True if omit first bar line (bit 3) is enabled."""
+        return bool(self.effects & 8)
+
     def to_osu_line(self) -> str:
-        """Formats the timing point into standard osu! v14 line syntax."""
+        """Formats the timing point into standard osu! v14 line syntax preserving all properties."""
+        if self.beat_length == int(self.beat_length):
+            bl_str = str(int(self.beat_length))
+        else:
+            bl_str = f"{self.beat_length:.8f}".rstrip("0").rstrip(".")
+            if not bl_str or bl_str == "-":
+                bl_str = f"{self.beat_length:.4f}"
+
         return (
             f"{int(round(self.time))},"
-            f"{self.beat_length:.4f},"
+            f"{bl_str},"
             f"{self.meter},"
             f"{self.sample_set},"
             f"{self.sample_index},"
@@ -54,6 +71,35 @@ class TimingPoint:
             f"{self.uninherited},"
             f"{self.effects}"
         )
+
+
+def parse_timing_point_line(line_str: str) -> Optional[TimingPoint]:
+    """Parses a single TimingPoint line from an .osu file preserving all 8 attributes."""
+    parts = line_str.strip().split(",")
+    if len(parts) < 2:
+        return None
+    try:
+        t_ms = float(parts[0].strip())
+        beat_len = float(parts[1].strip())
+        meter = int(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else 4
+        sample_set = int(parts[3].strip()) if len(parts) > 3 and parts[3].strip() else 1
+        sample_index = int(parts[4].strip()) if len(parts) > 4 and parts[4].strip() else 0
+        volume = int(parts[5].strip()) if len(parts) > 5 and parts[5].strip() else 70
+        uninherited = 1 if (len(parts) <= 6 or parts[6].strip() == "1") else 0
+        effects = int(parts[7].strip()) if len(parts) > 7 and parts[7].strip() else 0
+
+        return TimingPoint(
+            time=t_ms,
+            beat_length=beat_len,
+            meter=meter,
+            sample_set=sample_set,
+            sample_index=sample_index,
+            volume=volume,
+            uninherited=uninherited,
+            effects=effects,
+        )
+    except (ValueError, IndexError):
+        return None
 
 
 @dataclass

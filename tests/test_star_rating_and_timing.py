@@ -157,5 +157,53 @@ class TestStarRatingAndTiming(unittest.TestCase):
         self.assertTrue(any(abs(t - 20000) <= 2 for t in sec3_notes), "Must have notes anchored at section 3 timing point 20000ms")
 
 
+    def test_kiai_time_and_effects_preserved(self):
+        """Verify that green lines with Kiai Time (effects=1) and other attributes are preserved."""
+        from generate_beatmap import parse_template_osu_text
+        from osu_mapper.pipeline.timing import TimingPoint, parse_timing_point_line
+
+        sample_osu = """[General]
+AudioFilename: audio.mp3
+Mode: 3
+
+[Metadata]
+Title:Test Song
+Artist:Test Artist
+Version:Normal
+
+[TimingPoints]
+0,500.0,4,1,0,70,1,0
+15000,-100,4,1,0,85,0,1
+30000,-100,4,1,0,70,0,0
+45000,-50,4,2,1,90,0,9
+"""
+        meta, tps = parse_template_osu_text(sample_osu)
+        self.assertEqual(len(tps), 4)
+
+        # TP 0: Red line, no kiai
+        self.assertEqual(tps[0].uninherited, 1)
+        self.assertEqual(tps[0].effects, 0)
+        self.assertFalse(tps[0].is_kiai)
+
+        # TP 1: Green line with Kiai enabled (effects = 1)
+        self.assertEqual(tps[1].uninherited, 0)
+        self.assertEqual(tps[1].effects, 1)
+        self.assertTrue(tps[1].is_kiai)
+        self.assertEqual(tps[1].volume, 85)
+        self.assertIn("15000,-100,4,1,0,85,0,1", tps[1].to_osu_line())
+
+        # TP 2: Green line with Kiai disabled (effects = 0)
+        self.assertEqual(tps[2].uninherited, 0)
+        self.assertEqual(tps[2].effects, 0)
+        self.assertFalse(tps[2].is_kiai)
+
+        # TP 3: Green line with Kiai + omit bar line (effects = 9 = 1 + 8)
+        self.assertEqual(tps[3].uninherited, 0)
+        self.assertEqual(tps[3].effects, 9)
+        self.assertTrue(tps[3].is_kiai)
+        self.assertTrue(tps[3].omit_first_bar_line)
+        self.assertEqual(tps[3].volume, 90)
+
+
 if __name__ == "__main__":
     unittest.main()
