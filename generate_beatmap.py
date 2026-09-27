@@ -335,8 +335,8 @@ def main():
     sr_display = ", ".join(f"{s:.2f}*" for s in sr_list)
 
     # Determine pattern generation mode
-    force_neural = args.neural or (args.mode == "neural")
-    prefer_algorithmic = (args.mode == "algorithmic")
+    force_neural = bool(args.neural or (args.mode == "neural"))
+    prefer_algorithmic = bool(args.algo or (args.mode in ("algorithmic", "algo")))
 
     mode_display = "Neural (Model 3 Transformer)" if force_neural else ("Algorithmic (Heuristic)" if prefer_algorithmic else "Auto (Neural if weights exist)")
 
