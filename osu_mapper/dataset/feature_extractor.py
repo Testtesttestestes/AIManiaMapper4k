@@ -490,6 +490,148 @@ def quantize_beatmap_to_grid(
     )
 
 
+def compute_multiscale_pyramid_features(
+    mel: torch.Tensor,
+    tick_times_ms: np.ndarray | torch.Tensor | List[float],
+    frame_ms: float = 16.0,
+    meso_sec: float = 10.0,
+    macro_sec: float = 25.0,
+) -> torch.Tensor:
+    """
+    Computes 3-scale Acoustic Pyramid features for every tick:
+      1. Micro (instantaneous tick t): LogMel (80) + Delta (80) + OnsetFlux (80) = 240 dims
+      2. Meso (±10.0s window, 20s total): Past/Future spectrum, energy gradient, quadrant energies, dynamic range = 96 dims
+      3. Macro (±25.0s window, 50s total): Macro 4-band spectrum across 4 quadrants, track boundary ratio = 32 dims
+      Total dimension = 368 dims per tick.
+    
+    CRITICAL: Audio before 0.0s and after track end is padded with genuine silence (zero-padded log-mel),
+    ensuring fixed tensor dimensions and 100% accurate temporal centering at all points.
+    """
+    if not isinstance(mel, torch.Tensor):
+        mel = torch.tensor(mel, dtype=torch.float32)
+
+    num_frames = mel.shape[0]
+    device = mel.device
+    dtype = mel.dtype
+
+    if isinstance(tick_times_ms, torch.Tensor):
+        t_ms_arr = tick_times_ms.cpu().numpy()
+    elif isinstance(tick_times_ms, np.ndarray):
+        t_ms_arr = tick_times_ms
+    else:
+        t_ms_arr = np.array(tick_times_ms, dtype=np.float32)
+
+    num_ticks = len(t_ms_arr)
+    if num_ticks == 0:
+        return torch.zeros(0, 368, dtype=dtype, device=device)
+
+    pad_macro = int(round((macro_sec * 1000.0) / frame_ms))  # 1562 frames (25s)
+    pad_meso = int(round((meso_sec * 1000.0) / frame_ms))    # 625 frames (10s)
+
+    # Pad spectrogram with silence (0.0) on both sides
+    padded_mel = F.pad(mel, (0, 0, pad_macro, pad_macro), value=0.0)
+    L = padded_mel.shape[0]
+
+    # Pre-compute pooled 40-bin mel and integral image for O(1) interval queries
+    mel_40 = padded_mel.view(L, 40, 2).mean(dim=-1)
+    integral_mel_40 = torch.cumsum(F.pad(mel_40, (0, 0, 1, 0)), dim=0)
+
+    # Coarse 4-band mel for macro scale (0-20, 20-40, 40-60, 60-80)
+    mel_4 = padded_mel.view(L, 4, 20).mean(dim=-1)
+    integral_mel_4 = torch.cumsum(F.pad(mel_4, (0, 0, 1, 0)), dim=0)
+
+    padded_e = padded_mel.exp().mean(dim=-1)
+    integral_e = torch.cumsum(F.pad(padded_e, (1, 0)), dim=0)
+
+    # Track boundary mask: 1.0 inside valid song, 0.0 in outer silence padding
+    valid_track = torch.zeros(L, dtype=dtype, device=device)
+    valid_track[pad_macro : pad_macro + num_frames] = 1.0
+    integral_valid = torch.cumsum(F.pad(valid_track, (1, 0)), dim=0)
+
+    # Frame indices for all ticks
+    raw_frames = np.clip(np.round(t_ms_arr / frame_ms).astype(int), 0, max(0, num_frames - 1))
+    centers = raw_frames + pad_macro
+
+    c_t = torch.from_numpy(centers).to(device)
+
+    # 1. Micro features (240 dims)
+    cur_mel = padded_mel[c_t]                        # [num_ticks, 80]
+    prev_mel = padded_mel[c_t - 1]                   # [num_ticks, 80]
+    micro_delta = cur_mel - prev_mel                 # [num_ticks, 80]
+    micro_flux = F.relu(micro_delta)                 # [num_ticks, 80]
+    micro_feat = torch.cat([cur_mel, micro_delta, micro_flux], dim=-1)  # [num_ticks, 240]
+
+    # 2. Meso features (±10s = 625 frames past & future) -> 96 dims
+    past_spec = (integral_mel_40[c_t + 1] - integral_mel_40[c_t - pad_meso]) / pad_meso          # 40
+    future_spec = (integral_mel_40[c_t + pad_meso + 1] - integral_mel_40[c_t]) / pad_meso        # 40
+    past_e = (integral_e[c_t + 1] - integral_e[c_t - pad_meso]) / pad_meso                        # 1
+    future_e = (integral_e[c_t + pad_meso + 1] - integral_e[c_t]) / pad_meso                    # 1
+    e_slope = (future_e - past_e) / (past_e + future_e + 1e-4)                                    # 1
+    past_valid = (integral_valid[c_t + 1] - integral_valid[c_t - pad_meso]) / pad_meso            # 1
+    future_valid = (integral_valid[c_t + pad_meso + 1] - integral_valid[c_t]) / pad_meso          # 1
+
+    # 4 temporal sub-quadrants of Meso (each ~156 frames / 2.5s)
+    q_len = pad_meso // 2
+    q1_e = (integral_e[c_t - q_len + 1] - integral_e[c_t - pad_meso]) / q_len
+    q2_e = (integral_e[c_t + 1] - integral_e[c_t - q_len]) / q_len
+    q3_e = (integral_e[c_t + q_len + 1] - integral_e[c_t]) / q_len
+    q4_e = (integral_e[c_t + pad_meso + 1] - integral_e[c_t + q_len]) / q_len
+
+    meso_e_stats = torch.stack([
+        past_e, future_e, e_slope, past_valid, future_valid,
+        q1_e, q2_e, q3_e, q4_e,
+        (q3_e - q2_e) / (q2_e + q3_e + 1e-4),
+        (q4_e - q1_e) / (q1_e + q4_e + 1e-4),
+        torch.clamp(future_e / (past_e + 1e-4), 0.0, 10.0),
+        torch.clamp(past_e / (future_e + 1e-4), 0.0, 10.0),
+        torch.abs(future_e - past_e),
+        torch.max(q1_e, q2_e),
+        torch.max(q3_e, q4_e),
+    ], dim=-1)  # 16 dims
+
+    meso_feat = torch.cat([past_spec, future_spec, meso_e_stats], dim=-1)  # 40 + 40 + 16 = 96 dims
+
+    # 3. Macro features (±25s = 1562 frames past & future) -> 32 dims
+    # 4 intervals: [-25s, -12.5s], [-12.5s, 0s], [0s, +12.5s], [+12.5s, +25s]
+    h_macro = pad_macro // 2  # 781 frames
+    m1_spec = (integral_mel_4[c_t - h_macro + 1] - integral_mel_4[c_t - pad_macro]) / h_macro    # 4
+    m2_spec = (integral_mel_4[c_t + 1] - integral_mel_4[c_t - h_macro]) / h_macro                # 4
+    m3_spec = (integral_mel_4[c_t + h_macro + 1] - integral_mel_4[c_t]) / h_macro                # 4
+    m4_spec = (integral_mel_4[c_t + pad_macro + 1] - integral_mel_4[c_t + h_macro]) / h_macro    # 4
+    macro_spec = torch.cat([m1_spec, m2_spec, m3_spec, m4_spec], dim=-1)                         # 16
+
+    m1_e = (integral_e[c_t - h_macro + 1] - integral_e[c_t - pad_macro]) / h_macro
+    m2_e = (integral_e[c_t + 1] - integral_e[c_t - h_macro]) / h_macro
+    m3_e = (integral_e[c_t + h_macro + 1] - integral_e[c_t]) / h_macro
+    m4_e = (integral_e[c_t + pad_macro + 1] - integral_e[c_t + h_macro]) / h_macro
+
+    macro_past_valid = (integral_valid[c_t + 1] - integral_valid[c_t - pad_macro]) / pad_macro
+    macro_future_valid = (integral_valid[c_t + pad_macro + 1] - integral_valid[c_t]) / pad_macro
+
+    prog_scalar = torch.from_numpy((raw_frames / max(1, num_frames)).astype(np.float32)).to(device)
+    end_scalar = 1.0 - prog_scalar
+
+    macro_stats = torch.stack([
+        m1_e, m2_e, m3_e, m4_e,
+        macro_past_valid, macro_future_valid,
+        (macro_past_valid + macro_future_valid) * 0.5,
+        torch.clamp(m3_e / (m2_e + 1e-4), 0.0, 10.0),
+        torch.clamp(m4_e / (m1_e + 1e-4), 0.0, 10.0),
+        (m3_e + m4_e - m1_e - m2_e) / (m1_e + m2_e + m3_e + m4_e + 1e-4),
+        prog_scalar, end_scalar,
+        torch.max(torch.stack([m1_e, m2_e, m3_e, m4_e], dim=-1), dim=-1)[0],
+        torch.min(torch.stack([m1_e, m2_e, m3_e, m4_e], dim=-1), dim=-1)[0],
+        torch.abs(m3_e - m2_e),
+        torch.abs(m4_e - m1_e),
+    ], dim=-1)  # 16 dims
+
+    macro_feat = torch.cat([macro_spec, macro_stats], dim=-1)  # 16 + 16 = 32 dims
+
+    # Total Multi-Scale Pyramid: 240 (Micro) + 96 (Meso) + 32 (Macro) = 368 dims
+    multiscale_tensor = torch.cat([micro_feat, meso_feat, macro_feat], dim=-1)
+    return multiscale_tensor
+
+
 def slice_beatmap_into_musical_chunks(
     mel: torch.Tensor,
     tokens: torch.Tensor,
@@ -545,6 +687,9 @@ def slice_beatmap_into_musical_chunks(
         f = max(0, min(num_frames - 1, int(round(t_obj.time_ms / frame_ms))))
         tick_audio_mel[i] = mel[f]
 
+    tick_times_arr = np.array([t.time_ms for t in ticks], dtype=np.float32)
+    multiscale_pyramid_all = compute_multiscale_pyramid_features(mel, tick_times_arr, frame_ms=frame_ms)
+
     downbeat_indices = [i for i, t in enumerate(ticks) if t.is_downbeat]
     if not downbeat_indices:
         downbeat_indices = list(range(0, num_ticks, max(1, hop_size)))
@@ -558,6 +703,7 @@ def slice_beatmap_into_musical_chunks(
             break
 
         chunk_mel = tick_audio_mel[start_idx:end_idx]
+        chunk_multiscale = multiscale_pyramid_all[start_idx:end_idx]
         chunk_tok = tokens[start_idx:end_idx]
         chunk_ln = ln_active[start_idx:end_idx]
         chunk_sv = sv_curve[start_idx:end_idx]
@@ -580,6 +726,7 @@ def slice_beatmap_into_musical_chunks(
 
         chunks.append({
             "audio_mel": chunk_mel,
+            "multiscale_audio": chunk_multiscale,
             "tokens": chunk_tok,
             "prev_tokens": prev_tok,
             "lane_states": chunk_lane,
@@ -600,6 +747,7 @@ def slice_beatmap_into_musical_chunks(
         for start_idx in range(0, num_ticks - chunk_size + 1, max(1, hop_size)):
             end_idx = start_idx + chunk_size
             chunk_mel = tick_audio_mel[start_idx:end_idx]
+            chunk_multiscale = multiscale_pyramid_all[start_idx:end_idx]
             chunk_tok = tokens[start_idx:end_idx]
             chunk_ln = ln_active[start_idx:end_idx]
             chunk_sv = sv_curve[start_idx:end_idx]
@@ -617,8 +765,12 @@ def slice_beatmap_into_musical_chunks(
                 else:
                     prev_tok = torch.zeros(chunk_size, dtype=torch.int64)
 
+            t_start_ms = ticks[start_idx].time_ms
+            t_end_ms = ticks[end_idx - 1].time_ms
+
             chunks.append({
                 "audio_mel": chunk_mel,
+                "multiscale_audio": chunk_multiscale,
                 "tokens": chunk_tok,
                 "prev_tokens": prev_tok,
                 "lane_states": chunk_lane,
@@ -628,8 +780,9 @@ def slice_beatmap_into_musical_chunks(
                 "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
                 "bpm": torch.tensor([details.bpm], dtype=torch.float32),
                 "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
-                "start_ms": round(ticks[start_idx].time_ms, 2),
-                "end_ms": round(ticks[end_idx - 1].time_ms, 2),
+                "timing_source": timing_source,
+                "start_ms": round(t_start_ms, 2),
+                "end_ms": round(t_end_ms, 2),
                 "bar_index": 0,
                 "beat_len_ms": round(60000.0 / max(30.0, float(details.bpm)), 2),
             })
