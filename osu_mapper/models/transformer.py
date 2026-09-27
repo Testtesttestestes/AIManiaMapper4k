@@ -306,6 +306,15 @@ class ManiaPatternTransformer(BaseModule):
             nn.Linear(self.config.d_model // 2, self.config.d_model),
         )
 
+        # Direct Local Audio Patch Projection (Log-Mel + Delta + Onset Flux strictly at tick t)
+        # Guarantees local acoustic grounding: suppresses hallucinations in quiet intro/breaks
+        self.local_audio_proj = nn.Sequential(
+            nn.Linear(self.config.audio_dim * 3, self.config.d_model),
+            nn.LayerNorm(self.config.d_model),
+            nn.GELU(),
+            nn.Linear(self.config.d_model, self.config.d_model),
+        )
+
         # Positional encoding
         self.pos_encoder = PositionalEncoding(self.config.d_model, self.config.max_seq_len)
 
@@ -434,11 +443,23 @@ class ManiaPatternTransformer(BaseModule):
         else:
             metric_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
 
-        # 8. Rhythm target queries
-        tgt = self.pos_encoder(tok_feat + sr_feat + lane_feat + metric_feat + scaffold_feat + strain_feat)
+        # 8. Local Audio Patch at tick t (Instantaneous physical acoustic signal strictly at tick t)
+        if audio_mel.shape[-1] == self.config.audio_dim:
+            prev_mel = F.pad(audio_mel[:, :-1, :], (0, 0, 1, 0))
+            delta = audio_mel - prev_mel
+            flux = F.relu(delta)
+            tri_mel = torch.cat([audio_mel, delta, flux], dim=-1)
+            local_audio_feat = self.local_audio_proj(tri_mel)
+        elif audio_mel.shape[-1] == (self.config.audio_dim * 3):
+            local_audio_feat = self.local_audio_proj(audio_mel)
+        else:
+            local_audio_feat = torch.zeros(B, T, self.config.d_model, device=audio_mel.device)
+
+        # 9. Rhythm target queries (grounded in instantaneous audio, history, metrics, and strain)
+        tgt = self.pos_encoder(tok_feat + sr_feat + lane_feat + metric_feat + scaffold_feat + strain_feat + local_audio_feat)
         causal_mask = self._generate_causal_mask(T, audio_mel.device)
 
-        # 9. Cross-Attention Decoder Layers
+        # 10. Cross-Attention Decoder Layers
         hidden = tgt
         for layer in self.decoder_layers:
             hidden = layer(hidden, memory=audio_encoded, tgt_mask=causal_mask)
