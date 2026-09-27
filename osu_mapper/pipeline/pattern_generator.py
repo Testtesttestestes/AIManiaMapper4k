@@ -409,6 +409,13 @@ def generate_patterns_with_model3(
                 generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
             )
 
+        # Dynamic live strain trajectory based on actually generated notes
+        actual_notes = sum(1 for tok in generated_tokens if tok > 0)
+        running_density = actual_notes / max(1, cur_pos)
+        density_ratio = min(5.0, running_density / target_density)
+        strain_metrics_tensor[cur_pos, 0] = float(running_density)
+        strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
+
         window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
         window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
@@ -417,7 +424,7 @@ def generate_patterns_with_model3(
 
         # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet intros
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
-        if cur_energy_ratio < silence_gate:
+        if (silence_gate > 0.0) and (cur_energy_ratio < silence_gate):
             generated_tokens.append(0)
             all_ln_probs.append([0.0, 0.0, 0.0, 0.0])
             continue
@@ -435,6 +442,20 @@ def generate_patterns_with_model3(
             )
             cur_chord_logits = chord_logits[0, -1:].clone()
             cur_ln_logits = ln_logits[0, -1:].clone()
+
+            # Anti-Mode Collapse / Burst Stream Limiter:
+            # Prevents autoregressive Transformer feedback loops (endless 1/8 trills col1<->col2 for 30s)
+            recent_burst = 0
+            for prev_t in reversed(generated_tokens[-16:]):
+                if prev_t > 0:
+                    recent_burst += 1
+                else:
+                    break
+
+            max_ergonomic_burst = 6 if star_rating < 3.5 else (12 if star_rating < 5.0 else 24)
+            if recent_burst >= max_ergonomic_burst:
+                burst_penalty = min(10.0, 2.0 * float(recent_burst - max_ergonomic_burst + 1))
+                cur_chord_logits[0, 1:] -= burst_penalty
 
             new_tokens = sample_chord_tokens_with_nucleus(
                 logits=cur_chord_logits,
