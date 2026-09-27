@@ -1,10 +1,7 @@
 """
 Automated Multi-Parameter Interpreter Calibration Tool.
-Performs comprehensive multi-dimensional optimization across:
-1. Note Confidence Threshold (P_active vs P_idle) - eliminates low-confidence phantom spam
-2. Long Note (LN) Sustain Threshold - tunes slider duration and density
-3. Acoustic Silence Gate - suppresses notes during quiet passages and song breaks
-4. Sampling Temperature & Top-P Nucleus - balances deterministic precision with musical variance
+Tests the neural interpreter against real human ground-truth beatmaps from the dataset.
+Accurately replicates the production Two-Stage (Scaffold + Neural Refiner) pipeline.
 """
 
 import argparse
@@ -18,17 +15,56 @@ import torch.nn.functional as F
 from osu_mapper.models.transformer import ManiaPatternTransformer, TransformerConfig
 
 
+def build_algorithmic_scaffold_from_grid(
+    grid_metrics: torch.Tensor,
+    star_rating: float,
+    energy_ratio: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Builds the deterministic rhythmic scaffold matching Stage 1 of the generation pipeline.
+    Places structured downbeats and periodic beats scaled by difficulty.
+    """
+    T = grid_metrics.shape[1]
+    scaffold = torch.zeros(1, T, dtype=torch.int64, device=device)
+
+    is_downbeat = (grid_metrics[0, :, 2] > 0.5)
+    divisor_frac = grid_metrics[0, :, 0]
+    is_1_1 = (divisor_frac < 0.05) | (divisor_frac > 0.95)
+    is_1_2 = (divisor_frac - 0.5).abs() < 0.05
+    is_1_4 = ((divisor_frac - 0.25).abs() < 0.05) | ((divisor_frac - 0.75).abs() < 0.05)
+
+    chord_size = 1 if star_rating < 1.8 else (2 if star_rating < 3.8 else (3 if star_rating < 5.5 else 4))
+
+    for t in range(T):
+        e = float(energy_ratio[t].item())
+        if e < 0.20:
+            continue
+
+        if is_downbeat[t]:
+            scaffold[0, t] = 3 if chord_size >= 2 else 1  # [0, 1] or [0]
+        elif is_1_1[t]:
+            scaffold[0, t] = 1 << (t % 4)
+        elif is_1_2[t] and (star_rating >= 2.5):
+            scaffold[0, t] = 1 << ((t + 1) % 4)
+        elif is_1_4[t] and (star_rating >= 4.0):
+            scaffold[0, t] = 1 << ((t + 2) % 4)
+
+    return scaffold
+
+
 def evaluate_sample_with_thresholds(
     model: ManiaPatternTransformer,
     sample: Dict[str, Any],
     device: torch.device,
-    silence_gate: float = 0.25,
-    note_conf_thresh: float = 0.50,
+    silence_gate: float = 0.20,
+    note_conf_thresh: float = 0.0,
     ln_thresh: float = 0.78,
     temperature: float = 0.0,
     top_p: float = 0.90,
+    use_scaffold: bool = True,
 ) -> Dict[str, float]:
-    """Evaluates a single validation chunk against ground truth human mapping with full confidence gating."""
+    """Evaluates a single validation chunk against ground truth human mapping."""
     mel = sample["audio_mel"].unsqueeze(0).to(device)       # [1, T, 80]
     tokens = sample["tokens"].unsqueeze(0).to(device)         # [1, T]
     ln_mask = sample["ln_mask"].unsqueeze(0).to(device)       # [1, T, 4]
@@ -42,12 +78,20 @@ def evaluate_sample_with_thresholds(
     grid_metrics = sample.get("grid_metrics")
     if grid_metrics is not None:
         grid_metrics = grid_metrics.unsqueeze(0).to(device)
+    else:
+        grid_metrics = torch.zeros(1, T, 8, device=device)
 
     # Compute energy from mel
     with torch.no_grad():
         frame_energies = mel.exp().mean(dim=-1)               # [1, T]
         mean_e = frame_energies.mean(dim=-1, keepdim=True).clamp(min=1e-4)
         energy_ratio = (frame_energies / mean_e).squeeze(0)   # [T]
+
+    # Build Stage 1 scaffold if enabled
+    if use_scaffold:
+        scaffold_tokens = build_algorithmic_scaffold_from_grid(grid_metrics, sr_val, energy_ratio, device)
+    else:
+        scaffold_tokens = torch.zeros(1, T, dtype=torch.int64, device=device)
 
     generated_tokens: List[int] = []
     generated_lns: List[List[float]] = []
@@ -67,7 +111,7 @@ def evaluate_sample_with_thresholds(
                     generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=device
                 )
 
-            # Build strain metrics
+            # Build progressive strain metrics
             run_notes = sum(1 for tok in generated_tokens if tok > 0)
             run_density = run_notes / max(1, cur_pos + 1)
             ratio = min(5.0, run_density / target_density)
@@ -75,10 +119,11 @@ def evaluate_sample_with_thresholds(
             strain_window[0, :, 0] = run_density
             strain_window[0, :, 1] = ratio
 
-            w_grid = grid_metrics[:, ctx_start : cur_pos + 1] if grid_metrics is not None else None
+            w_grid = grid_metrics[:, ctx_start : cur_pos + 1]
+            w_scaffold = scaffold_tokens[:, ctx_start : cur_pos + 1]
             w_audio_mem = full_audio_memory[:, ctx_start : cur_pos + 1]
 
-            # 1. Acoustic Silence Gate: if audio energy is in noise floor, strictly suppress notes
+            # 1. Acoustic Silence Gate
             e_ratio_val = float(energy_ratio[cur_pos].item())
             if e_ratio_val < silence_gate:
                 generated_tokens.append(0)
@@ -90,6 +135,7 @@ def evaluate_sample_with_thresholds(
                 star_rating=star_rating,
                 prev_tokens=window_prev,
                 grid_metrics=w_grid,
+                scaffold_tokens=w_scaffold,
                 strain_metrics=strain_window,
                 audio_memory=w_audio_mem,
                 return_sr=True,
@@ -104,15 +150,15 @@ def evaluate_sample_with_thresholds(
             p_idle = float(probs_16[0].item())
             p_active = 1.0 - p_idle
 
-            # 2. Active Note Confidence Thresholding:
-            # If the model's total confidence that *any* note should exist is below note_conf_thresh, force 0
-            if p_active < note_conf_thresh:
+            # 2. Active Note Confidence Thresholding
+            if (note_conf_thresh > 0.0) and (p_active < note_conf_thresh):
                 pred_token = 0
             else:
                 active_logits = cur_logits.clone()
-                active_logits[0] = -1e9  # Suppress idle token since p_active exceeded threshold
+                if note_conf_thresh > 0.0:
+                    active_logits[0] = -1e9  # Active condition met
 
-                # SR Chord mask (prevent illegal chords on lower difficulties)
+                # Difficulty chord mask
                 max_k = 1 if sr_val < 1.8 else (2 if sr_val < 3.5 else (3 if sr_val < 5.0 else 4))
                 for t_i in range(1, 16):
                     k_cnt = bin(t_i).count("1")
@@ -240,19 +286,18 @@ def run_full_calibration_search(
     print("\n" + "=" * 115)
     print(" 🧪 COMPREHENSIVE MULTI-DIMENSIONAL CALIBRATION ON REAL HUMAN BEATMAPS")
     print("=" * 115)
-    print(f"{'CONF THRESH':<12} | {'SILENCE':<8} | {'TEMP':<5} | {'LN THRESH':<10} | {'RHYTHM F1':<10} | {'SILENCE CLEAN':<14} | {'PRECISION':<10} | {'SCORE':<7}")
+    print(f"{'SCAFFOLD':<9} | {'CONF':<6} | {'SILENCE':<7} | {'TEMP':<5} | {'NOTE RECALL':<12} | {'RHYTHM F1':<10} | {'SILENCE CLEAN':<14} | {'SCORE':<7}")
     print("-" * 115)
 
-    # Grid of parameters
-    conf_thresholds = [0.35, 0.45, 0.55, 0.65]
-    silence_gates = [0.15, 0.25, 0.35]
+    scaffold_options = [True, False]
+    conf_thresholds = [0.0, 0.25, 0.40]
+    silence_gates = [0.15, 0.25]
     temperatures = [0.0, 0.30]
-    ln_thresholds = [0.70, 0.80]
 
     best_score = -1.0
     best_config = {}
 
-    for conf, gate, temp, ln_t in itertools.product(conf_thresholds, silence_gates, temperatures, ln_thresholds):
+    for use_scaff, conf, gate, temp in itertools.product(scaffold_options, conf_thresholds, silence_gates, temperatures):
         tot_f1, tot_silence, tot_exact, tot_recall, tot_prec, tot_ln = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         for s in samples:
@@ -262,8 +307,9 @@ def run_full_calibration_search(
                 device=dev,
                 silence_gate=gate,
                 note_conf_thresh=conf,
-                ln_thresh=ln_t,
+                ln_thresh=0.78,
                 temperature=temp,
+                use_scaffold=use_scaff,
             )
             tot_f1 += res["rhythm_f1"]
             tot_silence += res["silence_acc"]
@@ -281,38 +327,39 @@ def run_full_calibration_search(
         avg_ln = (tot_ln / n) * 100.0
 
         # Balanced Composite Optimization Score
-        composite_score = (avg_f1 * 0.45) + (avg_silence * 0.35) + (avg_prec * 0.10) + (avg_ln * 0.10)
+        composite_score = (avg_rec * 0.40) + (avg_silence * 0.35) + (avg_f1 * 0.15) + (avg_exact * 0.10)
 
         marker = "⭐ BEST" if composite_score > best_score else ""
+        scaff_str = "Two-Stage" if use_scaff else "Pure-AI"
         print(
-            f"{conf:<12.2f} | {gate:<8.2f} | {temp:<5.2f} | {ln_t:<10.2f} | "
-            f"{avg_f1:<9.1f}% | {avg_silence:<13.1f}% | {avg_prec:<9.1f}% | {composite_score:<6.1f} {marker}"
+            f"{scaff_str:<9} | {conf:<6.2f} | {gate:<7.2f} | {temp:<5.2f} | "
+            f"{avg_rec:<11.1f}% | {avg_f1:<9.1f}% | {avg_silence:<13.1f}% | {composite_score:<6.1f} {marker}"
         )
 
         if composite_score > best_score:
             best_score = composite_score
             best_config = {
+                "scaffold": scaff_str,
                 "conf": conf,
                 "silence": gate,
                 "temp": temp,
-                "ln_thresh": ln_t,
+                "recall": avg_rec,
                 "f1": avg_f1,
                 "silence_clean": avg_silence,
+                "exact_4k": avg_exact,
                 "precision": avg_prec,
-                "recall": avg_rec,
-                "ln_f1": avg_ln,
                 "score": composite_score,
             }
 
     print("=" * 115)
     print(f" 🏆 OPTIMAL MULTI-PARAM INTERPRETER CONFIGURATION:")
+    print(f"  • Architecture Mode:                     {best_config['scaffold']}")
     print(f"  • Note Confidence Threshold (P_active):  {best_config['conf']:.2f}")
     print(f"  • Silence Energy Gate (Noise Floor):     {best_config['silence']:.2f}")
-    print(f"  • Long Note Sustain Threshold:           {best_config['ln_thresh']:.2f}")
     print(f"  • Sampling Temperature:                  {best_config['temp']:.2f}")
-    print(f"  • Verified Rhythm F1-Score:              {best_config['f1']:.1f}%")
+    print(f"  • Note Recall (Human Beat Hits):         {best_config['recall']:.1f}%")
     print(f"  • Silence Cleanliness:                   {best_config['silence_clean']:.1f}% (Zero phantom notes)")
-    print(f"  • Note Placement Precision:              {best_config['precision']:.1f}%")
+    print(f"  • Exact 4K Chord Match:                  {best_config['exact_4k']:.1f}%")
     print("=" * 115 + "\n")
 
 
