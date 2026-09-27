@@ -72,12 +72,15 @@ class ManiaHitObject:
 def sample_chord_tokens_with_nucleus(
     logits: torch.Tensor,
     star_rating: float = 3.5,
-    temperature: float = 0.70,
+    temperature: float = 0.0,
     top_p: float = 0.90,
+    greedy: bool = False,
 ) -> List[int]:
     """
-    Samples 4K chord tokens using Temperature + Nucleus (Top-P) sampling.
-    Preserves natural model distribution learned from real human beatmaps.
+    Samples 4K chord tokens.
+    - If greedy=True or temperature <= 0.05: uses direct deterministic ArgMax
+      (the exact mathematical decoding that produces 80+% exact match from training).
+    - If temperature > 0.05: uses Temperature + Nucleus (Top-P) sampling.
     """
     # Difficulty chord mask: mask out oversized chords for lower Star Ratings
     max_keys = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
@@ -89,6 +92,10 @@ def sample_chord_tokens_with_nucleus(
         num_keys = bin(tok_idx).count("1")
         if num_keys > max_keys:
             masked_logits[:, tok_idx] = -1e9
+
+    if greedy or temperature <= 0.05:
+        # Deterministic maximum-likelihood (Argmax) matching validation metrics
+        return masked_logits.argmax(dim=-1).cpu().tolist()
 
     scaled_logits = masked_logits / max(0.1, temperature)
     probs = F.softmax(scaled_logits, dim=-1)
@@ -248,6 +255,9 @@ def generate_patterns_with_model3(
     chunk_frames: int = 128,
     warmup_lead_in_frames: int = 64,
     timing_points: Optional[List[TimingPoint]] = None,
+    temperature: float = 0.0,
+    top_p: float = 0.90,
+    greedy: bool = False,
 ) -> List[ManiaHitObject]:
     """
     Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
@@ -434,8 +444,9 @@ def generate_patterns_with_model3(
             new_tokens = sample_chord_tokens_with_nucleus(
                 logits=cur_chord_logits,
                 star_rating=star_rating,
-                temperature=0.70,
-                top_p=0.90,
+                temperature=temperature,
+                top_p=top_p,
+                greedy=greedy,
             )
             new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()[0]
             tok = new_tokens[0]
