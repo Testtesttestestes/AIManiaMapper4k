@@ -506,36 +506,41 @@ def generate_patterns_with_model3(
                     audio_memory=window_audio_memory,
                     multiscale_audio=window_multiscale,
                 )
-                pred_dt_ms = beat_len_ms / 2.0
+                pred_dt_ms = beat_len_ms / (4.0 if star_rating >= 4.0 else 2.0)
 
             cur_chord_logits = chord_logits[0, -1].clone()   # [16]
             cur_ln_logits = ln_logits[0, -1].clone()         # [4]
 
-            # In continuous jump mode, every landing anchor is an active hit decision
             active_logits = cur_chord_logits.clone()
             active_logits[0] = -1e9  # Suppress idle class at hit anchors
 
-            # Difficulty chord limit (1.0* = single, 3.0* = double, 5.0* = triples/quads)
-            max_k = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
+            # 1. Ergonomic Chord Limits (Strict osu!mania ranking rules: no unplayable quad/triple spam)
+            is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
+            prev_tok = active_notes_history[-1] if active_notes_history else 0
+            prev_k = bin(prev_tok).count("1")
+
             for t_i in range(1, 16):
                 k_cnt = bin(t_i).count("1")
-                if k_cnt > max_k:
+                if star_rating < 2.0 and k_cnt > 1:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 3.5 and k_cnt > 2:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
+                    active_logits[t_i] = -1e9
+                elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
+                    # Quads only on heavy downbeats for 6.0*+
                     active_logits[t_i] = -1e9
 
-            # 1. Multi-Key Chord Scaling based on Target Star Rating (Jumpstreams, Handstreams)
-            if star_rating >= 3.2:
-                chord_boost = (float(star_rating) - 2.8) * 1.8
-                for t_cand in range(1, 16):
-                    k_cnt = bin(t_cand).count("1")
-                    if k_cnt >= 2:
-                        active_logits[t_cand] += chord_boost * (k_cnt - 1)
+                # Jumpstream rule: after a double/triple chord, next 1/4 note must be single tap
+                if prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
+                    active_logits[t_i] -= 8.0
 
-            # 2. Discourage new single taps on lanes currently occupied by a held slider
+            # 2. Discourage new taps on lanes currently occupied by a held slider
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     for t_cand in range(1, 16):
                         if (t_cand >> c) & 1:
-                            active_logits[t_cand] -= 6.0
+                            active_logits[t_cand] -= 10.0
 
             # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
             if len(active_notes_history) >= 4:
@@ -543,12 +548,12 @@ def generate_patterns_with_model3(
                     active_logits[active_notes_history[-1]] -= 12.0
                     active_logits[active_notes_history[-2]] -= 12.0
 
-            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
+            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
             if len(active_notes_history) >= 2:
                 if active_notes_history[-1] == active_notes_history[-2]:
                     active_logits[active_notes_history[-1]] -= 15.0
 
-            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
+            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
             recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
             if recent_active:
                 lane_usage = [0, 0, 0, 0]
@@ -556,8 +561,7 @@ def generate_patterns_with_model3(
                     for c in token_to_keys(tok_val):
                         lane_usage[c] += 1
                 for c in range(4):
-                    if lane_usage[c] >= 7:
-                        # Heavy fatigue on lane c: penalize candidates using lane c
+                    if lane_usage[c] >= 6:
                         for t_cand in range(1, 16):
                             if (t_cand >> c) & 1:
                                 active_logits[t_cand] -= 4.0
@@ -584,12 +588,10 @@ def generate_patterns_with_model3(
         # Check existing ongoing sliders: continue holding or unhold?
         for c in range(4):
             if active_ln_starts[c] is not None:
-                is_held = (new_lns[c] >= 0.38) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 4.0)))
+                is_held = (new_lns[c] >= 0.35) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
                 if is_held:
-                    # Continue holding slider!
                     lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
                 else:
-                    # Unhold / Release slider!
                     start_t = active_ln_starts[c]
                     end_t = max(start_t + 85, cur_time_ms - 30)
                     hit_objects.append(
@@ -634,26 +636,29 @@ def generate_patterns_with_model3(
                 active_ln_starts[c] = None
                 lane_states_seq[cur_pos, c] = 1
 
-        # Bound dynamic step jump by musical meter & star rating
-        # 1.0* -> 1/1 beat (434ms), 2.5* -> 1/2 beat (217ms), 4.5* -> 1/4 beat (108ms), 6.5*+ -> 1/8 beat (54ms)
-        if star_rating < 2.0:
-            max_jump_ms = beat_len_ms * 2.0
-            min_jump_ms = beat_len_ms * 0.75
-        elif star_rating < 3.2:
-            max_jump_ms = beat_len_ms * 1.0
-            min_jump_ms = beat_len_ms * 0.40
-        elif star_rating < 4.8:
-            max_jump_ms = beat_len_ms * 0.50
-            min_jump_ms = beat_len_ms * 0.20
+        # -------------------------------------------------------------
+        # Exact Musical Divisor Snapping (100% On-Beat: 1/4, 1/2, 1/1)
+        # -------------------------------------------------------------
+        raw_beats = pred_dt_ms / beat_len_ms
+
+        if star_rating < 2.5:
+            # 1.0* - 2.5*: 1/1 beat (435ms) or 2/1 beat (870ms)
+            cand_divs = [0.5, 1.0, 2.0]
+        elif star_rating < 4.5:
+            # 2.5* - 4.5*: 1/2 beat (217ms) or 1/4 beat (108ms)
+            cand_divs = [0.25, 0.5, 1.0]
+        elif star_rating < 6.0:
+            # 4.5* - 6.0*: 1/4 beat streams (108ms) and 1/2 beat jumps
+            cand_divs = [0.25, 0.5]
         else:
-            # 5.0* - 8.0*+: fast 1/4 streams & 1/8 bursts
-            max_jump_ms = beat_len_ms * 0.25
-            min_jump_ms = beat_len_ms / 8.0
+            # 6.0* - 8.0*+: 1/4 streams (108ms) with 1/8 burst rolls (54ms)
+            cand_divs = [0.125, 0.25, 0.5]
 
-        clamped_dt_ms = max(min_jump_ms, min(max_jump_ms, pred_dt_ms))
+        quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
+        quantized_jump_ms = quantized_fraction * beat_len_ms
 
-        target_time_ms = ticks[cur_pos].time_ms + clamped_dt_ms
-        next_pos = bisect.bisect_left(tick_times_list, target_time_ms)
+        target_time_ms = ticks[cur_pos].time_ms + quantized_jump_ms
+        next_pos = bisect.bisect_left(tick_times_list, target_time_ms - 5.0)
         cur_pos = max(cur_pos + 1, next_pos)
 
     # Close any lingering sliders at the end of track
