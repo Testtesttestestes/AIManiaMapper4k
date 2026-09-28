@@ -64,8 +64,14 @@ def evaluate_sample_with_thresholds(
     temperature: float = 0.0,
     top_p: float = 0.90,
     use_scaffold: bool = True,
+    step_mode: str = "neural_step",
 ) -> Dict[str, float]:
-    """Evaluates a single validation chunk against ground truth human mapping."""
+    """
+    Evaluates a single validation chunk against ground truth human mapping.
+    Supports:
+    - step_mode='neural_step': Model predicts next-note forward jump \Delta t in ms and advances dynamically.
+    - step_mode='dense_grid': Fixed tick-by-tick dense evaluation across every subdivision.
+    """
     mel = sample["audio_mel"].unsqueeze(0).to(device)       # [1, T, 80]
     tokens = sample["tokens"].unsqueeze(0).to(device)         # [1, T]
     ln_mask = sample["ln_mask"].unsqueeze(0).to(device)       # [1, T, 4]
@@ -76,11 +82,24 @@ def evaluate_sample_with_thresholds(
     T = tokens.shape[1]
     sr_val = float(star_rating.squeeze().item())
 
+    # Multi-scale audio if available
+    multiscale_audio = sample.get("multiscale_audio")
+    if multiscale_audio is not None:
+        multiscale_audio = multiscale_audio.unsqueeze(0).to(device)
+
     grid_metrics = sample.get("grid_metrics")
     if grid_metrics is not None:
         grid_metrics = grid_metrics.unsqueeze(0).to(device)
     else:
         grid_metrics = torch.zeros(1, T, 8, device=device)
+
+    # Estimate ms duration per tick
+    bpm_val = float(sample["bpm"].item()) if "bpm" in sample else 150.0
+    beat_len_ms = float(sample.get("beat_len_ms", 60000.0 / max(30.0, bpm_val)))
+    if "start_ms" in sample and "end_ms" in sample:
+        tick_len_ms = max(5.0, (float(sample["end_ms"]) - float(sample["start_ms"])) / max(1, T - 1))
+    else:
+        tick_len_ms = max(5.0, beat_len_ms / 4.0)
 
     # Compute energy from mel
     with torch.no_grad():
@@ -99,14 +118,19 @@ def evaluate_sample_with_thresholds(
     else:
         scaffold_tokens = torch.zeros(1, T, dtype=torch.int64, device=device)
 
-    generated_tokens: List[int] = []
-    generated_lns: List[List[float]] = []
+    generated_tokens = [0] * T
+    generated_lns = [[0.0, 0.0, 0.0, 0.0] for _ in range(T)]
     target_density = max(0.05, sr_val / 10.0)
+
+    true_arr = tokens.squeeze(0)
+    true_note_indices = [i for i, tok in enumerate(true_arr.cpu().tolist()) if tok > 0]
+    step_errors: List[float] = []
 
     with torch.no_grad():
         full_audio_memory = model.audio_encoder(mel)
 
-        for cur_pos in range(T):
+        cur_pos = 0
+        while cur_pos < T:
             ctx_start = max(0, cur_pos - 64)
             window_len = (cur_pos + 1) - ctx_start
 
@@ -118,7 +142,7 @@ def evaluate_sample_with_thresholds(
                 )
 
             # Build progressive strain metrics
-            run_notes = sum(1 for tok in generated_tokens if tok > 0)
+            run_notes = sum(1 for tok in generated_tokens[:cur_pos] if tok > 0)
             run_density = run_notes / max(1, cur_pos + 1)
             ratio = min(5.0, run_density / target_density)
             strain_window = torch.zeros(1, window_len, 2, dtype=torch.float32, device=device)
@@ -128,24 +152,43 @@ def evaluate_sample_with_thresholds(
             w_grid = grid_metrics[:, ctx_start : cur_pos + 1]
             w_scaffold = scaffold_tokens[:, ctx_start : cur_pos + 1]
             w_audio_mem = full_audio_memory[:, ctx_start : cur_pos + 1]
+            w_multi = multiscale_audio[:, ctx_start : cur_pos + 1] if multiscale_audio is not None else None
 
             # 1. Acoustic Silence Gate
             e_ratio_val = float(energy_ratio[cur_pos].item())
             if e_ratio_val < silence_gate:
-                generated_tokens.append(0)
-                generated_lns.append([0.0, 0.0, 0.0, 0.0])
+                generated_tokens[cur_pos] = 0
+                generated_lns[cur_pos] = [0.0, 0.0, 0.0, 0.0]
+                cur_pos += 1
                 continue
 
-            chord_logits, ln_logits, _ = model(
-                window_mel,
-                star_rating=star_rating,
-                prev_tokens=window_prev,
-                grid_metrics=w_grid,
-                scaffold_tokens=w_scaffold,
-                strain_metrics=strain_window,
-                audio_memory=w_audio_mem,
-                return_sr=True,
-            )
+            try:
+                chord_logits, ln_logits, _, pred_time_deltas = model(
+                    window_mel,
+                    star_rating=star_rating,
+                    prev_tokens=window_prev,
+                    grid_metrics=w_grid,
+                    scaffold_tokens=w_scaffold,
+                    strain_metrics=strain_window,
+                    multiscale_audio=w_multi,
+                    audio_memory=w_audio_mem,
+                    return_sr=True,
+                    return_time_delta=True,
+                )
+                pred_dt_ms = float(pred_time_deltas[0, -1, 0].item())
+            except Exception:
+                chord_logits, ln_logits, _ = model(
+                    window_mel,
+                    star_rating=star_rating,
+                    prev_tokens=window_prev,
+                    grid_metrics=w_grid,
+                    scaffold_tokens=w_scaffold,
+                    strain_metrics=strain_window,
+                    multiscale_audio=w_multi,
+                    audio_memory=w_audio_mem,
+                    return_sr=True,
+                )
+                pred_dt_ms = tick_len_ms
 
             cur_logits = chord_logits[0, -1]       # [16]
             cur_ln_raw = ln_logits[0, -1]          # [4]
@@ -185,8 +228,21 @@ def evaluate_sample_with_thresholds(
                     p_act = p_act / p_act.sum().clamp(min=1e-8)
                     pred_token = int(torch.multinomial(p_act, 1).item())
 
-            generated_tokens.append(pred_token)
-            generated_lns.append(cur_ln_probs)
+            generated_tokens[cur_pos] = pred_token
+            generated_lns[cur_pos] = cur_ln_probs
+
+            # Record step prediction error if at a real human note
+            next_human_notes = [idx for idx in true_note_indices if idx > cur_pos]
+            if next_human_notes:
+                true_dt_ms = (next_human_notes[0] - cur_pos) * tick_len_ms
+                step_errors.append(abs(pred_dt_ms - true_dt_ms))
+
+            # Step advance logic
+            if step_mode == "neural_step" and pred_token > 0:
+                jump_ticks = max(1, int(round(pred_dt_ms / tick_len_ms)))
+                cur_pos += jump_ticks
+            else:
+                cur_pos += 1
 
     pred_arr = torch.tensor(generated_tokens, dtype=torch.int64, device=device)
     true_arr = tokens.squeeze(0)
@@ -220,6 +276,7 @@ def evaluate_sample_with_thresholds(
     ln_recall = (ln_hits / max(1, ln_true_cnt)) if ln_true_cnt > 0 else 1.0
     ln_prec = (ln_hits / max(1, ln_pred_cnt)) if ln_pred_cnt > 0 else 1.0
     ln_f1 = (2 * ln_prec * ln_recall) / max(1e-6, (ln_prec + ln_recall))
+    avg_step_err = float(sum(step_errors) / max(1, len(step_errors)))
 
     return {
         "sr": sr_val,
@@ -231,6 +288,7 @@ def evaluate_sample_with_thresholds(
         "silence_acc": silence_acc,
         "exact_4k": exact_4k,
         "ln_f1": ln_f1,
+        "step_mae_ms": avg_step_err,
     }
 
 
@@ -289,22 +347,23 @@ def run_full_calibration_search(
     step = max(1, len(dataset) // num_samples)
     samples = [dataset[i * step] for i in range(min(num_samples, len(dataset)))]
 
-    print("\n" + "=" * 115)
-    print(" 🧪 COMPREHENSIVE MULTI-DIMENSIONAL CALIBRATION ON REAL HUMAN BEATMAPS")
-    print("=" * 115)
-    print(f"{'SCAFFOLD':<9} | {'CONF':<6} | {'SILENCE':<7} | {'TEMP':<5} | {'NOTE RECALL':<12} | {'RHYTHM F1':<10} | {'SILENCE CLEAN':<14} | {'SCORE':<7}")
-    print("-" * 115)
+    print("\n" + "=" * 125)
+    print(" 🧪 COMPREHENSIVE MULTI-DIMENSIONAL CALIBRATION ON REAL HUMAN BEATMAPS (WITH NEURAL TIME STEP PACING)")
+    print("=" * 125)
+    print(f"{'STEP MODE':<12} | {'SCAFFOLD':<9} | {'CONF':<5} | {'GATE':<5} | {'TEMP':<5} | {'NOTE REC':<9} | {'RHYTHM F1':<10} | {'STEP MAE':<10} | {'SILENCE':<9} | {'SCORE':<6}")
+    print("-" * 125)
 
+    step_modes = ["neural_step", "dense_grid"]
     scaffold_options = [True, False]
-    conf_thresholds = [0.0, 0.25, 0.40]
+    conf_thresholds = [0.0, 0.25]
     silence_gates = [0.15, 0.25]
     temperatures = [0.0, 0.30]
 
     best_score = -1.0
     best_config = {}
 
-    for use_scaff, conf, gate, temp in itertools.product(scaffold_options, conf_thresholds, silence_gates, temperatures):
-        tot_f1, tot_silence, tot_exact, tot_recall, tot_prec, tot_ln = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    for mode, use_scaff, conf, gate, temp in itertools.product(step_modes, scaffold_options, conf_thresholds, silence_gates, temperatures):
+        tot_f1, tot_silence, tot_exact, tot_recall, tot_prec, tot_ln, tot_step_err = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         for s in samples:
             res = evaluate_sample_with_thresholds(
@@ -316,6 +375,7 @@ def run_full_calibration_search(
                 ln_thresh=0.78,
                 temperature=temp,
                 use_scaffold=use_scaff,
+                step_mode=mode,
             )
             tot_f1 += res["rhythm_f1"]
             tot_silence += res["silence_acc"]
@@ -323,6 +383,7 @@ def run_full_calibration_search(
             tot_recall += res["note_recall"]
             tot_prec += res["note_precision"]
             tot_ln += res["ln_f1"]
+            tot_step_err += res["step_mae_ms"]
 
         n = len(samples)
         avg_f1 = (tot_f1 / n) * 100.0
@@ -331,20 +392,24 @@ def run_full_calibration_search(
         avg_rec = (tot_recall / n) * 100.0
         avg_prec = (tot_prec / n) * 100.0
         avg_ln = (tot_ln / n) * 100.0
+        avg_step_mae = tot_step_err / n
 
         # Balanced Composite Optimization Score
-        composite_score = (avg_rec * 0.40) + (avg_silence * 0.35) + (avg_f1 * 0.15) + (avg_exact * 0.10)
+        step_score = max(0.0, 100.0 - min(100.0, avg_step_mae))
+        composite_score = (avg_rec * 0.35) + (avg_silence * 0.30) + (avg_f1 * 0.15) + (avg_exact * 0.10) + (step_score * 0.10)
 
         marker = "⭐ BEST" if composite_score > best_score else ""
         scaff_str = "Two-Stage" if use_scaff else "Pure-AI"
+        mode_str = "Neural \u0394t" if mode == "neural_step" else "Dense Grid"
         print(
-            f"{scaff_str:<9} | {conf:<6.2f} | {gate:<7.2f} | {temp:<5.2f} | "
-            f"{avg_rec:<11.1f}% | {avg_f1:<9.1f}% | {avg_silence:<13.1f}% | {composite_score:<6.1f} {marker}"
+            f"{mode_str:<12} | {scaff_str:<9} | {conf:<5.2f} | {gate:<5.2f} | {temp:<5.2f} | "
+            f"{avg_rec:<8.1f}% | {avg_f1:<9.1f}% | ±{avg_step_mae:<7.1f}ms | {avg_silence:<8.1f}% | {composite_score:<6.1f} {marker}"
         )
 
         if composite_score > best_score:
             best_score = composite_score
             best_config = {
+                "step_mode": mode_str,
                 "scaffold": scaff_str,
                 "conf": conf,
                 "silence": gate,
@@ -354,11 +419,13 @@ def run_full_calibration_search(
                 "silence_clean": avg_silence,
                 "exact_4k": avg_exact,
                 "precision": avg_prec,
+                "step_mae": avg_step_mae,
                 "score": composite_score,
             }
 
-    print("=" * 115)
+    print("=" * 125)
     print(f" 🏆 OPTIMAL MULTI-PARAM INTERPRETER CONFIGURATION:")
+    print(f"  • Pacing / Step Advance Mode:            {best_config['step_mode']}")
     print(f"  • Architecture Mode:                     {best_config['scaffold']}")
     print(f"  • Note Confidence Threshold (P_active):  {best_config['conf']:.2f}")
     print(f"  • Silence Energy Gate (Noise Floor):     {best_config['silence']:.2f}")
@@ -366,7 +433,8 @@ def run_full_calibration_search(
     print(f"  • Note Recall (Human Beat Hits):         {best_config['recall']:.1f}%")
     print(f"  • Silence Cleanliness:                   {best_config['silence_clean']:.1f}% (Zero phantom notes)")
     print(f"  • Exact 4K Chord Match:                  {best_config['exact_4k']:.1f}%")
-    print("=" * 115 + "\n")
+    print(f"  • Neural Time Step MAE (Pacing Precision): ±{best_config['step_mae']:.1f} ms")
+    print("=" * 125 + "\n")
 
 
 if __name__ == "__main__":

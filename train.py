@@ -650,10 +650,19 @@ def train_model_3_transformer(
                 loss_ln = criterion_ln(ln_logits, ln_mask)
                 # 4. Difficulty consistency loss
                 loss_sr = F.smooth_l1_loss(pred_sr, star_rating)
-                # 5. Continuous Time-Delta SmoothL1Loss (\Delta t step forward in ms)
-                loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
+                # 5. Note-Focused Continuous Time-Delta Loss (\Delta t step forward in ms)
+                is_note_mask = (tokens > 0)
+                if is_note_mask.any():
+                    loss_delta_notes = F.smooth_l1_loss(pred_time_deltas[is_note_mask], target_time_deltas[is_note_mask])
+                    loss_delta_log = F.smooth_l1_loss(
+                        torch.log1p(pred_time_deltas[is_note_mask]),
+                        torch.log1p(target_time_deltas[is_note_mask])
+                    )
+                    loss_delta = loss_delta_notes + 5.0 * loss_delta_log
+                else:
+                    loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
 
-                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.01 * loss_delta
+                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.05 * loss_delta
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -760,8 +769,17 @@ def train_model_3_transformer(
                     l_lane = F.binary_cross_entropy(v_pred_lane_probs.clamp(1e-6, 1.0 - 1e-6), v_true_lanes)
                     l_l = criterion_ln(l_logits, ln_mask)
                     l_sr = F.smooth_l1_loss(p_sr, star_rating)
-                    l_delta = F.smooth_l1_loss(p_time_deltas, val_target_deltas)
-                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr + 0.01 * l_delta).item() * B
+                    val_is_note = (tokens > 0)
+                    if val_is_note.any():
+                        val_l_notes = F.smooth_l1_loss(p_time_deltas[val_is_note], val_target_deltas[val_is_note])
+                        val_l_log = F.smooth_l1_loss(
+                            torch.log1p(p_time_deltas[val_is_note]),
+                            torch.log1p(val_target_deltas[val_is_note])
+                        )
+                        l_delta = val_l_notes + 5.0 * val_l_log
+                    else:
+                        l_delta = F.smooth_l1_loss(p_time_deltas, val_target_deltas)
+                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr + 0.05 * l_delta).item() * B
                     val_sr_err += torch.abs(p_sr - star_rating).sum().item()
 
                     preds = c_logits.argmax(dim=-1)

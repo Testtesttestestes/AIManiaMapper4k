@@ -379,6 +379,7 @@ class ManiaPatternTransformer(BaseModule):
         return_hidden: bool = False,
         return_sr: bool = False,
         return_time_delta: bool = False,
+        detach_time_delta: bool = True,
         context_dropout: Optional[float] = None,
     ):
         """
@@ -501,7 +502,8 @@ class ManiaPatternTransformer(BaseModule):
         ln_logits = self.ln_head(modulated_hidden)
 
         if return_time_delta:
-            pred_time_deltas = F.softplus(self.time_delta_head(modulated_hidden))
+            delta_feat = modulated_hidden.detach() if detach_time_delta else modulated_hidden
+            pred_time_deltas = F.softplus(self.time_delta_head(delta_feat))
             if return_sr:
                 pred_sr = self.sr_eval_head(hidden.mean(dim=1))
                 return chord_logits, ln_logits, pred_sr, pred_time_deltas
