@@ -417,7 +417,11 @@ def generate_patterns_with_model3(
 
     # Autoregressive generation: neural step jump causality with rolling context
     ctx_len = 64
-    cur_pos = 0
+    
+    # Start generation at first active timing offset
+    target_start_ms = float(offset_ms) if offset_ms is not None else 0.0
+    cur_pos = max(0, bisect.bisect_left(tick_times_list, target_start_ms))
+
     while cur_pos < num_ticks:
         ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
@@ -444,7 +448,7 @@ def generate_patterns_with_model3(
         window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
 
-        # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet intros
+        # Acoustic Silence & Break Gating: strictly suppress notes during song silence and quiet breaks
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
         if (silence_gate > 0.0) and (cur_energy_ratio < silence_gate):
             generated_tokens[cur_pos] = 0
@@ -482,11 +486,21 @@ def generate_patterns_with_model3(
                 )
                 pred_dt_ms = 120.0
 
-            cur_chord_logits = chord_logits[0, -1:].clone()
-            cur_ln_logits = ln_logits[0, -1:].clone()
+            cur_chord_logits = chord_logits[0, -1].clone()   # [16]
+            cur_ln_logits = ln_logits[0, -1].clone()         # [4]
 
-            # Anti-Mode Collapse / Burst Stream Limiter:
-            # Prevents autoregressive Transformer feedback loops (endless 1/8 trills col1<->col2 for 30s)
+            # In continuous jump mode, every landing anchor is an active hit decision
+            active_logits = cur_chord_logits.clone()
+            active_logits[0] = -1e9  # Suppress idle class at hit anchors
+
+            # Difficulty chord limit (1.0* = single, 3.0* = double, 5.0* = triples/quads)
+            max_k = 1 if star_rating < 1.8 else (2 if star_rating < 3.5 else (3 if star_rating < 5.0 else 4))
+            for t_i in range(1, 16):
+                k_cnt = bin(t_i).count("1")
+                if k_cnt > max_k:
+                    active_logits[t_i] = -1e9
+
+            # Anti-burst stream limiter
             recent_burst = 0
             for prev_t in reversed(generated_tokens[max(0, cur_pos - 16) : cur_pos]):
                 if prev_t > 0:
@@ -497,20 +511,16 @@ def generate_patterns_with_model3(
             max_ergonomic_burst = 6 if star_rating < 3.5 else (12 if star_rating < 5.0 else 24)
             if recent_burst >= max_ergonomic_burst:
                 burst_penalty = min(10.0, 2.0 * float(recent_burst - max_ergonomic_burst + 1))
-                cur_chord_logits[0, 1:] -= burst_penalty
+                active_logits[1:] -= burst_penalty
 
-            has_scaff = (scaffold_tokens_tensor[cur_pos].item() > 0)
-            new_tokens = sample_chord_tokens_with_nucleus(
-                logits=cur_chord_logits,
-                star_rating=star_rating,
-                temperature=temperature,
-                top_p=top_p,
-                greedy=greedy,
-                note_conf_thresh=note_conf_thresh,
-                has_scaffold_hint=has_scaff,
-            )
-            new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()[0]
-            tok = new_tokens[0]
+            if greedy or temperature <= 0.05:
+                tok = int(active_logits.argmax().item())
+            else:
+                scaled = active_logits / max(0.1, temperature)
+                probs = F.softmax(scaled, dim=-1)
+                tok = int(torch.multinomial(probs, 1).item())
+
+            new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()
 
         generated_tokens[cur_pos] = tok
         all_ln_probs[cur_pos] = new_lns
