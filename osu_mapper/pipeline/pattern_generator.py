@@ -409,9 +409,11 @@ def generate_patterns_with_model3(
     # Maintain real-time 4-lane physical activity state
     lane_states_seq = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
     tick_times_list = [float(t_obj.time_ms) for t_obj in ticks]
+    beat_len_ms = 60000.0 / max(30.0, bpm)
 
     generated_tokens: List[int] = [0] * num_ticks
     all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(num_ticks)]
+    active_notes_history: List[int] = []
 
     print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
 
@@ -435,7 +437,7 @@ def generate_patterns_with_model3(
             )
 
         # Dynamic live strain trajectory based on actually generated notes
-        actual_notes = sum(1 for tok in generated_tokens[:cur_pos] if tok > 0)
+        actual_notes = len(active_notes_history)
         running_density = actual_notes / max(1, cur_pos)
         density_ratio = min(5.0, running_density / target_density)
         strain_metrics_tensor[cur_pos, 0] = float(running_density)
@@ -484,7 +486,7 @@ def generate_patterns_with_model3(
                     audio_memory=window_audio_memory,
                     multiscale_audio=window_multiscale,
                 )
-                pred_dt_ms = 120.0
+                pred_dt_ms = beat_len_ms / 2.0
 
             cur_chord_logits = chord_logits[0, -1].clone()   # [16]
             cur_ln_logits = ln_logits[0, -1].clone()         # [4]
@@ -500,23 +502,36 @@ def generate_patterns_with_model3(
                 if k_cnt > max_k:
                     active_logits[t_i] = -1e9
 
-            # Anti-burst stream limiter
-            recent_burst = 0
-            for prev_t in reversed(generated_tokens[max(0, cur_pos - 16) : cur_pos]):
-                if prev_t > 0:
-                    recent_burst += 1
-                else:
-                    break
+            # 1. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            if len(active_notes_history) >= 4:
+                if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
+                    active_logits[active_notes_history[-1]] -= 12.0
+                    active_logits[active_notes_history[-2]] -= 12.0
 
-            max_ergonomic_burst = 6 if star_rating < 3.5 else (12 if star_rating < 5.0 else 24)
-            if recent_burst >= max_ergonomic_burst:
-                burst_penalty = min(10.0, 2.0 * float(recent_burst - max_ergonomic_burst + 1))
-                active_logits[1:] -= burst_penalty
+            # 2. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
+            if len(active_notes_history) >= 2:
+                if active_notes_history[-1] == active_notes_history[-2]:
+                    active_logits[active_notes_history[-1]] -= 15.0
 
-            if greedy or temperature <= 0.05:
+            # 3. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
+            recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
+            if recent_active:
+                lane_usage = [0, 0, 0, 0]
+                for tok_val in recent_active:
+                    for c in token_to_keys(tok_val):
+                        lane_usage[c] += 1
+                for c in range(4):
+                    if lane_usage[c] >= 7:
+                        # Heavy fatigue on lane c: penalize candidates using lane c
+                        for t_cand in range(1, 16):
+                            if (t_cand >> c) & 1:
+                                active_logits[t_cand] -= 4.0
+
+            eff_temp = 0.35 if (temperature <= 0.05 and not greedy) else max(0.1, temperature)
+            if greedy:
                 tok = int(active_logits.argmax().item())
             else:
-                scaled = active_logits / max(0.1, temperature)
+                scaled = active_logits / eff_temp
                 probs = F.softmax(scaled, dim=-1)
                 tok = int(torch.multinomial(probs, 1).item())
 
@@ -524,25 +539,28 @@ def generate_patterns_with_model3(
 
         generated_tokens[cur_pos] = tok
         all_ln_probs[cur_pos] = new_lns
+        active_notes_history.append(tok)
 
         # Update lane state sequence for future autoregressive context
-        if tok > 0:
-            cols = token_to_keys(tok)
-            for c in cols:
-                if (star_rating >= 1.8) and (new_lns[c] >= 0.78):
-                    lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
-                    hold_span = min(4, num_ticks - cur_pos - 1)
-                    for hf in range(1, hold_span):
-                        lane_states_seq[cur_pos + hf, c] = 3  # STATE_LN_HOLD
-                else:
-                    lane_states_seq[cur_pos, c] = 1  # STATE_TAP
+        cols = token_to_keys(tok)
+        for c in cols:
+            if (star_rating >= 1.8) and (new_lns[c] >= 0.78):
+                lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
+                hold_span = min(4, num_ticks - cur_pos - 1)
+                for hf in range(1, hold_span):
+                    lane_states_seq[cur_pos + hf, c] = 3  # STATE_LN_HOLD
+            else:
+                lane_states_seq[cur_pos, c] = 1  # STATE_TAP
 
-            # Dynamic Neural Step Jump: Paces forward continuously to the next hit event
-            target_time_ms = ticks[cur_pos].time_ms + max(25.0, pred_dt_ms)
-            next_pos = bisect.bisect_left(tick_times_list, target_time_ms)
-            cur_pos = max(cur_pos + 1, next_pos)
-        else:
-            cur_pos += 1
+        # Bound dynamic step jump by musical meter & star rating
+        # 5.0* -> streams (1/4 beat ~ 79ms), 3.0* -> 1/2 beat ~ 158ms, 1.5* -> 1/1 beat ~ 316ms
+        max_jump_ms = beat_len_ms * (2.0 if star_rating < 2.5 else (1.0 if star_rating < 4.0 else 0.5))
+        min_jump_ms = beat_len_ms / (4.0 if star_rating < 4.0 else 8.0)
+        clamped_dt_ms = max(min_jump_ms, min(max_jump_ms, pred_dt_ms))
+
+        target_time_ms = ticks[cur_pos].time_ms + clamped_dt_ms
+        next_pos = bisect.bisect_left(tick_times_list, target_time_ms)
+        cur_pos = max(cur_pos + 1, next_pos)
 
     # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
