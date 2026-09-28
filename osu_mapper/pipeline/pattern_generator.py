@@ -77,24 +77,22 @@ def sample_chord_tokens_with_nucleus(
     top_p: float = 0.90,
     greedy: bool = False,
     note_conf_thresh: float = 0.0,
+    has_scaffold_hint: bool = False,
 ) -> List[int]:
     """
     Difficulty-Conditioned Neural Chord Decoder:
-    Calibrates decision boundary with Star Rating so high difficulties (5.0* - 7.0*+)
+    Calibrates decision boundary with Star Rating so high difficulties (3.5* - 7.0*+)
     reliably trigger dense jumpstreams/chords without being suppressed by raw background idle frequency.
     """
     T, num_classes = logits.shape
     out_tokens: List[int] = []
 
     # Calibrated active activation threshold scaled to Star Rating:
-    # 1.0* -> 0.52 (very conservative, strictly downbeats/singles)
-    # 3.0* -> 0.38 (standard rhythm)
-    # 4.5* -> 0.28 (dense streams)
-    # 6.0* -> 0.18 (fast bursts, 1/4 jumpstreams)
-    # 7.5*+ -> 0.12 (dense handstreams/chordstreams)
-    calibrated_active_thresh = max(0.10, min(0.55, 0.60 - (float(star_rating) - 1.0) * 0.075))
+    calibrated_active_thresh = max(0.06, min(0.40, 0.42 - (float(star_rating) - 1.0) * 0.065))
+    if has_scaffold_hint:
+        calibrated_active_thresh *= 0.65
     if note_conf_thresh > 0.0:
-        calibrated_active_thresh = max(calibrated_active_thresh, note_conf_thresh)
+        calibrated_active_thresh = note_conf_thresh
 
     for t_i in range(T):
         step_logits = logits[t_i : t_i + 1].clone()
@@ -111,8 +109,8 @@ def sample_chord_tokens_with_nucleus(
                 out_tokens.append(0)
         else:
             scaled_logits = step_logits / max(0.1, temperature)
-            if star_rating >= 4.0:
-                boost = (star_rating - 3.5) * 0.35
+            if star_rating >= 3.5:
+                boost = (star_rating - 3.0) * 0.30
                 scaled_logits[0, 1:] += boost
 
             probs = F.softmax(scaled_logits, dim=-1)
@@ -410,15 +408,17 @@ def generate_patterns_with_model3(
 
     # Maintain real-time 4-lane physical activity state
     lane_states_seq = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
+    tick_times_list = [float(t_obj.time_ms) for t_obj in ticks]
 
-    generated_tokens: List[int] = []
-    all_ln_probs: List[List[float]] = []
+    generated_tokens: List[int] = [0] * num_ticks
+    all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(num_ticks)]
 
-    print(f"  • Generating neural 4K patterns on discrete musical ticks (SR: {star_rating:.1f}*, {num_ticks} decision steps)...")
+    print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
 
-    # Autoregressive generation: tick-by-tick causality with rolling context
+    # Autoregressive generation: neural step jump causality with rolling context
     ctx_len = 64
-    for cur_pos in range(num_ticks):
+    cur_pos = 0
+    while cur_pos < num_ticks:
         ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
 
@@ -431,7 +431,7 @@ def generate_patterns_with_model3(
             )
 
         # Dynamic live strain trajectory based on actually generated notes
-        actual_notes = sum(1 for tok in generated_tokens if tok > 0)
+        actual_notes = sum(1 for tok in generated_tokens[:cur_pos] if tok > 0)
         running_density = actual_notes / max(1, cur_pos)
         density_ratio = min(5.0, running_density / target_density)
         strain_metrics_tensor[cur_pos, 0] = float(running_density)
@@ -447,29 +447,48 @@ def generate_patterns_with_model3(
         # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet intros
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
         if (silence_gate > 0.0) and (cur_energy_ratio < silence_gate):
-            generated_tokens.append(0)
-            all_ln_probs.append([0.0, 0.0, 0.0, 0.0])
+            generated_tokens[cur_pos] = 0
+            all_ln_probs[cur_pos] = [0.0, 0.0, 0.0, 0.0]
+            cur_pos += 1
             continue
 
         with torch.no_grad():
-            chord_logits, ln_logits = model(
-                window_mel,
-                star_rating=sr_tensor,
-                prev_tokens=window_prev_tokens,
-                lane_states=window_lane_states,
-                grid_metrics=window_grid_metrics,
-                scaffold_tokens=window_scaffold,
-                strain_metrics=window_strain,
-                audio_memory=window_audio_memory,
-                multiscale_audio=window_multiscale,
-            )
+            try:
+                chord_logits, ln_logits, _, pred_time_deltas = model(
+                    window_mel,
+                    star_rating=sr_tensor,
+                    prev_tokens=window_prev_tokens,
+                    lane_states=window_lane_states,
+                    grid_metrics=window_grid_metrics,
+                    scaffold_tokens=window_scaffold,
+                    strain_metrics=window_strain,
+                    audio_memory=window_audio_memory,
+                    multiscale_audio=window_multiscale,
+                    return_sr=True,
+                    return_time_delta=True,
+                )
+                pred_dt_ms = float(pred_time_deltas[0, -1, 0].item())
+            except Exception:
+                chord_logits, ln_logits = model(
+                    window_mel,
+                    star_rating=sr_tensor,
+                    prev_tokens=window_prev_tokens,
+                    lane_states=window_lane_states,
+                    grid_metrics=window_grid_metrics,
+                    scaffold_tokens=window_scaffold,
+                    strain_metrics=window_strain,
+                    audio_memory=window_audio_memory,
+                    multiscale_audio=window_multiscale,
+                )
+                pred_dt_ms = 120.0
+
             cur_chord_logits = chord_logits[0, -1:].clone()
             cur_ln_logits = ln_logits[0, -1:].clone()
 
             # Anti-Mode Collapse / Burst Stream Limiter:
             # Prevents autoregressive Transformer feedback loops (endless 1/8 trills col1<->col2 for 30s)
             recent_burst = 0
-            for prev_t in reversed(generated_tokens[-16:]):
+            for prev_t in reversed(generated_tokens[max(0, cur_pos - 16) : cur_pos]):
                 if prev_t > 0:
                     recent_burst += 1
                 else:
@@ -480,6 +499,7 @@ def generate_patterns_with_model3(
                 burst_penalty = min(10.0, 2.0 * float(recent_burst - max_ergonomic_burst + 1))
                 cur_chord_logits[0, 1:] -= burst_penalty
 
+            has_scaff = (scaffold_tokens_tensor[cur_pos].item() > 0)
             new_tokens = sample_chord_tokens_with_nucleus(
                 logits=cur_chord_logits,
                 star_rating=star_rating,
@@ -487,12 +507,13 @@ def generate_patterns_with_model3(
                 top_p=top_p,
                 greedy=greedy,
                 note_conf_thresh=note_conf_thresh,
+                has_scaffold_hint=has_scaff,
             )
             new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()[0]
             tok = new_tokens[0]
 
-        generated_tokens.append(tok)
-        all_ln_probs.append(new_lns)
+        generated_tokens[cur_pos] = tok
+        all_ln_probs[cur_pos] = new_lns
 
         # Update lane state sequence for future autoregressive context
         if tok > 0:
@@ -505,6 +526,13 @@ def generate_patterns_with_model3(
                         lane_states_seq[cur_pos + hf, c] = 3  # STATE_LN_HOLD
                 else:
                     lane_states_seq[cur_pos, c] = 1  # STATE_TAP
+
+            # Dynamic Neural Step Jump: Paces forward continuously to the next hit event
+            target_time_ms = ticks[cur_pos].time_ms + max(25.0, pred_dt_ms)
+            next_pos = bisect.bisect_left(tick_times_list, target_time_ms)
+            cur_pos = max(cur_pos + 1, next_pos)
+        else:
+            cur_pos += 1
 
     # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
