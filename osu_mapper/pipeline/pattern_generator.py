@@ -415,6 +415,12 @@ def generate_patterns_with_model3(
     all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(num_ticks)]
     active_notes_history: List[int] = []
 
+    # State Machine tracking for Long Notes (Sliders) across neural jumps
+    active_ln_starts: Dict[int, Optional[int]] = {0: None, 1: None, 2: None, 3: None}
+    hit_objects: List[ManiaHitObject] = []
+    total_taps = 0
+    total_lns = 0
+
     print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
 
     # Autoregressive generation: neural step jump causality with rolling context
@@ -425,6 +431,10 @@ def generate_patterns_with_model3(
     cur_pos = max(0, bisect.bisect_left(tick_times_list, target_start_ms))
 
     while cur_pos < num_ticks:
+        cur_time_ms = int(round(ticks[cur_pos].time_ms))
+        if cur_time_ms >= duration_ms:
+            break
+
         ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
 
@@ -453,6 +463,16 @@ def generate_patterns_with_model3(
         # Acoustic Silence & Break Gating: strictly suppress notes during song silence and quiet breaks
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
         if (silence_gate > 0.0) and (cur_energy_ratio < silence_gate):
+            # Close any open sliders on song break
+            for c in range(4):
+                if active_ln_starts[c] is not None:
+                    start_t = active_ln_starts[c]
+                    end_t = max(start_t + 85, cur_time_ms - 30)
+                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                    total_lns += 1
+                    active_ln_starts[c] = None
+                    lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
+
             generated_tokens[cur_pos] = 0
             all_ln_probs[cur_pos] = [0.0, 0.0, 0.0, 0.0]
             cur_pos += 1
@@ -510,18 +530,25 @@ def generate_patterns_with_model3(
                     if k_cnt >= 2:
                         active_logits[t_cand] += chord_boost * (k_cnt - 1)
 
-            # 2. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            # 2. Discourage new single taps on lanes currently occupied by a held slider
+            for c in range(4):
+                if active_ln_starts[c] is not None:
+                    for t_cand in range(1, 16):
+                        if (t_cand >> c) & 1:
+                            active_logits[t_cand] -= 6.0
+
+            # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
             if len(active_notes_history) >= 4:
                 if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
                     active_logits[active_notes_history[-1]] -= 12.0
                     active_logits[active_notes_history[-2]] -= 12.0
 
-            # 3. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
+            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
             if len(active_notes_history) >= 2:
                 if active_notes_history[-1] == active_notes_history[-2]:
                     active_logits[active_notes_history[-1]] -= 15.0
 
-            # 4. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
+            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
             recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
             if recent_active:
                 lane_usage = [0, 0, 0, 0]
@@ -549,16 +576,63 @@ def generate_patterns_with_model3(
         all_ln_probs[cur_pos] = new_lns
         active_notes_history.append(tok)
 
-        # Update lane state sequence for future autoregressive context
-        cols = token_to_keys(tok)
-        for c in cols:
-            if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
-                lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
-                hold_span = min(4, num_ticks - cur_pos - 1)
-                for hf in range(1, hold_span):
-                    lane_states_seq[cur_pos + hf, c] = 3  # STATE_LN_HOLD
+        # -------------------------------------------------------------
+        # Continuous State Machine: Hold / Unhold across Neural Jumps
+        # -------------------------------------------------------------
+        new_cols = set(token_to_keys(tok))
+
+        # Check existing ongoing sliders: continue holding or unhold?
+        for c in range(4):
+            if active_ln_starts[c] is not None:
+                is_held = (new_lns[c] >= 0.38) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 4.0)))
+                if is_held:
+                    # Continue holding slider!
+                    lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
+                else:
+                    # Unhold / Release slider!
+                    start_t = active_ln_starts[c]
+                    end_t = max(start_t + 85, cur_time_ms - 30)
+                    hit_objects.append(
+                        ManiaHitObject(
+                            column=c,
+                            start_time=start_t,
+                            end_time=end_t,
+                            is_ln=True,
+                        )
+                    )
+                    total_lns += 1
+                    active_ln_starts[c] = None
+                    lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
+
+        # Process new hit object strikes for this step
+        for c in new_cols:
+            if active_ln_starts[c] is None:
+                # If LN probability is strong, start a new slider
+                if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
+                    active_ln_starts[c] = cur_time_ms
+                    lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
+                else:
+                    # Standard Single Tap
+                    hit_objects.append(
+                        ManiaHitObject(
+                            column=c,
+                            start_time=cur_time_ms,
+                            end_time=cur_time_ms,
+                            is_ln=False,
+                        )
+                    )
+                    total_taps += 1
+                    lane_states_seq[cur_pos, c] = 1  # STATE_TAP
             else:
-                lane_states_seq[cur_pos, c] = 1  # STATE_TAP
+                # Lane was already held; re-striking closes previous LN and starts new tap
+                start_t = active_ln_starts[c]
+                end_t = max(start_t + 85, cur_time_ms - 30)
+                hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                total_lns += 1
+                hit_objects.append(ManiaHitObject(column=c, start_time=cur_time_ms, end_time=cur_time_ms, is_ln=False))
+                total_taps += 1
+                active_ln_starts[c] = None
+                lane_states_seq[cur_pos, c] = 1
 
         # Bound dynamic step jump by musical meter & star rating
         # 1.0* -> 1/1 beat (434ms), 2.5* -> 1/2 beat (217ms), 4.5* -> 1/4 beat (108ms), 6.5*+ -> 1/8 beat (54ms)
@@ -582,83 +656,15 @@ def generate_patterns_with_model3(
         next_pos = bisect.bisect_left(tick_times_list, target_time_ms)
         cur_pos = max(cur_pos + 1, next_pos)
 
-    # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
-    hit_objects: List[ManiaHitObject] = []
-    
-    # Calibrated LN probability threshold matching standard 15-25% mania ratio
-    ln_threshold = 0.50 if star_rating < 4.0 else 0.45
-
-    total_taps = 0
-    total_lns = 0
-
-    # Process each of the 4 keys independently with Lane-Locking & Sustain-Tracking
-    for col in range(4):
-        busy_until_ms = -1
-
-        for i in range(num_ticks):
-            tok = generated_tokens[i]
-            if tok <= 0:
-                continue
-
-            active_cols = token_to_keys(tok)
-            if col not in active_cols:
-                continue
-
-            tick_obj = ticks[i]
-            t_ms = int(round(tick_obj.time_ms))
-            if t_ms <= busy_until_ms or t_ms >= duration_ms:
-                continue
-
-            cur_ln_prob = all_ln_probs[i][col]
-            is_potential_ln = (star_rating >= 1.5) and (cur_ln_prob >= ln_threshold)
-
-            if is_potential_ln:
-                # Calculate hold duration from audio sustain or musical beat fractions
-                sustain_ms = estimate_ln_sustain_duration(
-                    tick_mel_tensor,
-                    start_frame=i,
-                    beat_len_ms=beat_len_ms,
-                    frame_ms=16.0,
-                )
-                if sustain_ms < 100:
-                    sustain_ms = int(round(beat_len_ms * (0.5 if star_rating >= 4.0 else 1.0)))
-
-                end_t_ms = t_ms + sustain_ms
-
-                # Prevent LN from overlapping next note on the same column
-                next_same_lane_ms = None
-                for nxt_i in range(i + 1, num_ticks):
-                    nxt_tok = generated_tokens[nxt_i]
-                    if nxt_tok > 0 and (col in token_to_keys(nxt_tok)):
-                        next_same_lane_ms = int(round(ticks[nxt_i].time_ms))
-                        break
-
-                if next_same_lane_ms is not None:
-                    end_t_ms = min(end_t_ms, next_same_lane_ms - 40)
-
-                if end_t_ms - t_ms >= 85:
-                    busy_until_ms = end_t_ms
-                    total_lns += 1
-                    hit_objects.append(
-                        ManiaHitObject(
-                            column=col,
-                            start_time=t_ms,
-                            end_time=end_t_ms,
-                            is_ln=True,
-                        )
-                    )
-                    continue
-
-            # Standard Tap Note
-            total_taps += 1
-            hit_objects.append(
-                ManiaHitObject(
-                    column=col,
-                    start_time=t_ms,
-                    end_time=t_ms,
-                    is_ln=False,
-                )
-            )
+    # Close any lingering sliders at the end of track
+    final_track_ms = min(duration_ms, int(round(ticks[-1].time_ms)))
+    for c in range(4):
+        if active_ln_starts[c] is not None:
+            start_t = active_ln_starts[c]
+            end_t = max(start_t + 85, final_track_ms)
+            hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+            total_lns += 1
+            active_ln_starts[c] = None
 
     hit_objects.sort(key=lambda o: (o.start_time, o.column))
     total_objs = len(hit_objects)
