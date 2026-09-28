@@ -634,6 +634,33 @@ def compute_multiscale_pyramid_features(
     return multiscale_tensor
 
 
+def compute_chunk_time_deltas(
+    chunk_tok: torch.Tensor,
+    ticks_slice: List[MusicalGridTick],
+    beat_len_ms: float,
+) -> torch.Tensor:
+    """Computes exact continuous time distance (in ms) to next active hit object event."""
+    chunk_size = len(chunk_tok)
+    deltas = torch.zeros(chunk_size, 1, dtype=torch.float32)
+    tok_arr = chunk_tok.cpu().numpy() if isinstance(chunk_tok, torch.Tensor) else chunk_tok
+    note_indices = [i for i, tok in enumerate(tok_arr) if tok > 0]
+
+    if not note_indices:
+        deltas.fill_(float(beat_len_ms))
+        return deltas
+
+    times_ms = [t.time_ms for t in ticks_slice]
+    for i in range(chunk_size):
+        next_notes = [idx for idx in note_indices if idx > i]
+        if next_notes:
+            nxt = next_notes[0]
+            dt = max(10.0, times_ms[nxt] - times_ms[i])
+        else:
+            dt = max(10.0, (times_ms[-1] - times_ms[i]) + beat_len_ms)
+        deltas[i, 0] = float(dt)
+    return deltas
+
+
 def slice_beatmap_into_musical_chunks(
     mel: torch.Tensor,
     tokens: torch.Tensor,
@@ -725,6 +752,8 @@ def slice_beatmap_into_musical_chunks(
 
         t_start_ms = ticks[start_idx].time_ms
         t_end_ms = ticks[end_idx - 1].time_ms
+        b_len_ms = round(60000.0 / max(30.0, float(details.bpm)), 2)
+        chunk_deltas = compute_chunk_time_deltas(chunk_tok, ticks[start_idx:end_idx], b_len_ms)
 
         chunks.append({
             "audio_mel": chunk_mel,
@@ -735,6 +764,7 @@ def slice_beatmap_into_musical_chunks(
             "grid_metrics": chunk_grid,
             "ln_mask": chunk_ln,
             "sv_curve": chunk_sv,
+            "target_time_deltas": chunk_deltas,
             "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
             "bpm": torch.tensor([details.bpm], dtype=torch.float32),
             "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
@@ -742,7 +772,7 @@ def slice_beatmap_into_musical_chunks(
             "start_ms": round(t_start_ms, 2),
             "end_ms": round(t_end_ms, 2),
             "bar_index": db_i,
-            "beat_len_ms": round(60000.0 / max(30.0, float(details.bpm)), 2),
+            "beat_len_ms": b_len_ms,
         })
 
     if not chunks and num_ticks >= chunk_size:
@@ -769,6 +799,8 @@ def slice_beatmap_into_musical_chunks(
 
             t_start_ms = ticks[start_idx].time_ms
             t_end_ms = ticks[end_idx - 1].time_ms
+            b_len_ms = round(60000.0 / max(30.0, float(details.bpm)), 2)
+            chunk_deltas = compute_chunk_time_deltas(chunk_tok, ticks[start_idx:end_idx], b_len_ms)
 
             chunks.append({
                 "audio_mel": chunk_mel,
@@ -779,6 +811,7 @@ def slice_beatmap_into_musical_chunks(
                 "grid_metrics": chunk_grid,
                 "ln_mask": chunk_ln,
                 "sv_curve": chunk_sv,
+                "target_time_deltas": chunk_deltas,
                 "star_rating": torch.tensor([details.star_rating], dtype=torch.float32),
                 "bpm": torch.tensor([details.bpm], dtype=torch.float32),
                 "offset_ms": torch.tensor([details.offset_ms], dtype=torch.float32),
@@ -786,7 +819,7 @@ def slice_beatmap_into_musical_chunks(
                 "start_ms": round(t_start_ms, 2),
                 "end_ms": round(t_end_ms, 2),
                 "bar_index": 0,
-                "beat_len_ms": round(60000.0 / max(30.0, float(details.bpm)), 2),
+                "beat_len_ms": b_len_ms,
             })
 
     return chunks

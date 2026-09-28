@@ -410,6 +410,56 @@ def compute_multi_scenario_scaffold_and_strain(
     return scaffold_tokens, strain_metrics
 
 
+def extract_target_time_deltas(
+    batch: Dict[str, Any],
+    tokens: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Retrieves or dynamically computes ground-truth continuous forward time step deltas (\\Delta t in ms)
+    to the next active hit object event.
+    Returns: Tensor of shape [B, T, 1].
+    """
+    if "target_time_deltas" in batch:
+        return batch["target_time_deltas"].to(device)
+
+    B, T = tokens.shape
+    if "start_ms" in batch and "end_ms" in batch:
+        s = batch["start_ms"]
+        e = batch["end_ms"]
+        if isinstance(s, torch.Tensor) and isinstance(e, torch.Tensor):
+            span = (e - s).float().clamp(min=100.0)
+        else:
+            span = torch.tensor([float(e[i]) - float(s[i]) for i in range(B)], dtype=torch.float32, device=device).clamp(min=100.0)
+        step_len = (span / max(1, T - 1)).unsqueeze(1).to(device)
+    elif "bpm" in batch:
+        bpm = batch["bpm"].float().clamp(min=40.0, max=400.0)
+        step_len = (60000.0 / bpm / 4.0).view(B, 1).to(device)
+    else:
+        step_len = torch.full((B, 1), 30.0, dtype=torch.float32, device=device)
+
+    target_deltas = torch.zeros(B, T, 1, dtype=torch.float32, device=device)
+    has_notes = (tokens > 0)
+
+    for b in range(B):
+        note_indices = torch.nonzero(has_notes[b], as_tuple=False).squeeze(-1)
+        cur_step = float(step_len[b, 0].item())
+        if len(note_indices) == 0:
+            target_deltas[b, :, 0] = cur_step * 4.0
+            continue
+
+        next_note_pos = torch.searchsorted(note_indices, torch.arange(T, device=device) + 1)
+        valid_mask = next_note_pos < len(note_indices)
+
+        delta_ticks = torch.zeros(T, dtype=torch.float32, device=device)
+        delta_ticks[valid_mask] = (note_indices[next_note_pos[valid_mask]] - torch.arange(T, device=device)[valid_mask]).float()
+        delta_ticks[~valid_mask] = ((T - torch.arange(T, device=device)[~valid_mask]).float() + 4.0)
+
+        target_deltas[b, :, 0] = delta_ticks * cur_step
+
+    return target_deltas.clamp(min=5.0, max=10000.0)
+
+
 def train_model_3_transformer(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -519,6 +569,7 @@ def train_model_3_transformer(
             total_correct, total_tokens = 0, 0
             true_note_total, note_detected_total, note_exact_total = 0, 0, 0
             ln_true_pos_total, ln_pred_pos_total, ln_hit_total = 0, 0, 0
+            step_err_total = 0.0
             start_t = time.time()
 
             for batch_idx, batch in enumerate(train_loader):
@@ -527,6 +578,7 @@ def train_model_3_transformer(
                 B, T = tokens.shape
                 ln_mask = batch["ln_mask"].to(device)           # [B, T, 4]
                 star_rating = batch["star_rating"].to(device)   # [B, 1]
+                target_time_deltas = extract_target_time_deltas(batch, tokens, device)
                 multiscale_audio = batch["multiscale_audio"].to(device) if "multiscale_audio" in batch else None
                 lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                 grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
@@ -561,7 +613,7 @@ def train_model_3_transformer(
                     prev_lane = None
 
                 optimizer.zero_grad()
-                chord_logits, ln_logits, pred_sr = model(
+                chord_logits, ln_logits, pred_sr, pred_time_deltas = model(
                     audio_mel,
                     star_rating=star_rating,
                     prev_tokens=prev_tok,
@@ -571,6 +623,7 @@ def train_model_3_transformer(
                     strain_metrics=strain_metrics,
                     multiscale_audio=multiscale_audio,
                     return_sr=True,
+                    return_time_delta=True,
                 )
 
                 # 1. Standard Chord CrossEntropy with class balance
@@ -597,8 +650,10 @@ def train_model_3_transformer(
                 loss_ln = criterion_ln(ln_logits, ln_mask)
                 # 4. Difficulty consistency loss
                 loss_sr = F.smooth_l1_loss(pred_sr, star_rating)
+                # 5. Continuous Time-Delta SmoothL1Loss (\Delta t step forward in ms)
+                loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
 
-                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr
+                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.01 * loss_delta
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -615,6 +670,7 @@ def train_model_3_transformer(
                 if true_note_cnt > 0:
                     note_detected_total += (preds[is_true_note] > 0).sum().item()
                     note_exact_total += (preds[is_true_note] == tokens[is_true_note]).sum().item()
+                    step_err_total += torch.abs(pred_time_deltas[is_true_note] - target_time_deltas[is_true_note]).sum().item()
 
                 # LN specific metrics
                 is_ln_true = (ln_mask > 0.5)
@@ -627,6 +683,7 @@ def train_model_3_transformer(
             train_all_acc = (total_correct / max(1, total_tokens)) * 100.0
             train_note_recall = (note_detected_total / max(1, true_note_total)) * 100.0
             train_strict_exact = (note_exact_total / max(1, true_note_total)) * 100.0
+            train_step_mae = step_err_total / max(1, true_note_total)
             train_ln_recall = (ln_hit_total / max(1, ln_true_pos_total)) * 100.0
             train_ln_prec = (ln_hit_total / max(1, ln_pred_pos_total)) * 100.0
             train_ln_f1 = (2 * train_ln_prec * train_ln_recall) / max(1e-5, train_ln_prec + train_ln_recall)
@@ -640,6 +697,7 @@ def train_model_3_transformer(
             val_true_note, val_note_det, val_note_exact = 0, 0, 0
             val_ln_true, val_ln_pred, val_ln_hit = 0, 0, 0
             val_sr_err = 0.0
+            val_step_err = 0.0
 
             with torch.no_grad():
                 for batch in val_loader:
@@ -647,6 +705,7 @@ def train_model_3_transformer(
                     tokens = batch["tokens"].to(device)
                     ln_mask = batch["ln_mask"].to(device)
                     star_rating = batch["star_rating"].to(device)
+                    val_target_deltas = extract_target_time_deltas(batch, tokens, device)
                     multiscale_audio = batch["multiscale_audio"].to(device) if "multiscale_audio" in batch else None
                     lane_states = batch["lane_states"].to(device) if "lane_states" in batch else None
                     grid_metrics = batch["grid_metrics"].to(device) if "grid_metrics" in batch else None
@@ -671,7 +730,7 @@ def train_model_3_transformer(
                     else:
                         prev_lane = None
 
-                    c_logits, l_logits, p_sr = model(
+                    c_logits, l_logits, p_sr, p_time_deltas = model(
                         audio_mel,
                         star_rating=star_rating,
                         prev_tokens=prev_tok,
@@ -681,6 +740,7 @@ def train_model_3_transformer(
                         strain_metrics=strain_metrics,
                         multiscale_audio=multiscale_audio,
                         return_sr=True,
+                        return_time_delta=True,
                     )
                     B, T, C = c_logits.shape
                     l_c = criterion_chord(c_logits.view(B * T, C), tokens.view(B * T))
@@ -700,7 +760,8 @@ def train_model_3_transformer(
                     l_lane = F.binary_cross_entropy(v_pred_lane_probs.clamp(1e-6, 1.0 - 1e-6), v_true_lanes)
                     l_l = criterion_ln(l_logits, ln_mask)
                     l_sr = F.smooth_l1_loss(p_sr, star_rating)
-                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr).item() * B
+                    l_delta = F.smooth_l1_loss(p_time_deltas, val_target_deltas)
+                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr + 0.01 * l_delta).item() * B
                     val_sr_err += torch.abs(p_sr - star_rating).sum().item()
 
                     preds = c_logits.argmax(dim=-1)
@@ -713,6 +774,7 @@ def train_model_3_transformer(
                     if t_cnt > 0:
                         val_note_det += (preds[is_true] > 0).sum().item()
                         val_note_exact += (preds[is_true] == tokens[is_true]).sum().item()
+                        val_step_err += torch.abs(p_time_deltas[is_true] - val_target_deltas[is_true]).sum().item()
 
                     is_ln = (ln_mask > 0.5)
                     pred_ln = (torch.sigmoid(l_logits) > 0.40)
@@ -722,6 +784,7 @@ def train_model_3_transformer(
 
             val_loss /= len(val_loader.dataset)
             val_sr_mae = val_sr_err / len(val_loader.dataset)
+            val_step_mae = val_step_err / max(1, val_true_note)
             val_all_acc = (val_correct / max(1, val_tokens)) * 100.0
             val_note_recall = (val_note_det / max(1, val_true_note)) * 100.0
             val_strict_exact = (val_note_exact / max(1, val_true_note)) * 100.0
@@ -731,8 +794,8 @@ def train_model_3_transformer(
 
             print(
                 f"Epoch {epoch:02d}/{target_total_epochs:02d} [{elapsed:.1f}s | {samples_sec:.1f} smp/s]\n"
-                f"  Train: Loss={train_loss:.4f} | Note Rec={train_note_recall:.1f}% | Exact 4K={train_strict_exact:.1f}% | LN Rec={train_ln_recall:.1f}% (LN F1={train_ln_f1:.1f}%) | Raw Acc={train_all_acc:.1f}%\n"
-                f"  Val:   Loss={val_loss:.4f} | Note Rec={val_note_recall:.1f}% | Exact 4K={val_strict_exact:.1f}% | LN Rec={val_ln_recall:.1f}% | SR MAE={val_sr_mae:.2f}* | Raw Acc={val_all_acc:.1f}%"
+                f"  Train: Loss={train_loss:.4f} | Note Rec={train_note_recall:.1f}% | Exact 4K={train_strict_exact:.1f}% | Step MAE=±{train_step_mae:.1f}ms | LN Rec={train_ln_recall:.1f}% (LN F1={train_ln_f1:.1f}%) | Raw Acc={train_all_acc:.1f}%\n"
+                f"  Val:   Loss={val_loss:.4f} | Note Rec={val_note_recall:.1f}% | Exact 4K={val_strict_exact:.1f}% | Step MAE=±{val_step_mae:.1f}ms | LN Rec={val_ln_recall:.1f}% | SR MAE={val_sr_mae:.2f}* | Raw Acc={val_all_acc:.1f}%"
             )
 
             record = {
@@ -750,6 +813,8 @@ def train_model_3_transformer(
                 "val_strict_exact": val_strict_exact,
                 "val_ln_recall": val_ln_recall,
                 "val_ln_f1": val_ln_f1,
+                "train_step_mae": train_step_mae,
+                "val_step_mae": val_step_mae,
             }
             history.append(record)
 
