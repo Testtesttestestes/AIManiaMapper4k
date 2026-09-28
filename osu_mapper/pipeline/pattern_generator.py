@@ -421,6 +421,9 @@ def generate_patterns_with_model3(
     total_taps = 0
     total_lns = 0
 
+    # 1. Acoustic Silence & Break Gating threshold
+    effective_silence_gate = max(0.12, float(silence_gate))
+
     print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
 
     # Autoregressive generation: neural step jump causality with rolling context
@@ -429,41 +432,21 @@ def generate_patterns_with_model3(
     # Start generation at first active timing offset
     target_start_ms = float(offset_ms) if offset_ms is not None else 0.0
     cur_pos = max(0, bisect.bisect_left(tick_times_list, target_start_ms))
+    consecutive_silence_ticks = 0
 
     while cur_pos < num_ticks:
         cur_time_ms = int(round(ticks[cur_pos].time_ms))
-        if cur_time_ms >= duration_ms:
+        if cur_time_ms >= (duration_ms - 100.0):
             break
 
         ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
 
-        window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-
-        window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
-        if cur_pos > ctx_start:
-            window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
-                generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
-            )
-
-        # Dynamic live strain trajectory based on actually generated notes
-        actual_notes = len(active_notes_history)
-        running_density = actual_notes / max(1, cur_pos)
-        density_ratio = min(5.0, running_density / target_density)
-        strain_metrics_tensor[cur_pos, 0] = float(running_density)
-        strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
-
-        window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
-
-        # Acoustic Silence & Break Gating: strictly suppress notes during song silence and quiet breaks
+        # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet outros
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
-        if (silence_gate > 0.0) and (cur_energy_ratio < silence_gate):
-            # Close any open sliders on song break
+        if cur_energy_ratio < effective_silence_gate:
+            consecutive_silence_ticks += 1
+            # Close any open sliders on song break or silence
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     start_t = active_ln_starts[c]
@@ -475,8 +458,37 @@ def generate_patterns_with_model3(
 
             generated_tokens[cur_pos] = 0
             all_ln_probs[cur_pos] = [0.0, 0.0, 0.0, 0.0]
-            cur_pos += 1
+
+            # If song has been completely silent for more than 4 seconds past middle of track, exit gracefully
+            if consecutive_silence_ticks > 48 and (cur_time_ms > duration_ms * 0.6):
+                break
+
+            cur_pos = max(cur_pos + 1, bisect.bisect_left(tick_times_list, cur_time_ms + beat_len_ms / 2.0))
             continue
+        else:
+            consecutive_silence_ticks = 0
+
+        window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+
+        window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
+        if cur_pos > ctx_start:
+            window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
+                generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
+            )
+
+        # Dynamic live strain trajectory computed over LOCAL rolling window (matching training distribution)
+        local_recent_notes = sum(1 for tok_v in generated_tokens[ctx_start:cur_pos] if tok_v > 0)
+        running_density = local_recent_notes / max(1, window_len)
+        density_ratio = min(5.0, running_density / target_density)
+        strain_metrics_tensor[cur_pos, 0] = float(running_density)
+        strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
+
+        window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
 
         with torch.no_grad():
             try:
@@ -637,22 +649,36 @@ def generate_patterns_with_model3(
                 lane_states_seq[cur_pos, c] = 1
 
         # -------------------------------------------------------------
-        # Exact Musical Divisor Snapping (100% On-Beat: 1/4, 1/2, 1/1)
+        # Exact Musical Divisor Snapping (Energy-Aware: 1/4 Streams on Drops, 1/2 in Verses)
         # -------------------------------------------------------------
         raw_beats = pred_dt_ms / beat_len_ms
+        has_dense_drop = (cur_energy_ratio >= 0.85) and (star_rating >= 3.2)
+        is_calm_section = (cur_energy_ratio < 0.60)
 
         if star_rating < 2.5:
-            # 1.0* - 2.5*: 1/1 beat (435ms) or 2/1 beat (870ms)
-            cand_divs = [0.5, 1.0, 2.0]
+            cand_divs = [1.0, 2.0] if is_calm_section else [0.5, 1.0]
         elif star_rating < 4.5:
-            # 2.5* - 4.5*: 1/2 beat (217ms) or 1/4 beat (108ms)
-            cand_divs = [0.25, 0.5, 1.0]
+            if has_dense_drop:
+                cand_divs = [0.25, 0.5]
+            elif is_calm_section:
+                cand_divs = [0.5, 1.0]
+            else:
+                cand_divs = [0.25, 0.5, 1.0]
         elif star_rating < 6.0:
-            # 4.5* - 6.0*: 1/4 beat streams (108ms) and 1/2 beat jumps
-            cand_divs = [0.25, 0.5]
+            if has_dense_drop:
+                cand_divs = [0.25]  # Dense 1/4 streams during drops/kiai
+            elif is_calm_section:
+                cand_divs = [0.5, 1.0]
+            else:
+                cand_divs = [0.25, 0.5]
         else:
-            # 6.0* - 8.0*+: 1/4 streams (108ms) with 1/8 burst rolls (54ms)
-            cand_divs = [0.125, 0.25, 0.5]
+            # 6.0* - 8.0*+
+            if has_dense_drop:
+                cand_divs = [0.125, 0.25]  # Fast 1/8 burst rolls & 1/4 streams on drops
+            elif is_calm_section:
+                cand_divs = [0.5]
+            else:
+                cand_divs = [0.25, 0.5]
 
         quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
         quantized_jump_ms = quantized_fraction * beat_len_ms
