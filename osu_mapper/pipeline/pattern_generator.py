@@ -70,6 +70,84 @@ class ManiaHitObject:
             return f"{x},{y},{self.start_time},{obj_type},{hit_sound},{extras}"
 
 
+def solve_sliders_and_collisions(
+    hit_objects: List[ManiaHitObject],
+    beat_len_ms: float = 400.0,
+    min_ln_ms: float = 110.0,
+    min_release_gap_ms: int = 35,
+) -> List[ManiaHitObject]:
+    """
+    Ranked-Compliant Slider & Lane Geometry Solver:
+    1. Guarantees 0 overlapping hits on the same lane (prevents osu! hold conflict bugs).
+    2. Zero Lost Notes: If a slider duration would be too short (< min_ln_ms) due to subsequent note on the same lane,
+       it is seamlessly resolved as a crisp Tap Note without deleting the hit!
+    3. Truncates LN end_time cleanly with a safe release gap (35ms) before the next note on the same column.
+    4. Removes any accidental identical-time duplicates on the same lane.
+    """
+    if not hit_objects:
+        return []
+
+    lane_buckets: Dict[int, List[ManiaHitObject]] = {0: [], 1: [], 2: [], 3: []}
+    for obj in hit_objects:
+        if 0 <= obj.column < 4:
+            lane_buckets[obj.column].append(obj)
+
+    solved_objects: List[ManiaHitObject] = []
+
+    for col in range(4):
+        objs = lane_buckets[col]
+        if not objs:
+            continue
+
+        # Sort chronologically
+        objs.sort(key=lambda o: (o.start_time, 0 if not o.is_ln else 1))
+
+        # Deduplicate simultaneous starts on same lane
+        deduped: List[ManiaHitObject] = []
+        for o in objs:
+            if not deduped or o.start_time != deduped[-1].start_time:
+                deduped.append(o)
+            elif o.is_ln and not deduped[-1].is_ln:
+                deduped[-1] = o
+
+        # Solve overlapping spans & clamp release times
+        for i in range(len(deduped)):
+            cur_o = deduped[i]
+            next_start = deduped[i + 1].start_time if (i + 1 < len(deduped)) else None
+
+            if not cur_o.is_ln:
+                solved_objects.append(ManiaHitObject(
+                    column=col,
+                    start_time=cur_o.start_time,
+                    end_time=cur_o.start_time,
+                    is_ln=False,
+                ))
+            else:
+                target_end = cur_o.end_time
+                if next_start is not None and target_end >= next_start:
+                    target_end = next_start - min_release_gap_ms
+
+                hold_len = target_end - cur_o.start_time
+                if hold_len >= min_ln_ms:
+                    solved_objects.append(ManiaHitObject(
+                        column=col,
+                        start_time=cur_o.start_time,
+                        end_time=int(round(target_end)),
+                        is_ln=True,
+                    ))
+                else:
+                    # Too short for a playable slider: convert cleanly to single Tap (0 lost notes)
+                    solved_objects.append(ManiaHitObject(
+                        column=col,
+                        start_time=cur_o.start_time,
+                        end_time=cur_o.start_time,
+                        is_ln=False,
+                    ))
+
+    solved_objects.sort(key=lambda o: (o.start_time, o.column))
+    return solved_objects
+
+
 def sample_chord_tokens_with_nucleus(
     logits: torch.Tensor,
     star_rating: float = 3.5,
@@ -426,6 +504,9 @@ def generate_patterns_with_model3(
 
     print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
 
+    # Calibrated minimum physical LN duration (in ms)
+    min_ln_ms = max(110.0, beat_len_ms * 0.35)
+
     # Autoregressive generation: neural step jump causality with rolling context
     ctx_len = 64
     
@@ -450,9 +531,14 @@ def generate_patterns_with_model3(
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     start_t = active_ln_starts[c]
-                    end_t = max(start_t + 85, cur_time_ms - 30)
-                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
-                    total_lns += 1
+                    hold_len = cur_time_ms - start_t
+                    if hold_len >= min_ln_ms:
+                        end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                        total_lns += 1
+                    else:
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                        total_taps += 1
                     active_ln_starts[c] = None
                     lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
 
@@ -526,7 +612,7 @@ def generate_patterns_with_model3(
             active_logits = cur_chord_logits.clone()
             active_logits[0] = -1e9  # Suppress idle class at hit anchors
 
-            # 1. Ergonomic Chord Limits (Strict osu!mania ranking rules: no unplayable quad/triple spam)
+            # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
             is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
             prev_tok = active_notes_history[-1] if active_notes_history else 0
             prev_k = bin(prev_tok).count("1")
@@ -543,8 +629,12 @@ def generate_patterns_with_model3(
                     # Quads only on heavy downbeats for 6.0*+
                     active_logits[t_i] = -1e9
 
-                # Jumpstream rule: after a double/triple chord, next 1/4 note must be single tap
-                if prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
+                # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
+                if star_rating >= 5.0 and k_cnt >= 2:
+                    active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
+
+                # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
+                if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
                     active_logits[t_i] -= 8.0
 
             # 2. Discourage new taps on lanes currently occupied by a held slider
@@ -561,7 +651,7 @@ def generate_patterns_with_model3(
                     active_logits[active_notes_history[-2]] -= 12.0
 
             # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
-            if len(active_notes_history) >= 2:
+            if len(active_notes_history) >= 2 and star_rating < 8.0:
                 if active_notes_history[-1] == active_notes_history[-2]:
                     active_logits[active_notes_history[-1]] -= 15.0
 
@@ -605,16 +695,15 @@ def generate_patterns_with_model3(
                     lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
                 else:
                     start_t = active_ln_starts[c]
-                    end_t = max(start_t + 85, cur_time_ms - 30)
-                    hit_objects.append(
-                        ManiaHitObject(
-                            column=c,
-                            start_time=start_t,
-                            end_time=end_t,
-                            is_ln=True,
-                        )
-                    )
-                    total_lns += 1
+                    hold_len = cur_time_ms - start_t
+                    if hold_len >= min_ln_ms:
+                        end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                        total_lns += 1
+                    else:
+                        # Graceful Tap fallback
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                        total_taps += 1
                     active_ln_starts[c] = None
                     lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
 
@@ -638,11 +727,17 @@ def generate_patterns_with_model3(
                     total_taps += 1
                     lane_states_seq[cur_pos, c] = 1  # STATE_TAP
             else:
-                # Lane was already held; re-striking closes previous LN and starts new tap
+                # Lane was already held; re-striking closes previous note cleanly
                 start_t = active_ln_starts[c]
-                end_t = max(start_t + 85, cur_time_ms - 30)
-                hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
-                total_lns += 1
+                hold_len = cur_time_ms - start_t
+                if hold_len >= min_ln_ms:
+                    end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
+                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                    total_lns += 1
+                else:
+                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                    total_taps += 1
+
                 hit_objects.append(ManiaHitObject(column=c, start_time=cur_time_ms, end_time=cur_time_ms, is_ln=False))
                 total_taps += 1
                 active_ln_starts[c] = None
@@ -657,7 +752,7 @@ def generate_patterns_with_model3(
 
         if star_rating < 2.5:
             cand_divs = [1.0, 2.0] if is_calm_section else [0.5, 1.0]
-        elif star_rating < 4.5:
+        elif star_rating < 4.0:
             if has_dense_drop:
                 cand_divs = [0.25, 0.5]
             elif is_calm_section:
@@ -671,14 +766,18 @@ def generate_patterns_with_model3(
                 cand_divs = [0.5, 1.0]
             else:
                 cand_divs = [0.25, 0.5]
-        else:
-            # 6.0* - 8.0*+
+        elif star_rating < 9.0:
+            # 6.0* - 9.0*: 1/4 streams with 1/8 burst rolls on drops
             if has_dense_drop:
-                cand_divs = [0.125, 0.25]  # Fast 1/8 burst rolls & 1/4 streams on drops
-            elif is_calm_section:
-                cand_divs = [0.5]
+                cand_divs = [0.125, 0.25]
             else:
-                cand_divs = [0.25, 0.5]
+                cand_divs = [0.25]
+        elif star_rating < 13.0:
+            # 9.0* - 13.0*: dense 1/8 streams and jumpstreams
+            cand_divs = [0.125] if has_dense_drop else [0.125, 0.25]
+        else:
+            # 13.0* - 16.0*+: extreme 1/12 and 1/8 chordstreams
+            cand_divs = [0.0833, 0.125]
 
         quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
         quantized_jump_ms = quantized_fraction * beat_len_ms
@@ -692,21 +791,32 @@ def generate_patterns_with_model3(
     for c in range(4):
         if active_ln_starts[c] is not None:
             start_t = active_ln_starts[c]
-            end_t = max(start_t + 85, final_track_ms)
-            hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
-            total_lns += 1
+            hold_len = final_track_ms - start_t
+            if hold_len >= min_ln_ms:
+                end_t = max(start_t + int(round(min_ln_ms)), final_track_ms)
+                hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                total_lns += 1
+            else:
+                hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                total_taps += 1
             active_ln_starts[c] = None
 
-    hit_objects.sort(key=lambda o: (o.start_time, o.column))
-    total_objs = len(hit_objects)
+    # -------------------------------------------------------------
+    # Ranked-Compliant Slider & Collision Solver (Zero Lost Notes, Zero Overlaps)
+    # -------------------------------------------------------------
+    solved_objects = solve_sliders_and_collisions(hit_objects, beat_len_ms=beat_len_ms, min_ln_ms=min_ln_ms)
+    
+    total_objs = len(solved_objects)
+    final_lns = sum(1 for o in solved_objects if o.is_ln)
+    final_taps = total_objs - final_lns
     duration_sec = max(0.001, duration_ms / 1000.0)
     avg_nps = total_objs / duration_sec
-    ln_pct = (total_lns / max(1, total_objs)) * 100.0
+    ln_pct = (final_lns / max(1, total_objs)) * 100.0
     print(
         f"  ✓ Neural pattern synthesis finished: generated {total_objs} hit objects "
-        f"({total_taps} taps, {total_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS, SR: {star_rating:.1f}*)."
+        f"({final_taps} taps, {final_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS, SR: {star_rating:.1f}*)."
     )
-    return hit_objects
+    return solved_objects
 
 
 def generate_patterns(
