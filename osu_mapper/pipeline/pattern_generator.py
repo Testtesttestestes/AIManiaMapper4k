@@ -502,18 +502,26 @@ def generate_patterns_with_model3(
                 if k_cnt > max_k:
                     active_logits[t_i] = -1e9
 
-            # 1. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            # 1. Multi-Key Chord Scaling based on Target Star Rating (Jumpstreams, Handstreams)
+            if star_rating >= 3.2:
+                chord_boost = (float(star_rating) - 2.8) * 1.8
+                for t_cand in range(1, 16):
+                    k_cnt = bin(t_cand).count("1")
+                    if k_cnt >= 2:
+                        active_logits[t_cand] += chord_boost * (k_cnt - 1)
+
+            # 2. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
             if len(active_notes_history) >= 4:
                 if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
                     active_logits[active_notes_history[-1]] -= 12.0
                     active_logits[active_notes_history[-2]] -= 12.0
 
-            # 2. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
+            # 3. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on medium/high diffs
             if len(active_notes_history) >= 2:
                 if active_notes_history[-1] == active_notes_history[-2]:
                     active_logits[active_notes_history[-1]] -= 15.0
 
-            # 3. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
+            # 4. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes (D, K vs F, J)
             recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
             if recent_active:
                 lane_usage = [0, 0, 0, 0]
@@ -544,7 +552,7 @@ def generate_patterns_with_model3(
         # Update lane state sequence for future autoregressive context
         cols = token_to_keys(tok)
         for c in cols:
-            if (star_rating >= 1.8) and (new_lns[c] >= 0.78):
+            if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
                 lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
                 hold_span = min(4, num_ticks - cur_pos - 1)
                 for hf in range(1, hold_span):
@@ -553,9 +561,21 @@ def generate_patterns_with_model3(
                 lane_states_seq[cur_pos, c] = 1  # STATE_TAP
 
         # Bound dynamic step jump by musical meter & star rating
-        # 5.0* -> streams (1/4 beat ~ 79ms), 3.0* -> 1/2 beat ~ 158ms, 1.5* -> 1/1 beat ~ 316ms
-        max_jump_ms = beat_len_ms * (2.0 if star_rating < 2.5 else (1.0 if star_rating < 4.0 else 0.5))
-        min_jump_ms = beat_len_ms / (4.0 if star_rating < 4.0 else 8.0)
+        # 1.0* -> 1/1 beat (434ms), 2.5* -> 1/2 beat (217ms), 4.5* -> 1/4 beat (108ms), 6.5*+ -> 1/8 beat (54ms)
+        if star_rating < 2.0:
+            max_jump_ms = beat_len_ms * 2.0
+            min_jump_ms = beat_len_ms * 0.75
+        elif star_rating < 3.2:
+            max_jump_ms = beat_len_ms * 1.0
+            min_jump_ms = beat_len_ms * 0.40
+        elif star_rating < 4.8:
+            max_jump_ms = beat_len_ms * 0.50
+            min_jump_ms = beat_len_ms * 0.20
+        else:
+            # 5.0* - 8.0*+: fast 1/4 streams & 1/8 bursts
+            max_jump_ms = beat_len_ms * 0.25
+            min_jump_ms = beat_len_ms / 8.0
+
         clamped_dt_ms = max(min_jump_ms, min(max_jump_ms, pred_dt_ms))
 
         target_time_ms = ticks[cur_pos].time_ms + clamped_dt_ms
@@ -565,35 +585,18 @@ def generate_patterns_with_model3(
     # 3. Convert predicted tokens directly into ManiaHitObjects using State Machine Decoder
     hit_objects: List[ManiaHitObject] = []
     
-    # Calibrated LN probability thresholds matching empirical 15-20% dataset ratio
-    # Model 3 was trained with pos_weight=6.6: threshold in 0.76-0.85 captures true vocal/synth sustains
-    if star_rating < 1.8:
-        ln_start_threshold = 0.95
-        hold_decay_threshold = 0.85
-    elif star_rating < 3.5:
-        ln_start_threshold = 0.82
-        hold_decay_threshold = 0.60
-    elif star_rating < 5.0:
-        ln_start_threshold = 0.78
-        hold_decay_threshold = 0.52
-    else:
-        ln_start_threshold = 0.74
-        hold_decay_threshold = 0.45
+    # Calibrated LN probability threshold matching standard 15-25% mania ratio
+    ln_threshold = 0.50 if star_rating < 4.0 else 0.45
 
     total_taps = 0
     total_lns = 0
 
     # Process each of the 4 keys independently with Lane-Locking & Sustain-Tracking
-    # Pure unconstrained mapping: all notes predicted by the model are emitted directly as-is
     for col in range(4):
-        busy_until_tick = -1
+        busy_until_ms = -1
 
         for i in range(num_ticks):
-            if i <= busy_until_tick:
-                # Lane is currently locked holding a Long Note; ignore collisions
-                continue
-
-            tok = generated_tokens[i] if i < len(generated_tokens) else 0
+            tok = generated_tokens[i]
             if tok <= 0:
                 continue
 
@@ -603,44 +606,39 @@ def generate_patterns_with_model3(
 
             tick_obj = ticks[i]
             t_ms = int(round(tick_obj.time_ms))
-            if t_ms >= duration_ms:
-                break
+            if t_ms <= busy_until_ms or t_ms >= duration_ms:
+                continue
 
-            cur_ln_prob = all_ln_probs[i][col] if i < len(all_ln_probs) else 0.0
-            is_potential_ln = (star_rating >= 1.8) and (cur_ln_prob >= ln_start_threshold)
+            cur_ln_prob = all_ln_probs[i][col]
+            is_potential_ln = (star_rating >= 1.5) and (cur_ln_prob >= ln_threshold)
 
             if is_potential_ln:
-                # Continuous State Machine: Trace sustain duration along audio frames
-                sustain_ticks = 0
-                k = i + 1
-                max_hold_ticks = min(num_ticks - i - 1, 32)  # max ~ 4 measures
-                
-                while sustain_ticks < max_hold_ticks:
-                    next_prob = all_ln_probs[k][col] if k < len(all_ln_probs) else 0.0
-                    next_tok = generated_tokens[k] if k < len(generated_tokens) else 0
-                    
-                    # Stop sustain if LN probability drops below decay threshold
-                    if next_prob < hold_decay_threshold:
-                        break
-                        
-                    # Stop sustain if a new distinct tap is struck on the same lane
-                    if (next_tok > 0) and (col in token_to_keys(next_tok)) and (next_prob < ln_start_threshold):
+                # Calculate hold duration from audio sustain or musical beat fractions
+                sustain_ms = estimate_ln_sustain_duration(
+                    tick_mel_tensor,
+                    start_frame=i,
+                    beat_len_ms=beat_len_ms,
+                    frame_ms=16.0,
+                )
+                if sustain_ms < 100:
+                    sustain_ms = int(round(beat_len_ms * (0.5 if star_rating >= 4.0 else 1.0)))
+
+                end_t_ms = t_ms + sustain_ms
+
+                # Prevent LN from overlapping next note on the same column
+                next_same_lane_ms = None
+                for nxt_i in range(i + 1, num_ticks):
+                    nxt_tok = generated_tokens[nxt_i]
+                    if nxt_tok > 0 and (col in token_to_keys(nxt_tok)):
+                        next_same_lane_ms = int(round(ticks[nxt_i].time_ms))
                         break
 
-                    sustain_ticks += 1
-                    k += 1
+                if next_same_lane_ms is not None:
+                    end_t_ms = min(end_t_ms, next_same_lane_ms - 40)
 
-                # If the note sustains across subsequent ticks, emit a calibrated Long Note
-                if sustain_ticks >= 1:
-                    release_tick = min(num_ticks - 1, i + sustain_ticks)
-                    raw_end_ms = ticks[release_tick].time_ms
-                    
-                    # Apply a safe 30ms release gap so fingers release before the next possible tick
-                    end_t_ms = max(t_ms + 75, int(round(raw_end_ms - 30.0)))
-                    busy_until_tick = release_tick
-                    last_note_end_ms = end_t_ms
+                if end_t_ms - t_ms >= 85:
+                    busy_until_ms = end_t_ms
                     total_lns += 1
-                    
                     hit_objects.append(
                         ManiaHitObject(
                             column=col,
@@ -651,15 +649,13 @@ def generate_patterns_with_model3(
                     )
                     continue
 
-            # Fallback to standard Single Tap
-            end_t_ms = t_ms
-            last_note_end_ms = t_ms
+            # Standard Tap Note
             total_taps += 1
             hit_objects.append(
                 ManiaHitObject(
                     column=col,
                     start_time=t_ms,
-                    end_time=end_t_ms,
+                    end_time=t_ms,
                     is_ln=False,
                 )
             )
