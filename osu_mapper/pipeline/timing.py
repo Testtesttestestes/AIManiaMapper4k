@@ -126,6 +126,7 @@ def generate_musical_grid_ticks_from_timing_points(
     default_offset_ms: float = 0.0,
     subdiv_binary: int = 8,   # 8 subdivisions per beat -> 1/1, 1/2, 1/4, 1/8 ticks
     subdiv_ternary: int = 6,  # 6 subdivisions per beat -> 1/1, 1/3, 1/6 ticks
+    universal_grid: bool = False, # If True, generates both binary & ternary subdivisions simultaneously
 ) -> List[MusicalGridTick]:
     """
     Constructs a deterministic sequence of musical grid decision points strictly aligned
@@ -166,61 +167,70 @@ def generate_musical_grid_ticks_from_timing_points(
         section_end_ms = min(max_duration + (tp_beat_len * 2.0), next_tp_time)
 
         bpm = 60000.0 / tp_beat_len
-        is_ternary = (tp_meter % 3 == 0)
-        subdivs = subdiv_ternary if is_ternary else subdiv_binary
-        step_ms = tp_beat_len / float(subdivs)
+        is_ternary_meter = (tp_meter % 3 == 0)
+
+        # In universal_grid mode, generate both binary and ternary passes to cover 1/4, 1/8 and 1/3, 1/6, 1/12
+        pass_configs = []
+        if universal_grid:
+            pass_configs.append((False, max(8, subdiv_binary)))
+            pass_configs.append((True, max(6, subdiv_ternary)))
+        else:
+            pass_configs.append((is_ternary_meter, subdiv_ternary if is_ternary_meter else subdiv_binary))
+
         bar_len_ms = tp_beat_len * float(tp_meter)
 
-        if idx == 0:
-            start_t = tp_time
-            while start_t > 0:
-                start_t -= bar_len_ms
-            current_t = start_t
-        else:
-            current_t = tp_time
+        for is_ternary, subdivs in pass_configs:
+            step_ms = tp_beat_len / float(subdivs)
 
-        while current_t < section_end_ms:
-            if current_t >= 0:
-                rel_t = current_t - tp_time
-                total_steps = round(rel_t / step_ms)
-                
-                steps_per_bar = subdivs * tp_meter
-                step_in_bar = total_steps % steps_per_bar
-                if step_in_bar < 0:
-                    step_in_bar += steps_per_bar
+            if idx == 0:
+                start_t = tp_time
+                while start_t > 0:
+                    start_t -= bar_len_ms
+                current_t = start_t
+            else:
+                current_t = tp_time
 
-                beat_in_measure = step_in_bar // subdivs
-                subdiv_idx = step_in_bar % subdivs
+            while current_t < section_end_ms:
+                if current_t >= 0:
+                    rel_t = current_t - tp_time
+                    total_steps = round(rel_t / step_ms)
+                    
+                    steps_per_bar = subdivs * tp_meter
+                    step_in_bar = total_steps % steps_per_bar
+                    if step_in_bar < 0:
+                        step_in_bar += steps_per_bar
 
-                if is_ternary:
-                    if subdiv_idx == 0:
-                        div = 1
-                        div_frac = 1.0
-                    elif subdiv_idx in (2, 4):
-                        div = 3
-                        div_frac = 1.0 / 3.0
+                    beat_in_measure = step_in_bar // subdivs
+                    subdiv_idx = step_in_bar % subdivs
+
+                    if is_ternary:
+                        if subdiv_idx == 0:
+                            div = 1
+                            div_frac = 1.0
+                        elif subdiv_idx in (2, 4):
+                            div = 3
+                            div_frac = 1.0 / 3.0
+                        else:
+                            div = 6
+                            div_frac = 1.0 / 6.0
                     else:
-                        div = 6
-                        div_frac = 1.0 / 6.0
-                else:
-                    if subdiv_idx == 0:
-                        div = 1
-                        div_frac = 1.0
-                    elif subdiv_idx == 4:
-                        div = 2
-                        div_frac = 0.5
-                    elif subdiv_idx in (2, 6):
-                        div = 4
-                        div_frac = 0.25
-                    else:
-                        div = 8
-                        div_frac = 0.125
+                        if subdiv_idx == 0:
+                            div = 1
+                            div_frac = 1.0
+                        elif subdiv_idx == 4:
+                            div = 2
+                            div_frac = 0.5
+                        elif subdiv_idx in (2, 6):
+                            div = 4
+                            div_frac = 0.25
+                        else:
+                            div = 8
+                            div_frac = 0.125
 
-                bar_phase = float(step_in_bar) / float(steps_per_bar)
-                is_downbeat = (step_in_bar == 0)
-                is_beat_start = (subdiv_idx == 0)
+                    bar_phase = float(step_in_bar) / float(steps_per_bar)
+                    is_downbeat = (step_in_bar == 0)
+                    is_beat_start = (subdiv_idx == 0)
 
-                if not ticks or abs(current_t - ticks[-1].time_ms) > (step_ms * 0.4):
                     ticks.append(
                         MusicalGridTick(
                             time_ms=round(current_t, 2),
@@ -239,10 +249,24 @@ def generate_musical_grid_ticks_from_timing_points(
                         )
                     )
 
-            current_t += step_ms
+                current_t += step_ms
 
+    # Deduplicate merged ticks (prioritize primary divisions: 1/1 > 1/2 > 1/4 > 1/3 > 1/6 > 1/8)
     ticks.sort(key=lambda t: t.time_ms)
-    return ticks
+    deduped_ticks: List[MusicalGridTick] = []
+    for t_obj in ticks:
+        if not deduped_ticks:
+            deduped_ticks.append(t_obj)
+        else:
+            prev = deduped_ticks[-1]
+            if abs(t_obj.time_ms - prev.time_ms) <= 2.0:
+                # If collision within 2ms, keep the more fundamental divisor (smaller divisor int)
+                if t_obj.divisor < prev.divisor:
+                    deduped_ticks[-1] = t_obj
+            else:
+                deduped_ticks.append(t_obj)
+
+    return deduped_ticks
 
 
 def snap_to_musical_grid(

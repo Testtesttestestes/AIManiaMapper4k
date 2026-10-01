@@ -43,6 +43,7 @@ def generate_beatmap_pipeline(
     note_conf_thresh: float = 0.0,
     ln_conf_thresh: float = 0.78,
     silence_gate: float = 0.0,
+    timing_mode: str = "soft_snap",
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
@@ -182,6 +183,7 @@ def generate_beatmap_pipeline(
                     note_conf_thresh=note_conf_thresh,
                     ln_conf_thresh=ln_conf_thresh,
                     silence_gate=silence_gate,
+                    timing_mode=timing_mode,
                 )
                 used_neural = True
                 print(f"✨ [Model 3 Transformer] Successfully generated {len(hit_objects)} neural hit objects.")
@@ -214,16 +216,61 @@ def generate_beatmap_pipeline(
         )
         packager = BeatmapPackager(meta)
         osu_str = packager.generate_osu_content(timing_points, hit_objects)
-        diff_packages.append((meta, osu_str))
-        osu_contents.append(osu_str)
 
-        # Exact rosu-pp Star Rating validation
+        # Initial rosu-pp Star Rating validation
         validated_sr = calculate_osu_mania_star_rating(
             osu_text=osu_str,
             keys=4,
             overall_difficulty=meta.overall_difficulty,
         )
         delta = validated_sr - sr
+
+        # Level 2: Closed-Loop Multi-Pass Difficulty Self-Refinement (Ornith Refinement Loop)
+        # If neural generation shows significant deviation from target difficulty, refine with adaptive feedback!
+        if used_neural and (delta < -0.35 or delta > 0.60):
+            print(f"  ⚡ [Ornith Refinement Pass 2] Target: {sr:.2f}* vs Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*). Initiating calibration & density elevation...")
+            # Compute calibrated target for Model 3's density controller
+            calibrated_sr = sr * ((sr / max(0.6, validated_sr)) ** 0.65)
+            calibrated_sr = min(16.0, max(1.0, calibrated_sr))
+            try:
+                refined_objects = generate_patterns_with_model3(
+                    checkpoint_path=m3_ckpt,
+                    audio_mel=mel,
+                    bpm=effective_bpm,
+                    offset_ms=effective_offset,
+                    duration_ms=audio_analysis.duration_ms,
+                    star_rating=calibrated_sr,
+                    timing_points=timing_points,
+                    temperature=temperature,
+                    top_p=top_p,
+                    greedy=greedy,
+                    note_conf_thresh=note_conf_thresh,
+                    ln_conf_thresh=ln_conf_thresh,
+                    silence_gate=silence_gate,
+                    timing_mode=timing_mode,
+                )
+                refined_osu = packager.generate_osu_content(timing_points, refined_objects)
+                refined_val_sr = calculate_osu_mania_star_rating(
+                    osu_text=refined_osu,
+                    keys=4,
+                    overall_difficulty=meta.overall_difficulty,
+                )
+                refined_delta = refined_val_sr - sr
+                # Accept refinement if it brought validated SR closer to target!
+                if abs(refined_delta) < abs(delta):
+                    print(f"  ✓ [Ornith Refinement] Pass 2 converged: {validated_sr:.2f}* -> {refined_val_sr:.2f}* (Delta: {refined_delta:+.2f}*)")
+                    hit_objects = refined_objects
+                    osu_str = refined_osu
+                    validated_sr = refined_val_sr
+                    delta = refined_delta
+                else:
+                    print(f"  ℹ️ [Ornith Refinement] Retaining Pass 1 (Pass 2 Delta: {refined_delta:+.2f}*)")
+            except Exception as ref_err:
+                print(f"  ⚠️ [Ornith Refinement] Refinement pass skipped: {ref_err}")
+
+        diff_packages.append((meta, osu_str))
+        osu_contents.append(osu_str)
+
         status_tag = "✓ EXACT" if abs(delta) <= 0.15 else ("~ CLOSE" if abs(delta) <= 0.40 else "⚠️ DEVIATION")
         print(f"  🔍 [rosu-pp Difficulty Validation] Target: {sr:.2f}* -> Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*) [{status_tag}]")
 
