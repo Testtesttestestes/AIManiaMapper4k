@@ -694,10 +694,14 @@ def generate_patterns_with_model3(
         # -------------------------------------------------------------
         new_cols = set(token_to_keys(tok))
 
+        # LN Sensitivity thresholds (controlled by --ln_conf)
+        effective_ln_start = max(0.08, min(0.90, float(ln_conf_thresh) if ln_conf_thresh is not None and ln_conf_thresh > 0 else 0.40))
+        effective_ln_hold = max(0.05, min(0.80, effective_ln_start * 0.75))
+
         # Check existing ongoing sliders: continue holding or unhold?
         for c in range(4):
             if active_ln_starts[c] is not None:
-                is_held = (new_lns[c] >= 0.35) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
+                is_held = (new_lns[c] >= effective_ln_hold) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 4.0)))
                 if is_held:
                     lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
                 else:
@@ -718,9 +722,13 @@ def generate_patterns_with_model3(
         for c in new_cols:
             if active_ln_starts[c] is None:
                 # If LN probability is strong, start a new slider
-                if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
+                if (star_rating >= 1.2) and (new_lns[c] >= effective_ln_start):
                     active_ln_starts[c] = cur_time_ms
                     lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
+                elif (effective_ln_start <= 0.35) and (cur_energy_ratio >= 0.70) and (ticks[cur_pos].is_downbeat or ticks[cur_pos].divisor <= 2):
+                    # Acoustic sustain boost for high-LN requests
+                    active_ln_starts[c] = cur_time_ms
+                    lane_states_seq[cur_pos, c] = 2
                 else:
                     # Standard Single Tap
                     hit_objects.append(

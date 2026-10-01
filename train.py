@@ -1251,20 +1251,40 @@ def train_model_3_self_improvement(
     print("=" * 65)
 
     cfg = TransformerConfig(
-        d_model=128,
-        nhead=4,
+        audio_dim=80,
+        d_model=256,
+        nhead=8,
         num_layers=4,
         dim_feedforward=512,
         num_classes=16,
         max_seq_len=512,
         dropout=0.1,
     )
+
+    # Check for existing checkpoint and auto-match architecture config if saved
+    base_ckpt = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
+    if base_ckpt:
+        try:
+            ckpt_peek = torch.load(base_ckpt, map_location="cpu", weights_only=False)
+            if isinstance(ckpt_peek, dict):
+                if "config" in ckpt_peek and isinstance(ckpt_peek["config"], TransformerConfig):
+                    cfg = ckpt_peek["config"]
+                elif "model_state" in ckpt_peek:
+                    ms = ckpt_peek["model_state"]
+                    for k in ["audio_proj.weight", "module.audio_proj.weight"]:
+                        if k in ms:
+                            detected_d = ms[k].shape[0]
+                            cfg.d_model = detected_d
+                            cfg.nhead = max(1, detected_d // 32)
+                            break
+        except Exception:
+            pass
+
     raw_model = ManiaPatternTransformer(cfg).to(device)
     model = wrap_model_multi_gpu(raw_model, device_ids or [])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr or 1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr or 5e-5, weight_decay=1e-4)
 
     # Load existing best weights
-    base_ckpt = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
     if base_ckpt:
         load_checkpoint_state(base_ckpt, model, optimizer=optimizer, device=device, override_lr=override_lr)
     else:
@@ -1317,57 +1337,80 @@ def train_model_3_self_improvement(
 
             B, T, C = c_logits.shape
 
-            # Sample two exploration rollouts:
-            # tau_A with T=0.7 (more exploratory)
-            # tau_B with T=0.35 (more greedy/conservative)
-            tau_A = torch.multinomial(F.softmax(c_logits / 0.70, dim=-1).view(-1, C), 1).view(B, T)
-            tau_B = torch.multinomial(F.softmax(c_logits / 0.35, dim=-1).view(-1, C), 1).view(B, T)
+            # 1. Contrastive Rollout Generation (Entropy-rich exploration vs Exploitation)
+            gumbel_noise = -torch.empty_like(c_logits).exponential_().log()
+            tau_A = (c_logits / 1.1 + gumbel_noise * 0.75).argmax(dim=-1)  # Exploratory rollout (T=1.1 + Gumbel noise)
+            tau_B = (c_logits / 0.35).argmax(dim=-1)                        # Greedy exploitative rollout (T=0.35)
 
-            # Automated Critic: Score rollouts based on Ground Truth & Acoustic Onset alignment
+            # 2. Honest Multi-Objective Critic (Rewards onsets & density, penalizes ghost notes & jacks)
             is_true_note = (tokens > 0)
-            true_count = is_true_note.sum(dim=1).clamp(min=1).float()
+            true_note_count = is_true_note.sum(dim=1).clamp(min=1).float()
 
-            recall_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / true_count
-            recall_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / true_count
+            # Active note recall (where human mapped a note)
+            recall_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / true_note_count
+            recall_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / true_note_count
 
-            exact_A = (tau_A == tokens).sum(dim=1).float() / float(T)
-            exact_B = (tau_B == tokens).sum(dim=1).float() / float(T)
+            # Note precision (penalize hallucinated ghost notes on silence)
+            pred_count_A = (tau_A > 0).sum(dim=1).clamp(min=1).float()
+            pred_count_B = (tau_B > 0).sum(dim=1).clamp(min=1).float()
+            prec_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / pred_count_A
+            prec_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / pred_count_B
 
-            # Jack penalty: repeated consecutive tokens on same lane
-            jacks_A = (tau_A[:, 1:] == tau_A[:, :-1]).float().mean(dim=1)
-            jacks_B = (tau_B[:, 1:] == tau_B[:, :-1]).float().mean(dim=1)
+            # Exact note match on active ticks
+            exact_active_A = (tau_A[is_true_note] == tokens[is_true_note]).float().mean() if is_true_note.any() else torch.tensor(1.0, device=device)
+            exact_active_B = (tau_B[is_true_note] == tokens[is_true_note]).float().mean() if is_true_note.any() else torch.tensor(1.0, device=device)
 
-            R_A = 2.0 * recall_A + 1.0 * exact_A - 0.4 * jacks_A
-            R_B = 2.0 * recall_B + 1.0 * exact_B - 0.4 * jacks_B
+            # Ergonomic Minijack Penalty (rapid consecutive strikes on same key)
+            jacks_A = ((tau_A[:, 1:] == tau_A[:, :-1]) & (tau_A[:, 1:] > 0)).float().mean(dim=1)
+            jacks_B = ((tau_B[:, 1:] == tau_B[:, :-1]) & (tau_B[:, 1:] > 0)).float().mean(dim=1)
 
-            # Build Winner & Loser tensors
+            R_A = 2.5 * recall_A + 1.5 * prec_A + 1.0 * exact_active_A - 0.8 * jacks_A
+            R_B = 2.5 * recall_B + 1.5 * prec_B + 1.0 * exact_active_B - 0.8 * jacks_B
+
+            # 3. Build Winner & Loser tensors with Ground Truth fallback
+            # If rollouts are identical, contrast the model rollout against Ground Truth (Ranked Map)
+            identical_mask = (tau_A == tau_B).all(dim=-1)
             win_mask = (R_A >= R_B)
+            
             tau_win = torch.where(win_mask.unsqueeze(1), tau_A, tau_B)
             tau_lose = torch.where(win_mask.unsqueeze(1), tau_B, tau_A)
 
-            # Gather log probs for winner and loser
-            log_p = F.log_softmax(c_logits, dim=-1)
-            log_p_win = log_p.gather(dim=-1, index=tau_win.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
-            log_p_lose = log_p.gather(dim=-1, index=tau_lose.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+            # When model rollouts collapse to identical sequences, pair with Ground Truth Winner
+            if identical_mask.any():
+                tau_win = torch.where(identical_mask.unsqueeze(1), tokens, tau_win)
 
-            # DPO loss
-            diff = beta_dpo * (log_p_win - log_p_lose)
+            # 4. Active Note Masking for DPO (Prevent 470 silent ticks from diluting log-probs by 15x)
+            active_mask = (tau_win > 0) | (tau_lose > 0) | (tokens > 0)
+            active_ticks = active_mask.sum(dim=-1).clamp(min=1).float()
+
+            log_p = F.log_softmax(c_logits, dim=-1)
+            log_p_win = (log_p.gather(dim=-1, index=tau_win.unsqueeze(-1)).squeeze(-1) * active_mask).sum(dim=-1) / active_ticks
+            log_p_lose = (log_p.gather(dim=-1, index=tau_lose.unsqueeze(-1)).squeeze(-1) * active_mask).sum(dim=-1) / active_ticks
+
+            # 5. DPO Loss with scaled beta
+            diff = (beta_dpo * 5.0) * (log_p_win - log_p_lose)
             loss_dpo = -F.logsigmoid(diff).mean()
 
-            # Supervised Cross-Entropy Teacher-Forcing Loss (anchors core vocabulary)
+            # 6. Policy Entropy Regularization (Prevents policy entropy collapse into flat plateaus)
+            probs = F.softmax(c_logits, dim=-1)
+            entropy = - (probs * log_p).sum(dim=-1).mean()
+
+            # 7. Supervised Cross-Entropy Teacher-Forcing Loss
             loss_sft = F.cross_entropy(c_logits.view(B * T, C), tokens.view(B * T))
 
-            loss = loss_sft + 0.3 * loss_dpo
+            # Total Multi-Objective Self-Improvement Loss
+            loss = loss_sft + 0.4 * loss_dpo - 0.005 * entropy
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
 
+            margin = torch.where(identical_mask, torch.tensor(0.5, device=device), (R_A - R_B).abs()).mean().item()
             total_loss += loss.item() * B
             total_dpo += loss_dpo.item() * B
             total_sft += loss_sft.item() * B
-            total_win_margin += (R_A - R_B).abs().mean().item()
+            total_win_margin += margin
             batch_count += 1
 
         elapsed = time.time() - start_t
