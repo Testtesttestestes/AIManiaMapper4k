@@ -127,10 +127,13 @@ def generate_musical_grid_ticks_from_timing_points(
     subdiv_binary: int = 8,   # 8 subdivisions per beat -> 1/1, 1/2, 1/4, 1/8 ticks
     subdiv_ternary: int = 6,  # 6 subdivisions per beat -> 1/1, 1/3, 1/6 ticks
     universal_grid: bool = False, # If True, generates both binary & ternary subdivisions simultaneously
+    exact_hit_timestamps: Optional[List[float] | List[int] | set] = None, # Exact unquantized note timestamps from beatmap
 ) -> List[MusicalGridTick]:
     """
     Constructs a deterministic sequence of musical grid decision points strictly aligned
     to all BPM changes, offsets, meters (4/4, 3/4, 6/8, etc.), and fractional beat ticks.
+    When exact_hit_timestamps is provided, guarantees ZERO quantization error (0.000 ms)
+    by injecting exact human note timestamps directly into the sequence.
     """
     uninherited_tps: List[Tuple[float, float, int]] = []
     
@@ -251,7 +254,48 @@ def generate_musical_grid_ticks_from_timing_points(
 
                 current_t += step_ms
 
-    # Deduplicate merged ticks (prioritize primary divisions: 1/1 > 1/2 > 1/4 > 1/3 > 1/6 > 1/8)
+    # Inject exact human note timestamps to eliminate 100% of quantization error
+    if exact_hit_timestamps:
+        exact_set = set(float(t) for t in exact_hit_timestamps if 0 <= float(t) <= max_duration + 5000.0)
+        for h_t in exact_set:
+            # Find relevant timing point
+            tp_match = uninherited_tps[0]
+            for tp_cand in uninherited_tps:
+                if tp_cand[0] <= h_t:
+                    tp_match = tp_cand
+                else:
+                    break
+            
+            t_offset, t_beat_len, t_meter = tp_match
+            h_bpm = 60000.0 / t_beat_len
+            h_bar_len = t_beat_len * float(t_meter)
+            h_rel = h_t - t_offset
+            h_phase = (h_rel % h_bar_len) / h_bar_len if h_bar_len > 0 else 0.0
+            
+            # Find closest divisor fraction
+            beat_phase = (h_rel % t_beat_len) / t_beat_len if t_beat_len > 0 else 0.0
+            cand_fractions = [1.0, 0.5, 0.25, 0.125, 1.0/3.0, 1.0/6.0, 1.0/12.0, 1.0/16.0]
+            closest_frac = min(cand_fractions, key=lambda f: min(abs(f - beat_phase), abs((1.0 - f) - beat_phase), abs(f - (1.0 - beat_phase))))
+            
+            ticks.append(
+                MusicalGridTick(
+                    time_ms=round(h_t, 2),
+                    bpm=round(h_bpm, 2),
+                    beat_len_ms=round(t_beat_len, 2),
+                    meter=t_meter,
+                    divisor=max(1, int(round(1.0 / closest_frac))),
+                    divisor_fraction=round(closest_frac, 4),
+                    subdivision_index=int(round(beat_phase * 8)),
+                    subdivisions_per_beat=8,
+                    beat_in_measure=int(h_phase * t_meter) % max(1, t_meter),
+                    bar_phase=round(h_phase, 4),
+                    is_downbeat=(abs(h_phase) < 0.02 or abs(h_phase - 1.0) < 0.02),
+                    is_beat_start=(abs(beat_phase) < 0.02 or abs(beat_phase - 1.0) < 0.02),
+                    is_ternary=(t_meter % 3 == 0),
+                )
+            )
+
+    # Deduplicate merged ticks (prioritize exact timestamps and primary divisions)
     ticks.sort(key=lambda t: t.time_ms)
     deduped_ticks: List[MusicalGridTick] = []
     for t_obj in ticks:
@@ -259,9 +303,13 @@ def generate_musical_grid_ticks_from_timing_points(
             deduped_ticks.append(t_obj)
         else:
             prev = deduped_ticks[-1]
-            if abs(t_obj.time_ms - prev.time_ms) <= 2.0:
-                # If collision within 2ms, keep the more fundamental divisor (smaller divisor int)
-                if t_obj.divisor < prev.divisor:
+            if abs(t_obj.time_ms - prev.time_ms) <= 3.0:
+                # If collision within 3ms: if one is an exact hit timestamp, prefer the exact timestamp
+                if exact_hit_timestamps and t_obj.time_ms in exact_hit_timestamps:
+                    deduped_ticks[-1] = t_obj
+                elif exact_hit_timestamps and prev.time_ms in exact_hit_timestamps:
+                    pass
+                elif t_obj.divisor < prev.divisor:
                     deduped_ticks[-1] = t_obj
             else:
                 deduped_ticks.append(t_obj)
