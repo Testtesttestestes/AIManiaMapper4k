@@ -384,11 +384,14 @@ def quantize_beatmap_to_grid(
     audio_mel: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[MusicalGridTick]]:
     duration_ms = float(num_frames * frame_ms)
+    # Collect all exact unquantized note start & end timestamps from human beatmap
+    exact_stamps = [float(h[1]) for h in details.hit_objects] + [float(h[2]) for h in details.hit_objects if h[3]]
     ticks = generate_musical_grid_ticks_from_timing_points(
         timing_points=details.timing_points,
         duration_ms=duration_ms,
         default_bpm=details.bpm,
         default_offset_ms=details.offset_ms,
+        exact_hit_timestamps=exact_stamps,
     )
 
     num_ticks = len(ticks)

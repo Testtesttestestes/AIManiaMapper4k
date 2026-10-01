@@ -650,19 +650,21 @@ def train_model_3_transformer(
                 loss_ln = criterion_ln(ln_logits, ln_mask)
                 # 4. Difficulty consistency loss
                 loss_sr = F.smooth_l1_loss(pred_sr, star_rating)
-                # 5. Note-Focused Continuous Time-Delta Loss (\Delta t step forward in ms)
+                # 5. Note-Focused Continuous Time-Delta Loss with Asymmetric Leap & Note-Skipping Penalty
                 is_note_mask = (tokens > 0)
                 if is_note_mask.any():
-                    loss_delta_notes = F.smooth_l1_loss(pred_time_deltas[is_note_mask], target_time_deltas[is_note_mask])
-                    loss_delta_log = F.smooth_l1_loss(
-                        torch.log1p(pred_time_deltas[is_note_mask]),
-                        torch.log1p(target_time_deltas[is_note_mask])
-                    )
-                    loss_delta = loss_delta_notes + 5.0 * loss_delta_log
+                    p_dt = pred_time_deltas[is_note_mask]
+                    t_dt = target_time_deltas[is_note_mask]
+                    loss_delta_l1 = F.smooth_l1_loss(p_dt, t_dt)
+                    loss_delta_log = F.smooth_l1_loss(torch.log1p(p_dt), torch.log1p(t_dt))
+                    # Asymmetric leap penalty: heavily penalize overshooting (jumping over / skipping upcoming notes)
+                    overshoot = F.relu(p_dt - t_dt)
+                    loss_overshoot = (overshoot ** 2 / (t_dt + 20.0)).mean()
+                    loss_delta = loss_delta_l1 + 3.0 * loss_delta_log + 2.5 * loss_overshoot
                 else:
                     loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
 
-                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.05 * loss_delta
+                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.25 * loss_delta
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -1364,8 +1366,12 @@ def train_model_3_self_improvement(
             jacks_A = ((tau_A[:, 1:] == tau_A[:, :-1]) & (tau_A[:, 1:] > 0)).float().mean(dim=1)
             jacks_B = ((tau_B[:, 1:] == tau_B[:, :-1]) & (tau_B[:, 1:] > 0)).float().mean(dim=1)
 
-            R_A = 2.5 * recall_A + 1.5 * prec_A + 1.0 * exact_active_A - 0.8 * jacks_A
-            R_B = 2.5 * recall_B + 1.5 * prec_B + 1.0 * exact_active_B - 0.8 * jacks_B
+            # Heavy Note-Skipping / Leap Penalty: Strictly punish rollouts that omit or jump over human notes
+            missed_A = ((tau_A == 0) & is_true_note).sum(dim=1).float() / true_note_count
+            missed_B = ((tau_B == 0) & is_true_note).sum(dim=1).float() / true_note_count
+
+            R_A = 3.0 * recall_A + 1.5 * prec_A + 1.0 * exact_active_A - 0.8 * jacks_A - 3.5 * missed_A
+            R_B = 3.0 * recall_B + 1.5 * prec_B + 1.0 * exact_active_B - 0.8 * jacks_B - 3.5 * missed_B
 
             # 3. Build Winner & Loser tensors with Ground Truth fallback
             # If rollouts are identical, contrast the model rollout against Ground Truth (Ranked Map)
