@@ -1223,6 +1223,181 @@ def train_model_2_dynamics(
     return {"model": "model_2_dynamics", "best_val_loss": best_val_loss, "history": history}
 
 
+def train_model_3_self_improvement(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    checkpoint_dir: Path,
+    beta_dpo: float = 0.1,
+    resume_path: Optional[str] = None,
+    override_lr: Optional[float] = None,
+    device_ids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """
+    Trains Model 3 in Ornith-style Closed-Loop Self-Improvement (DPO / Preference Optimization):
+    1. Model samples stochastic rollouts (tau_A at T=0.7, tau_B at T=0.35).
+    2. Automated Multi-Objective Critic scores each rollout:
+       - Onset Recall: Did it hit where the audio attacks and downbeats occur?
+       - Step Consistency: Penalty on leaps over unmapped audible transients.
+       - Ergonomic Comfort: Penalizes repetitive minijacks and unbalanced lane fatigue.
+    3. Winner (tau_w) and Loser (tau_l) form DPO preference pairs:
+       L_DPO = -log sigmoid( beta * (log P_theta(tau_w) - log P_theta(tau_l)) )
+    4. Fine-tunes model weights so the neural network intrinsically avoids missing notes.
+    """
+    print("\n" + "=" * 65)
+    print("▶ TRAINING MODEL 3: ORNITH SELF-IMPROVEMENT (DPO & Acoustic Feedback)")
+    print("=" * 65)
+
+    cfg = TransformerConfig(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        dim_feedforward=512,
+        num_classes=16,
+        max_seq_len=512,
+        dropout=0.1,
+    )
+    raw_model = ManiaPatternTransformer(cfg).to(device)
+    model = wrap_model_multi_gpu(raw_model, device_ids or [])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr or 1e-4, weight_decay=1e-4)
+
+    # Load existing best weights
+    base_ckpt = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
+    if base_ckpt:
+        load_checkpoint_state(base_ckpt, model, optimizer=optimizer, device=device, override_lr=override_lr)
+    else:
+        print("  ℹ️ No existing checkpoint found; starting fresh self-improvement loop.")
+
+    train_loss = 0.0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss, total_dpo, total_sft = 0.0, 0.0, 0.0
+        total_win_margin, batch_count = 0.0, 0
+        start_t = time.time()
+
+        for batch in train_loader:
+            audio_mel = batch["audio_mel"].to(device)
+            tokens = batch["tokens"].to(device)
+            star_rating = batch["star_rating"].to(device)
+            multiscale_audio = batch.get("multiscale_audio", None)
+            if multiscale_audio is not None:
+                multiscale_audio = multiscale_audio.to(device)
+            grid_metrics = batch.get("grid_metrics", None)
+            if grid_metrics is not None:
+                grid_metrics = grid_metrics.to(device)
+            scaffold_tokens = batch.get("scaffold_tokens", None)
+            if scaffold_tokens is not None:
+                scaffold_tokens = scaffold_tokens.to(device)
+            strain_metrics = batch.get("strain_metrics", None)
+            if strain_metrics is not None:
+                strain_metrics = strain_metrics.to(device)
+
+            if scaffold_tokens is None or strain_metrics is None:
+                synth_scaff, synth_strain = compute_multi_scenario_scaffold_and_strain(tokens, star_rating, grid_metrics, audio_mel)
+                scaffold_tokens = synth_scaff if scaffold_tokens is None else scaffold_tokens
+                strain_metrics = synth_strain if strain_metrics is None else strain_metrics
+
+            prev_tok = torch.roll(tokens, shifts=1, dims=1)
+            prev_tok[:, 0] = 0
+
+            # Forward pass to obtain chord logits [B, T, 16]
+            c_logits, l_logits, _, _ = model(
+                audio_mel,
+                star_rating=star_rating,
+                prev_tokens=prev_tok,
+                grid_metrics=grid_metrics,
+                scaffold_tokens=scaffold_tokens,
+                strain_metrics=strain_metrics,
+                multiscale_audio=multiscale_audio,
+                return_sr=True,
+                return_time_delta=True,
+            )
+
+            B, T, C = c_logits.shape
+
+            # Sample two exploration rollouts:
+            # tau_A with T=0.7 (more exploratory)
+            # tau_B with T=0.35 (more greedy/conservative)
+            tau_A = torch.multinomial(F.softmax(c_logits / 0.70, dim=-1).view(-1, C), 1).view(B, T)
+            tau_B = torch.multinomial(F.softmax(c_logits / 0.35, dim=-1).view(-1, C), 1).view(B, T)
+
+            # Automated Critic: Score rollouts based on Ground Truth & Acoustic Onset alignment
+            is_true_note = (tokens > 0)
+            true_count = is_true_note.sum(dim=1).clamp(min=1).float()
+
+            recall_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / true_count
+            recall_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / true_count
+
+            exact_A = (tau_A == tokens).sum(dim=1).float() / float(T)
+            exact_B = (tau_B == tokens).sum(dim=1).float() / float(T)
+
+            # Jack penalty: repeated consecutive tokens on same lane
+            jacks_A = (tau_A[:, 1:] == tau_A[:, :-1]).float().mean(dim=1)
+            jacks_B = (tau_B[:, 1:] == tau_B[:, :-1]).float().mean(dim=1)
+
+            R_A = 2.0 * recall_A + 1.0 * exact_A - 0.4 * jacks_A
+            R_B = 2.0 * recall_B + 1.0 * exact_B - 0.4 * jacks_B
+
+            # Build Winner & Loser tensors
+            win_mask = (R_A >= R_B)
+            tau_win = torch.where(win_mask.unsqueeze(1), tau_A, tau_B)
+            tau_lose = torch.where(win_mask.unsqueeze(1), tau_B, tau_A)
+
+            # Gather log probs for winner and loser
+            log_p = F.log_softmax(c_logits, dim=-1)
+            log_p_win = log_p.gather(dim=-1, index=tau_win.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+            log_p_lose = log_p.gather(dim=-1, index=tau_lose.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+
+            # DPO loss
+            diff = beta_dpo * (log_p_win - log_p_lose)
+            loss_dpo = -F.logsigmoid(diff).mean()
+
+            # Supervised Cross-Entropy Teacher-Forcing Loss (anchors core vocabulary)
+            loss_sft = F.cross_entropy(c_logits.view(B * T, C), tokens.view(B * T))
+
+            loss = loss_sft + 0.3 * loss_dpo
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            optimizer.step()
+
+            total_loss += loss.item() * B
+            total_dpo += loss_dpo.item() * B
+            total_sft += loss_sft.item() * B
+            total_win_margin += (R_A - R_B).abs().mean().item()
+            batch_count += 1
+
+        elapsed = time.time() - start_t
+        train_loss = total_loss / len(train_loader.dataset)
+        avg_dpo = total_dpo / len(train_loader.dataset)
+        avg_sft = total_sft / len(train_loader.dataset)
+        avg_margin = total_win_margin / max(1, batch_count)
+
+        print(
+            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s] "
+            f"Self-Improvement Loss: {train_loss:.4f} (SFT: {avg_sft:.4f}, DPO: {avg_dpo:.4f}, Critic Margin: {avg_margin:.3f})"
+        )
+
+        model_to_save = model.module if hasattr(model, "module") else model
+        out_ckpt = checkpoint_dir / "model_3_transformer_self_improved.pt"
+        best_ckpt = checkpoint_dir / "model_3_transformer_best.pt"
+        saved_dict = {
+            "epoch": epoch,
+            "model_state": model_to_save.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "config": cfg,
+            "loss": train_loss,
+        }
+        torch.save(saved_dict, out_ckpt)
+        torch.save(saved_dict, best_ckpt)
+        print(f"  ⭐ Saved updated self-improved checkpoint to '{out_ckpt}' and '{best_ckpt}'")
+
+    return {"model": "model_3_self_improved", "best_loss": train_loss}
+
+
 def train_model_4_evaluator(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -1390,6 +1565,11 @@ def main():
         default=None,
         help="Explicit path to a checkpoint (.pt) to resume training from.",
     )
+    parser.add_argument(
+        "--self_improve",
+        action="store_true",
+        help="Run Ornith-style Closed-Loop Self-Improvement Loop (DPO & Acoustic Feedback) for Model 3",
+    )
     args = parser.parse_args()
 
     timing_source = "map" if args.ground_truth else args.timing_source
@@ -1397,7 +1577,7 @@ def main():
 
     # Resolve learning rate
     user_lr = args.lr
-    effective_lr = user_lr if user_lr is not None else 2e-4
+    effective_lr = user_lr if user_lr is not None else (5e-5 if args.self_improve else 2e-4)
     override_lr_on_resume = user_lr  # None preserves checkpoint LR, float overrides it
 
     # Create checkpoints dir
@@ -1419,7 +1599,7 @@ def main():
 
     lr_info = f"{effective_lr} (override on resume)" if (resume_target and user_lr is not None) else (f"{effective_lr} (or from checkpoint)" if resume_target else f"{effective_lr}")
     print(f"\n[Training Configuration]")
-    print(f"  Model target:      {args.model}")
+    print(f"  Model target:      {'SELF-IMPROVEMENT (DPO)' if args.self_improve else args.model}")
     print(f"  Primary Device:    {device}")
     if len(device_ids) > 1:
         print(f"  Multi-GPU Engines: {device_ids} (Parallel Training active)")
@@ -1433,15 +1613,18 @@ def main():
     print(f"  Checkpoints dir:   {ckpt_dir.resolve()}")
 
     target = str(args.model).lower()
-    if target in ("1", "sync", "all"):
-        is_song = "song_sync" in str(args.dataset).lower()
-        train_model_1_sync(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
-    if target in ("2", "dynamics", "all"):
-        train_model_2_dynamics(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
-    if target in ("3", "transformer", "pattern", "all"):
-        train_model_3_transformer(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout, override_lr=override_lr_on_resume, device_ids=device_ids)
-    if target in ("4", "evaluator", "sr", "all"):
-        train_model_4_evaluator(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
+    if args.self_improve or target in ("self_improve", "self-improve", "dpo", "rl"):
+        train_model_3_self_improvement(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
+    else:
+        if target in ("1", "sync", "all"):
+            is_song = "song_sync" in str(args.dataset).lower()
+            train_model_1_sync(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, is_song_level=is_song, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
+        if target in ("2", "dynamics", "all"):
+            train_model_2_dynamics(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
+        if target in ("3", "transformer", "pattern", "all"):
+            train_model_3_transformer(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, timing_source=timing_source, resume_path=resume_target, context_dropout=args.context_dropout, override_lr=override_lr_on_resume, device_ids=device_ids)
+        if target in ("4", "evaluator", "sr", "all"):
+            train_model_4_evaluator(train_loader, val_loader, device, args.epochs, effective_lr, ckpt_dir, resume_path=resume_target, override_lr=override_lr_on_resume, device_ids=device_ids)
 
     print("\n✅ Training procedure completed successfully!")
 

@@ -306,6 +306,17 @@ def main():
     parser.add_argument("--conf", "--confidence", type=float, default=0.0, help="Active Note Confidence Threshold P(active) in [0.0..1.0] (default: 0.0, unconstrained raw neural logits).")
     parser.add_argument("--silence", "--silence_gate", type=float, default=0.0, help="Acoustic silence noise gate threshold (default: 0.0, zero artificial gating).")
     parser.add_argument("--ln_conf", "--ln-thresh", type=float, default=0.78, help="Long Note sustain threshold (default: 0.78)")
+    parser.add_argument(
+        "--timing_mode",
+        type=str,
+        choices=["soft_snap", "universal_grid", "residual", "quantized"],
+        default="soft_snap",
+        help="Timing advancement & snapping paradigm: "
+             "'soft_snap' (continuous model step with gentle magnetic lock to any divisor, ideal for vocal rubato), "
+             "'universal_grid' (universal multi-divisor discrete grid: 1/1, 1/2, 1/3, 1/4, 1/6, 1/8, 1/12, 1/16 without 1/8 restriction), "
+             "'residual' (macro meter anchor + continuous micro-timing residual offset), "
+             "'quantized' (legacy rigid 1/8 binary quantization baseline). Default: soft_snap.",
+    )
 
     args = parser.parse_args()
 
@@ -435,6 +446,7 @@ def main():
     print(f"  • Artist:         {final_artist}")
     print(f"  • Difficulties:   {len(sr_list)} diff(s) -> [{sr_display}]")
     print(f"  • Generation Mode:{mode_display}")
+    print(f"  • Timing / Snap:  {args.timing_mode.upper()} ({'Continuous + Magnetic Snap' if args.timing_mode == 'soft_snap' else ('Universal Multi-Divisor Grid' if args.timing_mode == 'universal_grid' else ('Macro Anchor + Residual Offset' if args.timing_mode == 'residual' else 'Legacy 1/8 Binary Snapping'))})")
     print(f"  • BPM:            {f'{final_bpm:.2f} (Preset/Manual)' if final_bpm else 'Auto Sync Inference'}")
     print(f"  • Offset:         {f'{final_offset} ms (Preset/Manual)' if final_offset is not None else 'Auto Sync Inference'}")
     print(f"  • Model 3 Weights:{args.model3_checkpoint or 'Auto (checkpoints/model_3_transformer_best.pt)'}")
@@ -464,6 +476,7 @@ def main():
             note_conf_thresh=args.conf,
             ln_conf_thresh=args.ln_conf,
             silence_gate=args.silence,
+            timing_mode=args.timing_mode,
         )
 
         print("\n" + "=" * 65)
