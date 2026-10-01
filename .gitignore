@@ -20,6 +20,7 @@ sdist/
 var/
 wheels/
 *.egg-info/
+ffmpeg/ffmpeg.exe
 
 # PyTorch checkpoints and heavy datasets
 *.pt
@@ -37,3 +38,4 @@ node_modules/
 dist/
 .vite/
 *.log
+ffmpeg/ffmpeg.exe

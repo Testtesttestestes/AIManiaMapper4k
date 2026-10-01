@@ -1,0 +1,6 @@
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0,4.5,5,5.5 --neural
+
+
+python generate_beatmap.py --template "C:\path\to\map.osz" --sr 3.5,5.0 --neural --timing_mode residual
+
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\ANOTR - Topic - Talk To You (ft 54 Ultra) (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0 --neural --timing_mode quantized
