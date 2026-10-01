@@ -305,7 +305,7 @@ def main():
     parser.add_argument("--greedy", action="store_true", help="Force deterministic ArgMax decoding")
     parser.add_argument("--conf", "--confidence", type=float, default=0.0, help="Active Note Confidence Threshold P(active) in [0.0..1.0] (default: 0.0, unconstrained raw neural logits).")
     parser.add_argument("--silence", "--silence_gate", type=float, default=0.0, help="Acoustic silence noise gate threshold (default: 0.0, zero artificial gating).")
-    parser.add_argument("--ln_conf", "--ln-thresh", type=float, default=0.78, help="Long Note sustain threshold (default: 0.78)")
+    parser.add_argument("--ln_conf", "--ln-thresh", "--ln", type=float, default=0.35, help="Long Note (slider) activation threshold: 0.20=dense LN, 0.35=balanced (default), 0.70=very few LN")
     parser.add_argument(
         "--timing_mode",
         type=str,
