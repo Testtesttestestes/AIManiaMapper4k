@@ -511,8 +511,8 @@ def generate_patterns_with_model3(
     effective_ln_thresh = float(ln_conf_thresh) if (ln_conf_thresh is not None and ln_conf_thresh > 0) else 0.40
 
     # Effective active note threshold calibrated to Star Rating (prevents long empty gaps)
-    # At 3.6*, calibrated_thresh is ~0.22, meaning if Model 3 sees >=22% note probability, it places the note!
-    calibrated_active_thresh = max(0.08, min(0.35, 0.38 - (float(star_rating) - 1.0) * 0.055))
+    # At 3.6*, calibrated_thresh is ~0.18, meaning if Model 3 sees >=18% note probability, it places the note!
+    calibrated_active_thresh = max(0.08, min(0.28, 0.28 - (float(star_rating) - 1.0) * 0.04))
     if note_conf_thresh is not None and note_conf_thresh > 0:
         calibrated_active_thresh = float(note_conf_thresh)
 
@@ -586,6 +586,10 @@ def generate_patterns_with_model3(
             probs_raw = F.softmax(step_c_logits, dim=-1)
             p_active = float((1.0 - probs_raw[0]).item())
 
+            # Scaffold guidance: if scaffold has an acoustic onset or it's a downbeat, lower the threshold so verses are never empty!
+            has_scaff = (int(window_scaffold[0, -1].item()) > 0) or t_obj.is_downbeat or (t_obj.is_beat_start and star_rating >= 2.5)
+            effective_thresh = max(0.08, calibrated_active_thresh * 0.70) if has_scaff else calibrated_active_thresh
+
             # Decide note presence based on neural active probability:
             is_physically_too_close = (cur_time_ms - last_placed_note_ms) < (min_tick_gap_ms - 5.0)
 
@@ -593,7 +597,7 @@ def generate_patterns_with_model3(
                 tok = 0
             elif step_c_logits.argmax().item() > 0:
                 tok = int(step_c_logits.argmax().item())
-            elif p_active >= calibrated_active_thresh:
+            elif p_active >= effective_thresh:
                 # Active note detected by model
                 tok = int(step_c_logits[1:].argmax().item()) + 1
             else:
