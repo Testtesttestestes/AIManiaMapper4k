@@ -619,71 +619,78 @@ def generate_patterns_with_model3(
             active_logits = cur_chord_logits.clone()
             active_logits[0] = -1e9  # Suppress idle class at hit anchors
 
-            # In Stochastic Sampling Mode (temperature > 0.05), apply ergonomic guardrails
-            # In Greedy / Pure Neural Mode (matching Validation), trust the 91.4% exact neural logits directly!
-            if not greedy and eff_temp > 0.05:
-                # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
-                is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
-                prev_tok = active_notes_history[-1] if active_notes_history else 0
-                prev_k = bin(prev_tok).count("1")
+            # Ergonomic Guardrails: Prevents infinite 2-key cycles and enforces human playability
+            # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
+            is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
+            prev_tok = active_notes_history[-1] if active_notes_history else 0
+            prev_k = bin(prev_tok).count("1")
 
-                for t_i in range(1, 16):
-                    k_cnt = bin(t_i).count("1")
-                    if star_rating < 2.0 and k_cnt > 1:
-                        active_logits[t_i] = -1e9
-                    elif star_rating < 3.5 and k_cnt > 2:
-                        active_logits[t_i] = -1e9
-                    elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
-                        active_logits[t_i] = -1e9
-                    elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
-                        # Quads only on heavy downbeats for 6.0*+
-                        active_logits[t_i] = -1e9
+            for t_i in range(1, 16):
+                k_cnt = bin(t_i).count("1")
+                if star_rating < 2.0 and k_cnt > 1:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 3.5 and k_cnt > 2:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
+                    active_logits[t_i] = -1e9
+                elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
+                    # Quads only on heavy downbeats for 6.0*+
+                    active_logits[t_i] = -1e9
 
-                    # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
-                    if star_rating >= 5.0 and k_cnt >= 2:
-                        active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
+                # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
+                if star_rating >= 5.0 and k_cnt >= 2:
+                    active_logits[t_i] += min(6.0, (float(star_rating) - 4.0) * 0.8)
 
-                    # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
-                    if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
-                        active_logits[t_i] -= 8.0
+                # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
+                if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
+                    active_logits[t_i] -= 4.0
 
-                # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
-                if len(active_notes_history) >= 4:
-                    if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
-                        active_logits[active_notes_history[-1]] -= 12.0
-                        active_logits[active_notes_history[-2]] -= 12.0
+            # 2. Anti-Trill Limiter: Strictly breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            if len(active_notes_history) >= 4:
+                if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
+                    active_logits[active_notes_history[-1]] -= 8.0
+                    active_logits[active_notes_history[-2]] -= 8.0
 
-                # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
-                if len(active_notes_history) >= 2 and star_rating < 8.0:
-                    if active_notes_history[-1] == active_notes_history[-2]:
-                        active_logits[active_notes_history[-1]] -= 15.0
+            # 3. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on fast streams
+            if len(active_notes_history) >= 2 and star_rating < 8.0:
+                if active_notes_history[-1] == active_notes_history[-2]:
+                    active_logits[active_notes_history[-1]] -= 10.0
 
-                # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
-                recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
-                if recent_active:
-                    lane_usage = [0, 0, 0, 0]
-                    for tok_val in recent_active:
-                        for c in token_to_keys(tok_val):
-                            lane_usage[c] += 1
-                    for c in range(4):
-                        if lane_usage[c] >= 6:
-                            for t_cand in range(1, 16):
-                                if (t_cand >> c) & 1:
-                                    active_logits[t_cand] -= 4.0
+            # 4. Ergonomic 4-Lane Balance: Prevents over-clustering on middle lanes
+            recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
+            if recent_active:
+                lane_usage = [0, 0, 0, 0]
+                for tok_val in recent_active:
+                    for c in token_to_keys(tok_val):
+                        lane_usage[c] += 1
+                for c in range(4):
+                    if lane_usage[c] >= 6:
+                        for t_cand in range(1, 16):
+                            if (t_cand >> c) & 1:
+                                active_logits[t_cand] -= 4.0
 
-            # Physical impossibility: Discourage new taps on lanes currently occupied by a held slider
+            # Physical impossibility: Never tap on a lane currently held as a slider
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     for t_cand in range(1, 16):
                         if (t_cand >> c) & 1:
                             active_logits[t_cand] = -1e9
 
-            eff_temp = 0.35 if (temperature <= 0.05 and not greedy) else max(0.1, temperature)
-            if greedy or (temperature <= 0.05):
+            eff_temp = max(0.20, min(0.60, float(temperature) if temperature > 0.0 else 0.35))
+            if greedy:
                 tok = int(active_logits.argmax().item())
             else:
                 scaled = active_logits / eff_temp
                 probs = F.softmax(scaled, dim=-1)
+                # Nucleus Top-P filtering
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                probs[indices_to_remove] = 0.0
+                probs = probs / probs.sum().clamp(min=1e-8)
                 tok = int(torch.multinomial(probs, 1).item())
 
             new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()
@@ -798,15 +805,15 @@ def generate_patterns_with_model3(
             target_next_pos = max(cur_pos + 1, best_idx)
 
         elif timing_mode_norm in ("universal_grid", "hybrid_grid", "universal"):
-            # Mode 2: Universal Multi-Divisor Grid (Binary + Ternary simultaneous: 1/1, 1/2, 1/3, 1/4, 1/6, 1/8, 1/12, 1/16)
+            # Mode 2: Universal Multi-Divisor Grid (Binary + Ternary simultaneous: 1/1, 1/2, 1/3, 1/4, 1/6, 1/8)
             if star_rating < 2.5:
-                cand_divs = [1.0, 0.5, 0.3333]
-            elif star_rating < 4.0:
-                cand_divs = [0.5, 0.3333, 0.25, 0.1667]
-            elif star_rating < 6.0:
-                cand_divs = [0.3333, 0.25, 0.1667, 0.125] if has_dense_drop else [0.5, 0.3333, 0.25]
-            elif star_rating < 9.0:
-                cand_divs = [0.25, 0.1667, 0.125, 0.0833]
+                cand_divs = [2.0, 1.0] if is_calm_section else [1.0, 0.5]
+            elif star_rating < 3.8:
+                cand_divs = [0.5, 0.25] if has_dense_drop else [1.0, 0.5, 0.3333]
+            elif star_rating < 5.0:
+                cand_divs = [0.25, 0.1667] if has_dense_drop else [0.5, 0.3333, 0.25]
+            elif star_rating < 7.0:
+                cand_divs = [0.25, 0.1667, 0.125]
             else:
                 cand_divs = [0.125, 0.0833, 0.0625]
 
