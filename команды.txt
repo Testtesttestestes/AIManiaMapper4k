@@ -1,6 +1,23 @@
+# ==============================================================================
+# MANIADIFFUSION (1D Latent Beatmap Diffusion, аналогично Stable Diffusion 1.5)
+# ==============================================================================
+
+# 1. Запуск обучения на 3x RTX 5060 (батч 64 на каждую карту, авто-перенос весов из Model 3):
+python train_diffusion.py --epochs 100 --batch_size 64 --lr 0.0001
+# Или через скрипт:
+# train_diffusion.bat 100 64 0.0001
+
+# 2. Возобновление обучения диффузии:
+python train_diffusion.py --epochs 100 --batch_size 64 --resume
+
+# 3. Генерация готовой мапы через диффузию за один прогон (выбор шагов DDIM и CFG):
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\Siderland - Topic - Tutu Tur (MrSpookyFridays).osz" --sr 3.6 --diffusion --steps 30 --cfg 3.0
+
+# 4. Пакетная генерация нескольких сложностей диффузией (20 шагов DDIM):
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\Siderland - Topic - Tutu Tur (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0,4.5,5.0 --diffusion --steps 20 --cfg 3.5
+
+# ==============================================================================
+# ПРЕДЫДУЩИЕ КОМАНДЫ (Model 3 Transformer)
+# ==============================================================================
 python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0,4.5,5,5.5 --neural
-
-
-python generate_beatmap.py --template "C:\path\to\map.osz" --sr 3.5,5.0 --neural --timing_mode residual
-
 python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\ANOTR - Topic - Talk To You (ft 54 Ultra) (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0 --neural --timing_mode quantized
