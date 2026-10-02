@@ -44,6 +44,9 @@ def generate_beatmap_pipeline(
     ln_conf_thresh: float = 0.78,
     silence_gate: float = 0.0,
     timing_mode: str = "soft_snap",
+    diffusion_steps: int = 30,
+    cfg_scale: float = 3.0,
+    use_diffusion: Optional[bool] = None,
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
@@ -130,25 +133,38 @@ def generate_beatmap_pipeline(
             rms_profile=audio_analysis.rms_profile,
         )
 
-    # Step 3: Model 3 (ManiaPatternTransformer) Neural Pattern Synthesis
+    # Step 3: Neural Pattern Synthesis (ManiaDiffusion or Model 3 Transformer)
+    diff_ckpt = None
+    for cand in (Path("checkpoints/mania_diffusion_best.pt"), Path("checkpoints/mania_diffusion_latest.pt")):
+        if cand.exists():
+            diff_ckpt = str(cand)
+            break
+
     m3_ckpt = pattern_model_checkpoint
-    if m3_ckpt is None and not prefer_algorithmic:
+    if m3_ckpt is not None:
+        if "diff" in str(m3_ckpt).lower():
+            diff_ckpt = str(m3_ckpt)
+            m3_ckpt = None
+
+    if m3_ckpt is None and diff_ckpt is None and not prefer_algorithmic:
         for cand in (Path("checkpoints/model_3_transformer_best.pt"), Path("checkpoints/model_3_transformer_last.pt")):
             if cand.exists():
                 m3_ckpt = str(cand)
                 break
 
-    if force_neural and (m3_ckpt is None or not Path(m3_ckpt).exists()):
+    should_use_diffusion = bool(use_diffusion or (diff_ckpt is not None and not prefer_algorithmic and (use_diffusion is not False)))
+
+    if force_neural and (m3_ckpt is None and diff_ckpt is None):
         raise FileNotFoundError(
-            f"Neural generation was requested (--neural), but Model 3 checkpoint was not found!\n"
-            f"Expected file: checkpoints/model_3_transformer_best.pt (or specify with -c <path>).\n"
-            f"To train Model 3 weights first, run:\n"
-            f"  python train.py --model transformer --epochs 15"
+            f"Neural generation was requested (--neural), but no trained checkpoint was found!\n"
+            f"Expected file: checkpoints/mania_diffusion_best.pt or checkpoints/model_3_transformer_best.pt.\n"
+            f"To train ManiaDiffusion weights first, run:\n"
+            f"  python train_diffusion.py --epochs 100"
         )
 
     # Pre-extract spectrogram once for all difficulties
     mel = None
-    if m3_ckpt and Path(m3_ckpt).exists() and not prefer_algorithmic:
+    if (m3_ckpt or diff_ckpt) and not prefer_algorithmic:
         try:
             from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
             audio_wav = extract_audio_waveform(wav_path, target_sr=16000)
@@ -167,7 +183,31 @@ def generate_beatmap_pipeline(
         hit_objects: List[ManiaHitObject] = []
         used_neural = False
 
-        if m3_ckpt and Path(m3_ckpt).exists() and mel is not None and not prefer_algorithmic:
+        # Mode A: ManiaDiffusion (1D Latent Beatmap Diffusion)
+        if should_use_diffusion and mel is not None and not prefer_algorithmic:
+            try:
+                from .diffusion_generator import generate_patterns_with_diffusion
+                active_diff_ckpt = diff_ckpt or m3_ckpt or "checkpoints/mania_diffusion_best.pt"
+                hit_objects = generate_patterns_with_diffusion(
+                    checkpoint_path=active_diff_ckpt,
+                    audio_mel=mel,
+                    bpm=effective_bpm,
+                    offset_ms=effective_offset,
+                    duration_ms=audio_analysis.duration_ms,
+                    star_rating=sr,
+                    timing_points=timing_points,
+                    num_inference_steps=diffusion_steps,
+                    cfg_scale=cfg_scale,
+                )
+                used_neural = True
+                print(f"✨ [ManiaDiffusion] Successfully synthesized {len(hit_objects)} beatmap hit objects via DDIM.")
+            except Exception as err:
+                if force_neural and diff_ckpt:
+                    raise RuntimeError(f"ManiaDiffusion generation failed: {err}")
+                print(f"⚠️ [ManiaDiffusion Notice] Diffusion synthesis ({err}), falling back to Model 3 / algorithmic.")
+
+        # Mode B: Model 3 (Autoregressive Transformer)
+        if not used_neural and m3_ckpt and Path(m3_ckpt).exists() and mel is not None and not prefer_algorithmic:
             try:
                 hit_objects = generate_patterns_with_model3(
                     checkpoint_path=m3_ckpt,
@@ -192,6 +232,7 @@ def generate_beatmap_pipeline(
                     raise RuntimeError(f"Neural pattern generation failed: {err}")
                 print(f"⚠️ [Model 3 Warning] Neural pattern synthesis failed ({err}), falling back to algorithmic generation.")
 
+        # Mode C: Algorithmic fallback
         if not used_neural or not hit_objects:
             print(f"ℹ️ [Pattern Generator] Using algorithmic pattern synthesis (Conditioned on SR {sr:.2f}*)...")
             hit_objects = generate_patterns(
