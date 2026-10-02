@@ -510,6 +510,15 @@ def generate_patterns_with_model3(
     # Effective LN threshold (0.40 matches 99.8% validation)
     effective_ln_thresh = float(ln_conf_thresh) if (ln_conf_thresh is not None and ln_conf_thresh > 0) else 0.40
 
+    # Effective active note threshold calibrated to Star Rating (prevents long empty gaps)
+    # At 3.6*, calibrated_thresh is ~0.22, meaning if Model 3 sees >=22% note probability, it places the note!
+    calibrated_active_thresh = max(0.08, min(0.35, 0.38 - (float(star_rating) - 1.0) * 0.055))
+    if note_conf_thresh is not None and note_conf_thresh > 0:
+        calibrated_active_thresh = float(note_conf_thresh)
+
+    min_tick_gap_ms = max(50.0, beat_len_ms * 0.125)  # Physical minimum gap (1/8 beat, never 18ms collision)
+    last_placed_note_ms = -9999.0
+
     for cur_pos in range(num_ticks):
         t_obj = ticks[cur_pos]
         cur_time_ms = int(round(t_obj.time_ms))
@@ -574,14 +583,21 @@ def generate_patterns_with_model3(
             step_c_logits = c_logits[0, -1]
             step_l_logits = l_logits[0, -1]
 
-            # Pure Validation Decoding (Exact ArgMax on neural logits):
-            # Token 0 = Rest / Silence, Token 1..15 = Active 4K Chord
-            if greedy or temperature <= 0.05:
+            probs_raw = F.softmax(step_c_logits, dim=-1)
+            p_active = float((1.0 - probs_raw[0]).item())
+
+            # Decide note presence based on neural active probability:
+            is_physically_too_close = (cur_time_ms - last_placed_note_ms) < (min_tick_gap_ms - 5.0)
+
+            if is_physically_too_close:
+                tok = 0
+            elif step_c_logits.argmax().item() > 0:
                 tok = int(step_c_logits.argmax().item())
+            elif p_active >= calibrated_active_thresh:
+                # Active note detected by model
+                tok = int(step_c_logits[1:].argmax().item()) + 1
             else:
-                scaled_l = step_c_logits / max(0.1, temperature)
-                probs = F.softmax(scaled_l, dim=-1)
-                tok = int(torch.multinomial(probs, 1).item())
+                tok = 0
 
             ln_probs = torch.sigmoid(step_l_logits).cpu().tolist()
 
@@ -589,6 +605,7 @@ def generate_patterns_with_model3(
 
         # Process hit objects strictly from neural tokens:
         if tok > 0:
+            last_placed_note_ms = float(cur_time_ms)
             active_cols = token_to_keys(tok)
             for c in active_cols:
                 # Release existing LN if new note hits the same column
