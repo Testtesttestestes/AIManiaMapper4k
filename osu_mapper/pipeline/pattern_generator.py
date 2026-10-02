@@ -619,64 +619,67 @@ def generate_patterns_with_model3(
             active_logits = cur_chord_logits.clone()
             active_logits[0] = -1e9  # Suppress idle class at hit anchors
 
-            # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
-            is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
-            prev_tok = active_notes_history[-1] if active_notes_history else 0
-            prev_k = bin(prev_tok).count("1")
+            # In Stochastic Sampling Mode (temperature > 0.05), apply ergonomic guardrails
+            # In Greedy / Pure Neural Mode (matching Validation), trust the 91.4% exact neural logits directly!
+            if not greedy and eff_temp > 0.05:
+                # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
+                is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
+                prev_tok = active_notes_history[-1] if active_notes_history else 0
+                prev_k = bin(prev_tok).count("1")
 
-            for t_i in range(1, 16):
-                k_cnt = bin(t_i).count("1")
-                if star_rating < 2.0 and k_cnt > 1:
-                    active_logits[t_i] = -1e9
-                elif star_rating < 3.5 and k_cnt > 2:
-                    active_logits[t_i] = -1e9
-                elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
-                    active_logits[t_i] = -1e9
-                elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
-                    # Quads only on heavy downbeats for 6.0*+
-                    active_logits[t_i] = -1e9
+                for t_i in range(1, 16):
+                    k_cnt = bin(t_i).count("1")
+                    if star_rating < 2.0 and k_cnt > 1:
+                        active_logits[t_i] = -1e9
+                    elif star_rating < 3.5 and k_cnt > 2:
+                        active_logits[t_i] = -1e9
+                    elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
+                        active_logits[t_i] = -1e9
+                    elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
+                        # Quads only on heavy downbeats for 6.0*+
+                        active_logits[t_i] = -1e9
 
-                # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
-                if star_rating >= 5.0 and k_cnt >= 2:
-                    active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
+                    # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
+                    if star_rating >= 5.0 and k_cnt >= 2:
+                        active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
 
-                # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
-                if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
-                    active_logits[t_i] -= 8.0
+                    # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
+                    if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
+                        active_logits[t_i] -= 8.0
 
-            # 2. Discourage new taps on lanes currently occupied by a held slider
+                # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+                if len(active_notes_history) >= 4:
+                    if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
+                        active_logits[active_notes_history[-1]] -= 12.0
+                        active_logits[active_notes_history[-2]] -= 12.0
+
+                # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
+                if len(active_notes_history) >= 2 and star_rating < 8.0:
+                    if active_notes_history[-1] == active_notes_history[-2]:
+                        active_logits[active_notes_history[-1]] -= 15.0
+
+                # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
+                recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
+                if recent_active:
+                    lane_usage = [0, 0, 0, 0]
+                    for tok_val in recent_active:
+                        for c in token_to_keys(tok_val):
+                            lane_usage[c] += 1
+                    for c in range(4):
+                        if lane_usage[c] >= 6:
+                            for t_cand in range(1, 16):
+                                if (t_cand >> c) & 1:
+                                    active_logits[t_cand] -= 4.0
+
+            # Physical impossibility: Discourage new taps on lanes currently occupied by a held slider
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     for t_cand in range(1, 16):
                         if (t_cand >> c) & 1:
-                            active_logits[t_cand] -= 10.0
-
-            # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
-            if len(active_notes_history) >= 4:
-                if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
-                    active_logits[active_notes_history[-1]] -= 12.0
-                    active_logits[active_notes_history[-2]] -= 12.0
-
-            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
-            if len(active_notes_history) >= 2 and star_rating < 8.0:
-                if active_notes_history[-1] == active_notes_history[-2]:
-                    active_logits[active_notes_history[-1]] -= 15.0
-
-            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
-            recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
-            if recent_active:
-                lane_usage = [0, 0, 0, 0]
-                for tok_val in recent_active:
-                    for c in token_to_keys(tok_val):
-                        lane_usage[c] += 1
-                for c in range(4):
-                    if lane_usage[c] >= 6:
-                        for t_cand in range(1, 16):
-                            if (t_cand >> c) & 1:
-                                active_logits[t_cand] -= 4.0
+                            active_logits[t_cand] = -1e9
 
             eff_temp = 0.35 if (temperature <= 0.05 and not greedy) else max(0.1, temperature)
-            if greedy:
+            if greedy or (temperature <= 0.05):
                 tok = int(active_logits.argmax().item())
             else:
                 scaled = active_logits / eff_temp
