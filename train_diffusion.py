@@ -144,6 +144,7 @@ def train_diffusion(
     resume: bool = False,
     transfer_model3: Optional[str] = "checkpoints/model_3_transformer_best.pt",
     cfg_dropout: float = 0.15,
+    base_channels: int = 64,
 ):
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for train_diffusion. Please ensure torch is installed in your python environment.")
@@ -163,6 +164,7 @@ def train_diffusion(
             gpu_name = torch.cuda.get_device_name(gi)
             vram_gb = torch.cuda.get_device_properties(gi).total_memory / (1024 ** 3)
             print(f"    - GPU {gi}: {gpu_name} ({vram_gb:.1f} GB VRAM)")
+    print(f"  • UNet Base Channels: {base_channels}")
     print(f"  • Batch Size per GPU: {batch_size_per_gpu}")
     print(f"  • Total Batch Size:   {total_batch_size}")
     print(f"  • Target Epochs:      {epochs}")
@@ -201,7 +203,7 @@ def train_diffusion(
     raw_model = ManiaDiffusion(
         audio_in_dim=128,
         audio_d_model=256,
-        unet_base_channels=128,
+        unet_base_channels=base_channels,
         channel_multipliers=(1, 2, 4),
         time_dim=256,
         in_channels=12,
@@ -237,7 +239,14 @@ def train_diffusion(
 
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    # PyTorch 2.x safe GradScaler
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
     # 3. Training Loop
     print("\n🚀 Beginning Diffusion Training Loop...")
@@ -256,7 +265,7 @@ def train_diffusion(
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device_type, enabled=(device.type == "cuda")):
                 loss, loss_dict = raw_model(
                     beatmap_tensor=b_tensor,
                     audio_mel=a_mel,
@@ -291,7 +300,7 @@ def train_diffusion(
                 g_metrics = batch["grid_metrics"].to(device, non_blocking=True)
                 s_rating = batch["star_rating"].to(device, non_blocking=True)
 
-                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                with torch.autocast(device_type=device_type, enabled=(device.type == "cuda")):
                     v_loss, v_dict = raw_model(
                         beatmap_tensor=b_tensor,
                         audio_mel=a_mel,
@@ -341,6 +350,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     parser.add_argument("--transfer_model3", type=str, default="checkpoints/model_3_transformer_best.pt", help="Model 3 checkpoint to transfer acoustic weights from")
     parser.add_argument("--cfg_dropout", type=float, default=0.15, help="Classifier-Free Guidance conditioning dropout")
+    parser.add_argument("--base_channels", type=int, default=64, help="UNet base feature channels (default: 64, low VRAM footprint; 128 for large capacity)")
     args = parser.parse_args()
 
     train_diffusion(
@@ -352,6 +362,7 @@ def main():
         resume=args.resume,
         transfer_model3=args.transfer_model3,
         cfg_dropout=args.cfg_dropout,
+        base_channels=args.base_channels,
     )
 
 

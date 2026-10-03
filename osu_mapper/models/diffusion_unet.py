@@ -116,6 +116,14 @@ class SelfAttention1D(BaseModule):
         return x + self.to_out(out)
 
 
+def get_num_groups(channels: int, max_groups: int = 8) -> int:
+    """Finds the largest group count <= max_groups that evenly divides channels."""
+    for g in range(max_groups, 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
 class ResBlock1D(BaseModule):
     """
     1D Residual Block with timestep embedding and difficulty projection injection.
@@ -125,11 +133,11 @@ class ResBlock1D(BaseModule):
         in_channels: int,
         out_channels: int,
         time_emb_dim: int,
-        groups: int = 8,
         dropout: float = 0.05,
     ):
         super().__init__()
-        self.norm1 = nn.GroupNorm(groups, in_channels)
+        g1 = get_num_groups(in_channels, 8)
+        self.norm1 = nn.GroupNorm(g1, in_channels)
         self.act1 = nn.SiLU()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=5, padding=2)
 
@@ -138,7 +146,8 @@ class ResBlock1D(BaseModule):
             nn.Linear(time_emb_dim, out_channels * 2),  # Scale and Shift (AdaLN style)
         )
 
-        self.norm2 = nn.GroupNorm(groups, out_channels)
+        g2 = get_num_groups(out_channels, 8)
+        self.norm2 = nn.GroupNorm(g2, out_channels)
         self.act2 = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2)
@@ -212,8 +221,9 @@ class ManiaDiffusionUNet(BaseModule):
         # Initial projection from beatmap channels (12)
         self.init_conv = nn.Conv1d(in_channels, base_channels, kernel_size=5, padding=2)
 
-        # Downsampling Stages
+        # Downsampling Stages with skip channel tracking
         self.down_blocks = nn.ModuleList()
+        skip_channel_sizes = [base_channels]
         current_ch = base_channels
 
         for idx, mult in enumerate(channel_multipliers):
@@ -223,9 +233,11 @@ class ManiaDiffusionUNet(BaseModule):
                 cross_attn = CrossAttention1D(out_ch, audio_dim)
                 self.down_blocks.append(nn.ModuleList([res_block, cross_attn]))
                 current_ch = out_ch
+                skip_channel_sizes.append(current_ch)
 
             if idx < len(channel_multipliers) - 1:
                 self.down_blocks.append(Downsample1D(current_ch))
+                skip_channel_sizes.append(current_ch)
 
         # Middle Stage (Bottleneck with global beatmap Self-Attention)
         self.mid_block1 = ResBlock1D(current_ch, current_ch, time_dim)
@@ -233,14 +245,16 @@ class ManiaDiffusionUNet(BaseModule):
         self.mid_cross_attn = CrossAttention1D(current_ch, audio_dim)
         self.mid_block2 = ResBlock1D(current_ch, current_ch, time_dim)
 
-        # Upsampling Stages
+        # Upsampling Stages: pop skip channels in exact reverse order
         self.up_blocks = nn.ModuleList()
         reversed_mults = list(reversed(channel_multipliers))
 
         for idx, mult in enumerate(reversed_mults):
             out_ch = base_channels * mult
             for _ in range(num_res_blocks + 1):
-                res_block = ResBlock1D(current_ch * 2 if _ == 0 else current_ch, out_ch, time_dim)
+                skip_in_ch = skip_channel_sizes.pop()
+                in_ch = current_ch + skip_in_ch
+                res_block = ResBlock1D(in_ch, out_ch, time_dim)
                 cross_attn = CrossAttention1D(out_ch, audio_dim)
                 self.up_blocks.append(nn.ModuleList([res_block, cross_attn]))
                 current_ch = out_ch
@@ -249,7 +263,8 @@ class ManiaDiffusionUNet(BaseModule):
                 self.up_blocks.append(Upsample1D(current_ch))
 
         # Final Output Projection
-        self.final_norm = nn.GroupNorm(8, current_ch)
+        final_groups = get_num_groups(current_ch, 8)
+        self.final_norm = nn.GroupNorm(final_groups, current_ch)
         self.final_act = nn.SiLU()
         self.final_conv = nn.Conv1d(current_ch, out_channels, kernel_size=5, padding=2)
 
