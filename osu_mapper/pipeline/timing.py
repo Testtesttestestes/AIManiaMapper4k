@@ -8,6 +8,16 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+try:
+    from osu_mapper.pipeline.pattern_generator import ManiaHitObject
+except ImportError:
+    @dataclass
+    class ManiaHitObject:  # type: ignore
+        column: int
+        start_time: int
+        end_time: int
+        is_ln: bool = False
+
 
 @dataclass
 class TimingPoint:

@@ -183,11 +183,13 @@ def train_diffusion(
     generator = torch.Generator().manual_seed(42)
     train_data, val_data = random_split(full_dataset, [train_len, val_len], generator=generator)
 
+    effective_workers = min(num_workers, os.cpu_count() or 1)
+
     train_loader = DataLoader(
         train_data,
         batch_size=total_batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True if num_gpus > 0 else False,
         drop_last=True,
     )
@@ -195,7 +197,7 @@ def train_diffusion(
         val_data,
         batch_size=total_batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True if num_gpus > 0 else False,
     )
 
@@ -282,6 +284,11 @@ def train_diffusion(
             train_loss += loss.item()
             train_l1 += loss_dict.get("l1_error", 0.0)
             train_batches += 1
+
+            if train_batches % 500 == 0 or train_batches == len(train_loader):
+                cur_avg = train_loss / train_batches
+                pct = int((train_batches / len(train_loader)) * 100)
+                print(f"    [Epoch {epoch:2d} | Step {train_batches:4d}/{len(train_loader)} ({pct}%)] Batch MSE: {loss.item():.4f} (Running Avg: {cur_avg:.4f})")
 
         scheduler.step()
         train_loss /= max(1, train_batches)
