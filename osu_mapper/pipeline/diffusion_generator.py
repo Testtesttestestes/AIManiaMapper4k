@@ -218,21 +218,54 @@ def generate_patterns_with_diffusion(
         weight_accum[c_start:c_end] += blend_w
 
     # 4. Decode 12-channel continuous diffusion tensor into discrete ManiaHitObjects
-    raw_hit_objects = beatmap_tensor_to_hit_objects(
-        denoised_tensor=full_denoised_tensor,
-        ticks=ticks,
-        duration_ms=float(duration_ms),
-        beat_len_ms=beat_len_ms,
-        tap_threshold=0.0,
-        ln_threshold=0.10,
-    )
+    # Fast bisection calibration on decoded threshold to match target_sr accurately
+    from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
 
-    # 5. Ranked-compliant collision & slider solver
-    solved_objects = solve_sliders_and_collisions(
-        raw_hit_objects,
-        beat_len_ms=beat_len_ms,
-        min_ln_ms=max(110.0, beat_len_ms * 0.35),
-    )
+    # Human-ergonomic minimum gap per lane scaled with target SR
+    min_lane_gap = max(40.0, 110.0 - max(0.0, star_rating - 2.0) * 14.0)
+
+    # Search for the optimal activation threshold in [0.05, 0.70]
+    low_t = 0.05
+    high_t = 0.70
+    best_solved: List[ManiaHitObject] = []
+    best_delta = 999.0
+    best_thresh = 0.25
+
+    for _ in range(5):
+        mid_t = (low_t + high_t) / 2.0
+        candidate_raw = beatmap_tensor_to_hit_objects(
+            denoised_tensor=full_denoised_tensor,
+            ticks=ticks,
+            duration_ms=float(duration_ms),
+            beat_len_ms=beat_len_ms,
+            tap_threshold=mid_t,
+            ln_threshold=max(0.12, mid_t * 0.8),
+            min_lane_gap_ms=min_lane_gap,
+        )
+        candidate_solved = solve_sliders_and_collisions(
+            candidate_raw,
+            beat_len_ms=beat_len_ms,
+            min_ln_ms=max(110.0, beat_len_ms * 0.35),
+        )
+
+        curr_sr = calculate_osu_mania_star_rating(
+            hit_objects=[(o.column, o.start_time, o.end_time, o.is_ln) for o in candidate_solved],
+            keys=4,
+        )
+        delta = abs(curr_sr - star_rating)
+        if delta < best_delta:
+            best_delta = delta
+            best_solved = candidate_solved
+            best_thresh = mid_t
+
+        if curr_sr > star_rating:
+            # Over-dense -> raise threshold to keep only more prominent neural notes
+            low_t = mid_t
+        else:
+            # Under-dense -> lower threshold
+            high_t = mid_t
+
+    solved_objects = best_solved if best_solved else candidate_solved
 
     total_objs = len(solved_objects)
     final_lns = sum(1 for o in solved_objects if o.is_ln)
@@ -241,5 +274,5 @@ def generate_patterns_with_diffusion(
     duration_sec = max(0.001, duration_ms / 1000.0)
     avg_nps = total_objs / duration_sec
 
-    print(f"\n  ✓ [ManiaDiffusion] Generation complete: {total_objs} hit objects ({final_taps} taps, {final_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS).")
+    print(f"\n  ✓ [ManiaDiffusion] Generation complete: {total_objs} hit objects ({final_taps} taps, {final_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS | calibrated thresh {best_thresh:.2f}).")
     return solved_objects
