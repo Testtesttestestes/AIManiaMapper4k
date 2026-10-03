@@ -58,7 +58,7 @@ class ManiaDiffusion(BaseModule):
         self,
         audio_in_dim: int = 128,
         audio_d_model: int = 256,
-        unet_base_channels: int = 128,
+        unet_base_channels: int = 64,
         channel_multipliers: Tuple[int, ...] = (1, 2, 4),
         time_dim: int = 256,
         in_channels: int = 12,  # 4 tap + 4 LN start + 4 LN sustain

@@ -82,9 +82,6 @@ def generate_patterns_with_diffusion(
         if not found:
             raise FileNotFoundError(f"Neither {checkpoint_path} nor any fallback diffusion checkpoint was found.")
 
-    model = ManiaDiffusion().to(dev)
-    model.eval()
-
     # Load weights
     print(f"  • Loading checkpoint: {ckpt_file}...")
     ckpt_data = torch.load(ckpt_file, map_location=dev, weights_only=False)
@@ -96,6 +93,18 @@ def generate_patterns_with_diffusion(
             break
     if state_dict is None and isinstance(ckpt_data, dict) and all(isinstance(v, torch.Tensor) for v in ckpt_data.values()):
         state_dict = ckpt_data
+
+    # Auto-detect base channels from checkpoint
+    base_channels = 64
+    if state_dict is not None:
+        for k, v in state_dict.items():
+            if k.endswith("init_conv.weight") and hasattr(v, "shape") and len(v.shape) >= 1:
+                base_channels = int(v.shape[0])
+                break
+
+    print(f"  • UNet Base Channels: {base_channels} (auto-configured from checkpoint)")
+    model = ManiaDiffusion(unet_base_channels=base_channels).to(dev)
+    model.eval()
 
     if state_dict is not None:
         # Check if loading dedicated ManiaDiffusion weights
