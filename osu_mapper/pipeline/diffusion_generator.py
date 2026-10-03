@@ -28,9 +28,11 @@ from osu_mapper.models.mania_diffusion import (
     ManiaDiffusion,
     beatmap_tensor_to_hit_objects,
 )
-from osu_mapper.pipeline.pattern_generator import solve_sliders_and_collisions
-from osu_mapper.pipeline.timing import (
+from osu_mapper.pipeline.pattern_generator import (
     ManiaHitObject,
+    solve_sliders_and_collisions,
+)
+from osu_mapper.pipeline.timing import (
     MusicalGridTick,
     TimingPoint,
     generate_musical_grid_ticks_from_timing_points,
