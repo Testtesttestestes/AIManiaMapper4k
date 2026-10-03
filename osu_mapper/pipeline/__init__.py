@@ -258,11 +258,12 @@ def generate_beatmap_pipeline(
         packager = BeatmapPackager(meta)
         osu_str = packager.generate_osu_content(timing_points, hit_objects)
 
-        # Initial rosu-pp Star Rating validation
-        validated_sr = calculate_osu_mania_star_rating(
+        # Star Rating validation (using rosu-pp Rust engine or calibrated fallback)
+        validated_sr, calc_source = calculate_osu_mania_star_rating(
             osu_text=osu_str,
             keys=4,
             overall_difficulty=meta.overall_difficulty,
+            return_source=True,
         )
         delta = validated_sr - sr
 
@@ -271,7 +272,7 @@ def generate_beatmap_pipeline(
         osu_contents.append(osu_str)
 
         status_tag = "✓ EXACT" if abs(delta) <= 0.25 else ("~ CLOSE" if abs(delta) <= 0.60 else "ℹ️ VALIDATED")
-        print(f"  🔍 [rosu-pp Difficulty Validation] Target: {sr:.2f}* -> Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*) [{status_tag}]")
+        print(f"  🔍 [{calc_source}] Target: {sr:.2f}* -> Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*) [{status_tag}]")
 
     # Bundle all difficulties into single .osz archive
     final_osz = BeatmapPackager.package_multi_diff_osz(

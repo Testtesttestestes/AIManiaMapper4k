@@ -283,21 +283,25 @@ def train_diffusion(
 
             train_loss += loss.item()
             train_l1 += loss_dict.get("l1_error", 0.0)
+            train_f1 = loss_dict.get("note_f1", 0.0)
             train_batches += 1
 
             if train_batches % 500 == 0 or train_batches == len(train_loader):
                 cur_avg = train_loss / train_batches
                 pct = int((train_batches / len(train_loader)) * 100)
-                print(f"    [Epoch {epoch:2d} | Step {train_batches:4d}/{len(train_loader)} ({pct}%)] Batch MSE: {loss.item():.4f} (Running Avg: {cur_avg:.4f})")
+                print(f"    [Epoch {epoch:2d} | Step {train_batches:4d}/{len(train_loader)} ({pct}%)] Loss: {loss.item():.4f} | Note F1: {train_f1 * 100:.1f}% (Running Avg Loss: {cur_avg:.4f})")
 
         scheduler.step()
         train_loss /= max(1, train_batches)
         train_l1 /= max(1, train_batches)
 
-        # Validation Loop
+        # Validation Loop: Evaluate TRUE Note-Level Matching Metrics
         raw_model.eval()
         val_loss = 0.0
         val_l1 = 0.0
+        val_prec = 0.0
+        val_rec = 0.0
+        val_f1 = 0.0
         val_batches = 0
 
         with torch.no_grad():
@@ -316,35 +320,47 @@ def train_diffusion(
                     )
                 val_loss += v_loss.item()
                 val_l1 += v_dict.get("l1_error", 0.0)
+                val_prec += v_dict.get("note_precision", 0.0)
+                val_rec += v_dict.get("note_recall", 0.0)
+                val_f1 += v_dict.get("note_f1", 0.0)
                 val_batches += 1
 
         val_loss /= max(1, val_batches)
         val_l1 /= max(1, val_batches)
+        val_prec /= max(1, val_batches)
+        val_rec /= max(1, val_batches)
+        val_f1 /= max(1, val_batches)
         elapsed = time.time() - t0
         smp_per_sec = len(train_data) / max(0.001, elapsed)
 
         print(
-            f"Epoch {epoch:3d}/{epochs} [{elapsed:.1f}s | {smp_per_sec:.1f} smp/s] "
-            f"Train Loss (MSE): {train_loss:.4f} (L1: {train_l1:.4f}) | "
-            f"Val Loss: {val_loss:.4f} (L1: {val_l1:.4f}) | LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"Epoch {epoch:3d}/{epochs} [{elapsed:.1f}s | {smp_per_sec:.1f} smp/s]\n"
+            f"  • Train Loss: {train_loss:.4f} (L1: {train_l1:.4f})\n"
+            f"  • Val Loss:   {val_loss:.4f} (L1: {val_l1:.4f})\n"
+            f"  🎯 TRUE NOTE METRICS: Precision={val_prec * 100:.1f}% | Recall={val_rec * 100:.1f}% | Note F1 Match={val_f1 * 100:.1f}%"
         )
 
         # Save Latest Checkpoint every epoch
         latest_data = {
             "epoch": epoch,
             "val_loss": val_loss,
+            "val_f1": val_f1,
+            "val_precision": val_prec,
+            "val_recall": val_rec,
             "model_state": raw_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
         }
         torch.save(latest_data, latest_ckpt_path)
 
-        # Save Best Checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Save Best Checkpoint by Note F1 Match (honest note-level evaluation, NOT noise MSE!)
+        best_metric = getattr(train_diffusion, "_best_val_f1", -1.0)
+        if val_f1 > best_metric:
+            train_diffusion._best_val_f1 = val_f1
             torch.save(latest_data, best_ckpt_path)
-            print(f"  ★ New best model saved! (Val Loss: {val_loss:.4f}) -> {best_ckpt_path.name}")
+            print(f"  ★ New best model saved! (Note F1 Match: {val_f1 * 100:.2f}%, Val Loss: {val_loss:.4f}) -> {best_ckpt_path.name}")
 
-    print(f"\n🎉 Training Complete! Best Val Loss: {best_val_loss:.4f}. Model saved to {best_ckpt_path}")
+    best_f1_final = getattr(train_diffusion, "_best_val_f1", 0.0)
+    print(f"\n🎉 Training Complete! Best Note F1 Match: {best_f1_final * 100:.2f}%. Model saved to {best_ckpt_path}")
 
 
 def main():
