@@ -218,20 +218,40 @@ def generate_patterns_with_diffusion(
         weight_accum[c_start:c_end] += blend_w
 
     # 4. Decode 12-channel continuous diffusion tensor into discrete ManiaHitObjects
-    # Fast bisection calibration on decoded threshold to match target_sr accurately
+    # Strict bisection calibration against target_sr using rosu-pp Rust engine
     from osu_mapper.dataset.difficulty_calculator import calculate_osu_mania_star_rating
 
     # Human-ergonomic minimum gap per lane scaled with target SR
-    min_lane_gap = max(40.0, 110.0 - max(0.0, star_rating - 2.0) * 14.0)
+    min_lane_gap = max(35.0, 110.0 - max(0.0, star_rating - 2.0) * 14.0)
 
-    # Search for the optimal activation threshold in [0.05, 0.70]
-    low_t = 0.05
-    high_t = 0.70
+    # Wide search range to handle both quiet ambient tracks and high-confidence 270 BPM speedcore
+    low_t = 0.02
+    high_t = 1.35
     best_solved: List[ManiaHitObject] = []
     best_delta = 999.0
     best_thresh = 0.25
 
-    for _ in range(5):
+    def build_test_osu(objs: List[ManiaHitObject]) -> str:
+        lines = [
+            "osu file format v14",
+            "[General]",
+            "Mode: 3",
+            "[Difficulty]",
+            "CircleSize: 4",
+            "OverallDifficulty: 8",
+            "[TimingPoints]",
+            f"0,{beat_len_ms},4,2,0,100,1,0",
+            "[HitObjects]",
+        ]
+        for o in objs:
+            x = int(math.floor(o.column * (512.0 / 4.0) + (512.0 / 8.0)))
+            if o.is_ln and o.end_time > o.start_time:
+                lines.append(f"{x},192,{int(o.start_time)},128,0,{int(o.end_time)}:0:0:0:0:")
+            else:
+                lines.append(f"{x},192,{int(o.start_time)},1,0,0:0:0:0:")
+        return "\n".join(lines)
+
+    for _ in range(8):
         mid_t = (low_t + high_t) / 2.0
         candidate_raw = beatmap_tensor_to_hit_objects(
             denoised_tensor=full_denoised_tensor,
@@ -248,7 +268,9 @@ def generate_patterns_with_diffusion(
             min_ln_ms=max(110.0, beat_len_ms * 0.35),
         )
 
+        test_osu = build_test_osu(candidate_solved)
         curr_sr = calculate_osu_mania_star_rating(
+            osu_text=test_osu,
             hit_objects=[(o.column, o.start_time, o.end_time, o.is_ln) for o in candidate_solved],
             keys=4,
         )
@@ -258,8 +280,12 @@ def generate_patterns_with_diffusion(
             best_solved = candidate_solved
             best_thresh = mid_t
 
+        if delta < 0.15:
+            # Reached exact target SR within ±0.15* tolerance
+            break
+
         if curr_sr > star_rating:
-            # Over-dense -> raise threshold to keep only more prominent neural notes
+            # Over-dense -> raise threshold to filter out secondary notes and keep core rhythm
             low_t = mid_t
         else:
             # Under-dense -> lower threshold
