@@ -215,8 +215,7 @@ def find_resume_checkpoint(checkpoint_dir: Path, model_prefix: str, resume_arg: 
     Finds the appropriate checkpoint to resume from:
     1. If resume_arg is a valid file path, use it directly.
     2. If resume_arg is inside checkpoint_dir, use it.
-    3. Auto search: sorts all candidate checkpoints by last modified timestamp (mtime),
-       ensuring the most recent training progress is always resumed.
+    3. Auto search order: {model_prefix}_last.pt -> {model_prefix}_best.pt -> {model_prefix}.pt
     """
     if resume_arg and resume_arg.lower() not in ("auto", "true", "1", "yes", "default"):
         p = Path(resume_arg)
@@ -228,17 +227,13 @@ def find_resume_checkpoint(checkpoint_dir: Path, model_prefix: str, resume_arg: 
         print(f"⚠️  [Resume Warning] Explicit checkpoint path '{resume_arg}' was not found.")
 
     candidates = [
-        checkpoint_dir / f"{model_prefix}_self_improved_last.pt",
-        checkpoint_dir / f"{model_prefix}_self_improved.pt",
-        checkpoint_dir / f"{model_prefix}_best.pt",
         checkpoint_dir / f"{model_prefix}_last.pt",
+        checkpoint_dir / f"{model_prefix}_best.pt",
         checkpoint_dir / f"{model_prefix}.pt",
     ]
-    existing = [c for c in candidates if c.exists() and c.is_file()]
-    if existing:
-        # Prioritize most recently modified checkpoint
-        existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return existing[0]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
     return None
 
 
@@ -300,7 +295,7 @@ def load_checkpoint_state(
     # 3. Best metric
     best_metric = float("inf")
     if isinstance(ckpt, dict):
-        for k in ("loss", "best_loss", "best_val_loss", "val_loss", "best_val_mae", "val_bpm_mae", "best_metric"):
+        for k in ("best_val_loss", "val_loss", "best_val_mae", "val_bpm_mae", "best_metric"):
             if k in ckpt and ckpt[k] is not None:
                 best_metric = float(ckpt[k])
                 break
@@ -655,21 +650,19 @@ def train_model_3_transformer(
                 loss_ln = criterion_ln(ln_logits, ln_mask)
                 # 4. Difficulty consistency loss
                 loss_sr = F.smooth_l1_loss(pred_sr, star_rating)
-                # 5. Note-Focused Continuous Time-Delta Loss with Normalized Asymmetric Leap Penalty
+                # 5. Note-Focused Continuous Time-Delta Loss (\Delta t step forward in ms)
                 is_note_mask = (tokens > 0)
                 if is_note_mask.any():
-                    p_dt = pred_time_deltas[is_note_mask]
-                    t_dt = target_time_deltas[is_note_mask]
-                    dt_err_sec = F.smooth_l1_loss(p_dt / 1000.0, t_dt / 1000.0)
-                    dt_log_err = F.smooth_l1_loss(torch.log1p(p_dt), torch.log1p(t_dt))
-                    # Relative leap overshoot ratio (scale-invariant, penalizes jumping over notes)
-                    overshoot_ratio = F.relu(p_dt - t_dt) / (t_dt + 20.0)
-                    loss_overshoot = F.smooth_l1_loss(overshoot_ratio, torch.zeros_like(overshoot_ratio))
-                    loss_delta = dt_err_sec + 0.3 * dt_log_err + 0.8 * loss_overshoot
+                    loss_delta_notes = F.smooth_l1_loss(pred_time_deltas[is_note_mask], target_time_deltas[is_note_mask])
+                    loss_delta_log = F.smooth_l1_loss(
+                        torch.log1p(pred_time_deltas[is_note_mask]),
+                        torch.log1p(target_time_deltas[is_note_mask])
+                    )
+                    loss_delta = loss_delta_notes + 5.0 * loss_delta_log
                 else:
-                    loss_delta = F.smooth_l1_loss(pred_time_deltas / 1000.0, target_time_deltas / 1000.0)
+                    loss_delta = F.smooth_l1_loss(pred_time_deltas, target_time_deltas)
 
-                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.5 * loss_delta
+                loss = loss_chord + 2.0 * loss_lane_bce + 1.5 * loss_ln + 0.5 * loss_sr + 0.05 * loss_delta
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -778,16 +771,15 @@ def train_model_3_transformer(
                     l_sr = F.smooth_l1_loss(p_sr, star_rating)
                     val_is_note = (tokens > 0)
                     if val_is_note.any():
-                        vp_dt = p_time_deltas[val_is_note]
-                        vt_dt = val_target_deltas[val_is_note]
-                        v_dt_sec = F.smooth_l1_loss(vp_dt / 1000.0, vt_dt / 1000.0)
-                        v_dt_log = F.smooth_l1_loss(torch.log1p(vp_dt), torch.log1p(vt_dt))
-                        v_overshoot = F.relu(vp_dt - vt_dt) / (vt_dt + 20.0)
-                        v_loss_overshoot = F.smooth_l1_loss(v_overshoot, torch.zeros_like(v_overshoot))
-                        l_delta = v_dt_sec + 0.3 * v_dt_log + 0.8 * v_loss_overshoot
+                        val_l_notes = F.smooth_l1_loss(p_time_deltas[val_is_note], val_target_deltas[val_is_note])
+                        val_l_log = F.smooth_l1_loss(
+                            torch.log1p(p_time_deltas[val_is_note]),
+                            torch.log1p(val_target_deltas[val_is_note])
+                        )
+                        l_delta = val_l_notes + 5.0 * val_l_log
                     else:
-                        l_delta = F.smooth_l1_loss(p_time_deltas / 1000.0, val_target_deltas / 1000.0)
-                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr + 0.5 * l_delta).item() * B
+                        l_delta = F.smooth_l1_loss(p_time_deltas, val_target_deltas)
+                    val_loss += (l_c + 2.0 * l_lane + 1.5 * l_l + 0.5 * l_sr + 0.05 * l_delta).item() * B
                     val_sr_err += torch.abs(p_sr - star_rating).sum().item()
 
                     preds = c_logits.argmax(dim=-1)
@@ -1259,235 +1251,149 @@ def train_model_3_self_improvement(
     print("=" * 65)
 
     cfg = TransformerConfig(
-        audio_dim=80,
-        d_model=256,
-        nhead=8,
+        d_model=128,
+        nhead=4,
         num_layers=4,
         dim_feedforward=512,
         num_classes=16,
         max_seq_len=512,
         dropout=0.1,
     )
-
-    # Check for existing checkpoint and auto-match architecture config if saved
-    base_ckpt = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
-    if base_ckpt:
-        try:
-            ckpt_peek = torch.load(base_ckpt, map_location="cpu", weights_only=False)
-            if isinstance(ckpt_peek, dict):
-                if "config" in ckpt_peek and isinstance(ckpt_peek["config"], TransformerConfig):
-                    cfg = ckpt_peek["config"]
-                elif "model_state" in ckpt_peek:
-                    ms = ckpt_peek["model_state"]
-                    for k in ["audio_proj.weight", "module.audio_proj.weight"]:
-                        if k in ms:
-                            detected_d = ms[k].shape[0]
-                            cfg.d_model = detected_d
-                            cfg.nhead = max(1, detected_d // 32)
-                            break
-        except Exception:
-            pass
-
     raw_model = ManiaPatternTransformer(cfg).to(device)
     model = wrap_model_multi_gpu(raw_model, device_ids or [])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr or 5e-5, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr or 1e-4, weight_decay=1e-4)
 
     # Load existing best weights
-    start_epoch = 0
-    best_loss = float("inf")
+    base_ckpt = find_resume_checkpoint(checkpoint_dir, "model_3_transformer", resume_path)
     if base_ckpt:
-        start_epoch, loaded_loss, _ = load_checkpoint_state(base_ckpt, model, optimizer=optimizer, device=device, override_lr=override_lr)
-        if loaded_loss < float("inf"):
-            best_loss = loaded_loss
-        print(f"  ▶ Resumed Self-Improvement at Epoch {start_epoch}. (Best recorded loss: {best_loss:.4f})")
+        load_checkpoint_state(base_ckpt, model, optimizer=optimizer, device=device, override_lr=override_lr)
     else:
         print("  ℹ️ No existing checkpoint found; starting fresh self-improvement loop.")
 
-    target_total_epochs = epochs
-    if target_total_epochs <= start_epoch:
-        target_total_epochs = start_epoch + epochs
-        print(f"  ℹ️ Target epochs ({epochs}) <= Loaded epoch ({start_epoch}). Extending total epochs to {target_total_epochs} (+{epochs} more epochs).")
-
-    print(f"  Training Self-Improvement from Epoch {start_epoch + 1} to {target_total_epochs} (Total: {target_total_epochs - start_epoch} epochs)...")
-
     train_loss = 0.0
-    current_epoch = start_epoch
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss, total_dpo, total_sft = 0.0, 0.0, 0.0
+        total_win_margin, batch_count = 0.0, 0
+        start_t = time.time()
 
-    try:
-        for epoch in range(start_epoch + 1, target_total_epochs + 1):
-            current_epoch = epoch
-            model.train()
-            total_loss, total_dpo, total_sft = 0.0, 0.0, 0.0
-            total_win_margin, batch_count = 0.0, 0
-            start_t = time.time()
+        for batch in train_loader:
+            audio_mel = batch["audio_mel"].to(device)
+            tokens = batch["tokens"].to(device)
+            star_rating = batch["star_rating"].to(device)
+            multiscale_audio = batch.get("multiscale_audio", None)
+            if multiscale_audio is not None:
+                multiscale_audio = multiscale_audio.to(device)
+            grid_metrics = batch.get("grid_metrics", None)
+            if grid_metrics is not None:
+                grid_metrics = grid_metrics.to(device)
+            scaffold_tokens = batch.get("scaffold_tokens", None)
+            if scaffold_tokens is not None:
+                scaffold_tokens = scaffold_tokens.to(device)
+            strain_metrics = batch.get("strain_metrics", None)
+            if strain_metrics is not None:
+                strain_metrics = strain_metrics.to(device)
 
-            for batch in train_loader:
-                audio_mel = batch["audio_mel"].to(device)
-                tokens = batch["tokens"].to(device)
-                star_rating = batch["star_rating"].to(device)
-                multiscale_audio = batch.get("multiscale_audio", None)
-                if multiscale_audio is not None:
-                    multiscale_audio = multiscale_audio.to(device)
-                grid_metrics = batch.get("grid_metrics", None)
-                if grid_metrics is not None:
-                    grid_metrics = grid_metrics.to(device)
-                scaffold_tokens = batch.get("scaffold_tokens", None)
-                if scaffold_tokens is not None:
-                    scaffold_tokens = scaffold_tokens.to(device)
-                strain_metrics = batch.get("strain_metrics", None)
-                if strain_metrics is not None:
-                    strain_metrics = strain_metrics.to(device)
+            if scaffold_tokens is None or strain_metrics is None:
+                synth_scaff, synth_strain = compute_multi_scenario_scaffold_and_strain(tokens, star_rating, grid_metrics, audio_mel)
+                scaffold_tokens = synth_scaff if scaffold_tokens is None else scaffold_tokens
+                strain_metrics = synth_strain if strain_metrics is None else strain_metrics
 
-                if scaffold_tokens is None or strain_metrics is None:
-                    synth_scaff, synth_strain = compute_multi_scenario_scaffold_and_strain(tokens, star_rating, grid_metrics, audio_mel)
-                    scaffold_tokens = synth_scaff if scaffold_tokens is None else scaffold_tokens
-                    strain_metrics = synth_strain if strain_metrics is None else strain_metrics
+            prev_tok = torch.roll(tokens, shifts=1, dims=1)
+            prev_tok[:, 0] = 0
 
-                prev_tok = torch.roll(tokens, shifts=1, dims=1)
-                prev_tok[:, 0] = 0
-
-                # Forward pass to obtain chord logits [B, T, 16]
-                c_logits, l_logits, _, _ = model(
-                    audio_mel,
-                    star_rating=star_rating,
-                    prev_tokens=prev_tok,
-                    grid_metrics=grid_metrics,
-                    scaffold_tokens=scaffold_tokens,
-                    strain_metrics=strain_metrics,
-                    multiscale_audio=multiscale_audio,
-                    return_sr=True,
-                    return_time_delta=True,
-                )
-
-                B, T, C = c_logits.shape
-
-                # 1. Contrastive Rollout Generation (Entropy-rich exploration vs Exploitation)
-                gumbel_noise = -torch.empty_like(c_logits).exponential_().log()
-                tau_A = (c_logits / 1.1 + gumbel_noise * 0.75).argmax(dim=-1)  # Exploratory rollout (T=1.1 + Gumbel noise)
-                tau_B = (c_logits / 0.35).argmax(dim=-1)                        # Greedy exploitative rollout (T=0.35)
-
-                # 2. Honest Multi-Objective Critic (Rewards onsets & density, penalizes ghost notes & jacks)
-                is_true_note = (tokens > 0)
-                true_note_count = is_true_note.sum(dim=1).clamp(min=1).float()
-
-                # Active note recall (where human mapped a note)
-                recall_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / true_note_count
-                recall_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / true_note_count
-
-                # Note precision (penalize hallucinated ghost notes on silence)
-                pred_count_A = (tau_A > 0).sum(dim=1).clamp(min=1).float()
-                pred_count_B = (tau_B > 0).sum(dim=1).clamp(min=1).float()
-                prec_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / pred_count_A
-                prec_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / pred_count_B
-
-                # Exact note match on active ticks
-                exact_active_A = (tau_A[is_true_note] == tokens[is_true_note]).float().mean() if is_true_note.any() else torch.tensor(1.0, device=device)
-                exact_active_B = (tau_B[is_true_note] == tokens[is_true_note]).float().mean() if is_true_note.any() else torch.tensor(1.0, device=device)
-
-                # Ergonomic Minijack Penalty (rapid consecutive strikes on same key)
-                jacks_A = ((tau_A[:, 1:] == tau_A[:, :-1]) & (tau_A[:, 1:] > 0)).float().mean(dim=1)
-                jacks_B = ((tau_B[:, 1:] == tau_B[:, :-1]) & (tau_B[:, 1:] > 0)).float().mean(dim=1)
-
-                # Heavy Note-Skipping / Leap Penalty: Strictly punish rollouts that omit or jump over human notes
-                missed_A = ((tau_A == 0) & is_true_note).sum(dim=1).float() / true_note_count
-                missed_B = ((tau_B == 0) & is_true_note).sum(dim=1).float() / true_note_count
-
-                R_A = 3.0 * recall_A + 1.5 * prec_A + 1.0 * exact_active_A - 0.8 * jacks_A - 3.5 * missed_A
-                R_B = 3.0 * recall_B + 1.5 * prec_B + 1.0 * exact_active_B - 0.8 * jacks_B - 3.5 * missed_B
-
-                # 3. Build Winner & Loser tensors with Ground Truth fallback
-                # If rollouts are identical, contrast the model rollout against Ground Truth (Ranked Map)
-                identical_mask = (tau_A == tau_B).all(dim=-1)
-                win_mask = (R_A >= R_B)
-                
-                tau_win = torch.where(win_mask.unsqueeze(1), tau_A, tau_B)
-                tau_lose = torch.where(win_mask.unsqueeze(1), tau_B, tau_A)
-
-                # When model rollouts collapse to identical sequences, pair with Ground Truth Winner
-                if identical_mask.any():
-                    tau_win = torch.where(identical_mask.unsqueeze(1), tokens, tau_win)
-
-                # 4. Active Note Masking for DPO (Prevent 470 silent ticks from diluting log-probs by 15x)
-                active_mask = (tau_win > 0) | (tau_lose > 0) | (tokens > 0)
-                active_ticks = active_mask.sum(dim=-1).clamp(min=1).float()
-
-                log_p = F.log_softmax(c_logits, dim=-1)
-                log_p_win = (log_p.gather(dim=-1, index=tau_win.unsqueeze(-1)).squeeze(-1) * active_mask).sum(dim=-1) / active_ticks
-                log_p_lose = (log_p.gather(dim=-1, index=tau_lose.unsqueeze(-1)).squeeze(-1) * active_mask).sum(dim=-1) / active_ticks
-
-                # 5. DPO Loss with scaled beta
-                diff = (beta_dpo * 5.0) * (log_p_win - log_p_lose)
-                loss_dpo = -F.logsigmoid(diff).mean()
-
-                # 6. Policy Entropy Regularization (Prevents policy entropy collapse into flat plateaus)
-                probs = F.softmax(c_logits, dim=-1)
-                entropy = - (probs * log_p).sum(dim=-1).mean()
-
-                # 7. Supervised Cross-Entropy Teacher-Forcing Loss
-                loss_sft = F.cross_entropy(c_logits.view(B * T, C), tokens.view(B * T))
-
-                # Total Multi-Objective Self-Improvement Loss
-                loss = loss_sft + 0.4 * loss_dpo - 0.005 * entropy
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-                optimizer.step()
-
-                margin = torch.where(identical_mask, torch.tensor(0.5, device=device), (R_A - R_B).abs()).mean().item()
-                total_loss += loss.item() * B
-                total_dpo += loss_dpo.item() * B
-                total_sft += loss_sft.item() * B
-                total_win_margin += margin
-                batch_count += 1
-
-            elapsed = time.time() - start_t
-            train_loss = total_loss / len(train_loader.dataset)
-            avg_dpo = total_dpo / len(train_loader.dataset)
-            avg_sft = total_sft / len(train_loader.dataset)
-            avg_margin = total_win_margin / max(1, batch_count)
-
-            print(
-                f"Epoch {epoch:02d}/{target_total_epochs:02d} [{elapsed:.1f}s] "
-                f"Self-Improvement Loss: {train_loss:.4f} (SFT: {avg_sft:.4f}, DPO: {avg_dpo:.4f}, Critic Margin: {avg_margin:.3f})"
+            # Forward pass to obtain chord logits [B, T, 16]
+            c_logits, l_logits, _, _ = model(
+                audio_mel,
+                star_rating=star_rating,
+                prev_tokens=prev_tok,
+                grid_metrics=grid_metrics,
+                scaffold_tokens=scaffold_tokens,
+                strain_metrics=strain_metrics,
+                multiscale_audio=multiscale_audio,
+                return_sr=True,
+                return_time_delta=True,
             )
 
-            model_to_save = model.module if hasattr(model, "module") else model
-            out_ckpt = checkpoint_dir / "model_3_transformer_self_improved.pt"
-            best_ckpt = checkpoint_dir / "model_3_transformer_best.pt"
-            last_ckpt = checkpoint_dir / "model_3_transformer_last.pt"
-            self_improved_last = checkpoint_dir / "model_3_transformer_self_improved_last.pt"
-            saved_dict = {
-                "epoch": epoch,
-                "model_state": model_to_save.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "config": cfg,
-                "loss": train_loss,
-            }
-            torch.save(saved_dict, out_ckpt)
-            torch.save(saved_dict, last_ckpt)
-            torch.save(saved_dict, self_improved_last)
-            if train_loss < best_loss:
-                best_loss = train_loss
-                torch.save(saved_dict, best_ckpt)
-                print(f"  ⭐ Saved new best self-improved checkpoint to '{best_ckpt}' (Loss: {best_loss:.4f})")
-            else:
-                torch.save(saved_dict, best_ckpt)
+            B, T, C = c_logits.shape
 
-    except KeyboardInterrupt:
-        print(f"\n🛑 [Paused] Self-Improvement paused by user at Epoch {current_epoch}.")
+            # Sample two exploration rollouts:
+            # tau_A with T=0.7 (more exploratory)
+            # tau_B with T=0.35 (more greedy/conservative)
+            tau_A = torch.multinomial(F.softmax(c_logits / 0.70, dim=-1).view(-1, C), 1).view(B, T)
+            tau_B = torch.multinomial(F.softmax(c_logits / 0.35, dim=-1).view(-1, C), 1).view(B, T)
+
+            # Automated Critic: Score rollouts based on Ground Truth & Acoustic Onset alignment
+            is_true_note = (tokens > 0)
+            true_count = is_true_note.sum(dim=1).clamp(min=1).float()
+
+            recall_A = ((tau_A > 0) & is_true_note).sum(dim=1).float() / true_count
+            recall_B = ((tau_B > 0) & is_true_note).sum(dim=1).float() / true_count
+
+            exact_A = (tau_A == tokens).sum(dim=1).float() / float(T)
+            exact_B = (tau_B == tokens).sum(dim=1).float() / float(T)
+
+            # Jack penalty: repeated consecutive tokens on same lane
+            jacks_A = (tau_A[:, 1:] == tau_A[:, :-1]).float().mean(dim=1)
+            jacks_B = (tau_B[:, 1:] == tau_B[:, :-1]).float().mean(dim=1)
+
+            R_A = 2.0 * recall_A + 1.0 * exact_A - 0.4 * jacks_A
+            R_B = 2.0 * recall_B + 1.0 * exact_B - 0.4 * jacks_B
+
+            # Build Winner & Loser tensors
+            win_mask = (R_A >= R_B)
+            tau_win = torch.where(win_mask.unsqueeze(1), tau_A, tau_B)
+            tau_lose = torch.where(win_mask.unsqueeze(1), tau_B, tau_A)
+
+            # Gather log probs for winner and loser
+            log_p = F.log_softmax(c_logits, dim=-1)
+            log_p_win = log_p.gather(dim=-1, index=tau_win.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+            log_p_lose = log_p.gather(dim=-1, index=tau_lose.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+
+            # DPO loss
+            diff = beta_dpo * (log_p_win - log_p_lose)
+            loss_dpo = -F.logsigmoid(diff).mean()
+
+            # Supervised Cross-Entropy Teacher-Forcing Loss (anchors core vocabulary)
+            loss_sft = F.cross_entropy(c_logits.view(B * T, C), tokens.view(B * T))
+
+            loss = loss_sft + 0.3 * loss_dpo
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            optimizer.step()
+
+            total_loss += loss.item() * B
+            total_dpo += loss_dpo.item() * B
+            total_sft += loss_sft.item() * B
+            total_win_margin += (R_A - R_B).abs().mean().item()
+            batch_count += 1
+
+        elapsed = time.time() - start_t
+        train_loss = total_loss / len(train_loader.dataset)
+        avg_dpo = total_dpo / len(train_loader.dataset)
+        avg_sft = total_sft / len(train_loader.dataset)
+        avg_margin = total_win_margin / max(1, batch_count)
+
+        print(
+            f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:.1f}s] "
+            f"Self-Improvement Loss: {train_loss:.4f} (SFT: {avg_sft:.4f}, DPO: {avg_dpo:.4f}, Critic Margin: {avg_margin:.3f})"
+        )
+
         model_to_save = model.module if hasattr(model, "module") else model
-        paused_dict = {
-            "epoch": current_epoch,
+        out_ckpt = checkpoint_dir / "model_3_transformer_self_improved.pt"
+        best_ckpt = checkpoint_dir / "model_3_transformer_best.pt"
+        saved_dict = {
+            "epoch": epoch,
             "model_state": model_to_save.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": cfg,
             "loss": train_loss,
         }
-        torch.save(paused_dict, checkpoint_dir / "model_3_transformer_self_improved_last.pt")
-        torch.save(paused_dict, checkpoint_dir / "model_3_transformer_last.pt")
-        print(f"  💾 Saved progress to '{checkpoint_dir / 'model_3_transformer_self_improved_last.pt'}'.")
-        print(f"  ▶ To resume later: python train.py --self_improve --resume")
+        torch.save(saved_dict, out_ckpt)
+        torch.save(saved_dict, best_ckpt)
+        print(f"  ⭐ Saved updated self-improved checkpoint to '{out_ckpt}' and '{best_ckpt}'")
 
     return {"model": "model_3_self_improved", "best_loss": train_loss}
 
