@@ -294,21 +294,18 @@ def main():
     parser.add_argument("--mode", type=str, choices=["auto", "neural", "algorithmic", "algo"], default="auto", help="Pattern generation mode: 'algorithmic' / 'algo' (musical rhythm synthesis), 'neural' (Model 3 Transformer), or 'auto'")
     parser.add_argument("--algo", "--algorithmic", action="store_true", help="Use algorithmic pattern synthesis directly (musical beat snapping & ergonomic chordstreams)")
     parser.add_argument("--neural", action="store_true", help="Force neural pattern generation via Model 3 Transformer (fails with instructions if weights missing)")
-    parser.add_argument("--diffusion", action="store_true", help="Use ManiaDiffusion (1D Latent Beatmap Diffusion, like Stable Diffusion 1.5 for beatmaps)")
-    parser.add_argument("--steps", "--denoise_steps", type=int, default=30, help="DDIM diffusion denoising steps (default: 30, e.g. 20-50 like Stable Diffusion 1.5)")
-    parser.add_argument("--cfg", "--cfg_scale", type=float, default=3.0, help="Classifier-Free Guidance scale for diffusion (default: 3.0, range: 1.5 - 5.0)")
-    parser.add_argument("--model3_checkpoint", "--checkpoint", "-c", type=str, default=None, help="Path to Model 3 or ManiaDiffusion .pt weights")
+    parser.add_argument("--model3_checkpoint", "--checkpoint", "-c", type=str, default=None, help="Path to Model 3 (ManiaPatternTransformer) .pt weights")
     parser.add_argument("--sync_checkpoint", type=str, default=None, help="Path to Model 1 (SyncBPMOffsetModel) .pt weights")
     parser.add_argument("--output", "-o", type=str, default="output_beatmaps/generated_map.osz", help="Output .osz file path")
     parser.add_argument("--synthetic", action="store_true", help="Generate a synthetic test track if no audio provided")
     parser.add_argument("--duration", type=float, default=30.0, help="Duration in seconds for synthetic audio")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for generation")
-    parser.add_argument("--temperature", "--temp", type=float, default=0.35, help="Sampling temperature: 0.35 (default natural entropy & lane variety), 0.0=Greedy ArgMax")
-    parser.add_argument("--top_p", "--top-p", type=float, default=0.85, help="Nucleus Top-P cumulative probability threshold (default: 0.85)")
+    parser.add_argument("--temperature", "--temp", type=float, default=0.35, help="Sampling temperature: 0.35=natural entropy, 0.0=Greedy ArgMax")
+    parser.add_argument("--top_p", "--top-p", type=float, default=0.90, help="Nucleus Top-P cumulative probability threshold (default: 0.90)")
     parser.add_argument("--greedy", action="store_true", help="Force deterministic ArgMax decoding")
     parser.add_argument("--conf", "--confidence", type=float, default=0.0, help="Active Note Confidence Threshold P(active) in [0.0..1.0] (default: 0.0, unconstrained raw neural logits).")
     parser.add_argument("--silence", "--silence_gate", type=float, default=0.0, help="Acoustic silence noise gate threshold (default: 0.0, zero artificial gating).")
-    parser.add_argument("--ln_conf", "--ln-thresh", "--ln", type=float, default=0.40, help="Long Note (slider) activation threshold: 0.40 (matches 99.8%% validation), 0.20=dense LN, 0.70=very few LN")
+    parser.add_argument("--ln_conf", "--ln-thresh", type=float, default=0.78, help="Long Note sustain threshold (default: 0.78)")
     parser.add_argument(
         "--timing_mode",
         type=str,
@@ -480,9 +477,6 @@ def main():
             ln_conf_thresh=args.ln_conf,
             silence_gate=args.silence,
             timing_mode=args.timing_mode,
-            diffusion_steps=args.steps,
-            cfg_scale=args.cfg,
-            use_diffusion=args.diffusion if args.diffusion else None,
         )
 
         print("\n" + "=" * 65)

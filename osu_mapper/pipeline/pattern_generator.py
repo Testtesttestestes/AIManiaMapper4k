@@ -491,128 +491,51 @@ def generate_patterns_with_model3(
     with torch.no_grad():
         full_audio_memory = model.audio_encoder(tick_mel_tensor.unsqueeze(0))  # [1, num_ticks, d_model]
 
-    print(f"  • Executing Validation-Identical Neural Rollout across {num_ticks} musical grid ticks (Target SR: {star_rating:.2f}*)...")
-
     # Maintain real-time 4-lane physical activity state
     lane_states_seq = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
+    tick_times_list = [float(t_obj.time_ms) for t_obj in ticks]
     beat_len_ms = 60000.0 / max(30.0, bpm)
 
     generated_tokens: List[int] = [0] * num_ticks
+    all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(num_ticks)]
+    active_notes_history: List[int] = []
+
+    # State Machine tracking for Long Notes (Sliders) across neural jumps
     active_ln_starts: Dict[int, Optional[int]] = {0: None, 1: None, 2: None, 3: None}
     hit_objects: List[ManiaHitObject] = []
     total_taps = 0
     total_lns = 0
 
+    # 1. Acoustic Silence & Break Gating threshold
+    effective_silence_gate = max(0.12, float(silence_gate))
+
+    print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
+
     # Calibrated minimum physical LN duration (in ms)
     min_ln_ms = max(110.0, beat_len_ms * 0.35)
-    ctx_len = 128
 
-    # Effective LN threshold (0.40 matches 99.8% validation)
-    effective_ln_thresh = float(ln_conf_thresh) if (ln_conf_thresh is not None and ln_conf_thresh > 0) else 0.40
+    # Autoregressive generation: neural step jump causality with rolling context
+    ctx_len = 64
+    
+    # Start generation at first active timing offset
+    target_start_ms = float(offset_ms) if offset_ms is not None else 0.0
+    cur_pos = max(0, bisect.bisect_left(tick_times_list, target_start_ms))
+    consecutive_silence_ticks = 0
 
-    # Effective active note threshold calibrated to Star Rating (prevents long empty gaps)
-    # At 3.6*, calibrated_thresh is ~0.18, meaning if Model 3 sees >=18% note probability, it places the note!
-    calibrated_active_thresh = max(0.08, min(0.28, 0.28 - (float(star_rating) - 1.0) * 0.04))
-    if note_conf_thresh is not None and note_conf_thresh > 0:
-        calibrated_active_thresh = float(note_conf_thresh)
-
-    min_tick_gap_ms = max(50.0, beat_len_ms * 0.125)  # Physical minimum gap (1/8 beat, never 18ms collision)
-    last_placed_note_ms = -9999.0
-
-    for cur_pos in range(num_ticks):
-        t_obj = ticks[cur_pos]
-        cur_time_ms = int(round(t_obj.time_ms))
-        if cur_time_ms >= (duration_ms - 50.0):
+    while cur_pos < num_ticks:
+        cur_time_ms = int(round(ticks[cur_pos].time_ms))
+        if cur_time_ms >= (duration_ms - 100.0):
             break
 
-        ctx_start = max(0, cur_pos - ctx_len + 1)
+        ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
 
-        window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_grid = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
-
-        # Rolling prev_tokens & lane_states (identically shifted by 1 as in train.py validation)
-        window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
-        if cur_pos > ctx_start:
-            window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
-                generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
-            )
-        window_lane_states = torch.zeros(1, window_len, 4, dtype=torch.int64, device=dev)
-        if cur_pos > ctx_start:
-            window_lane_states[0, 1 : cur_pos - ctx_start + 1] = lane_states_seq[ctx_start:cur_pos]
-
-        # Rolling strain trajectory
-        local_recent_notes = sum(1 for tok_v in generated_tokens[ctx_start:cur_pos] if tok_v > 0)
-        running_density = local_recent_notes / max(1, window_len)
-        density_ratio = min(5.0, running_density / target_density)
-        strain_metrics_tensor[cur_pos, 0] = float(running_density)
-        strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
-        window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-
-        with torch.no_grad():
-            try:
-                c_logits, l_logits = model(
-                    window_mel,
-                    star_rating=sr_tensor,
-                    prev_tokens=window_prev_tokens,
-                    lane_states=window_lane_states,
-                    grid_metrics=window_grid,
-                    scaffold_tokens=window_scaffold,
-                    strain_metrics=window_strain,
-                    audio_memory=window_audio_memory,
-                    multiscale_audio=window_multiscale,
-                )
-            except Exception:
-                c_logits, l_logits, _, _ = model(
-                    window_mel,
-                    star_rating=sr_tensor,
-                    prev_tokens=window_prev_tokens,
-                    lane_states=window_lane_states,
-                    grid_metrics=window_grid,
-                    scaffold_tokens=window_scaffold,
-                    strain_metrics=window_strain,
-                    audio_memory=window_audio_memory,
-                    multiscale_audio=window_multiscale,
-                    return_sr=True,
-                    return_time_delta=True,
-                )
-
-            step_c_logits = c_logits[0, -1]
-            step_l_logits = l_logits[0, -1]
-
-            probs_raw = F.softmax(step_c_logits, dim=-1)
-            p_active = float((1.0 - probs_raw[0]).item())
-
-            # Scaffold guidance: if scaffold has an acoustic onset or it's a downbeat, lower the threshold so verses are never empty!
-            has_scaff = (int(window_scaffold[0, -1].item()) > 0) or t_obj.is_downbeat or (t_obj.is_beat_start and star_rating >= 2.5)
-            effective_thresh = max(0.08, calibrated_active_thresh * 0.70) if has_scaff else calibrated_active_thresh
-
-            # Decide note presence based on neural active probability:
-            is_physically_too_close = (cur_time_ms - last_placed_note_ms) < (min_tick_gap_ms - 5.0)
-
-            if is_physically_too_close:
-                tok = 0
-            elif step_c_logits.argmax().item() > 0:
-                tok = int(step_c_logits.argmax().item())
-            elif p_active >= effective_thresh:
-                # Active note detected by model
-                tok = int(step_c_logits[1:].argmax().item()) + 1
-            else:
-                tok = 0
-
-            ln_probs = torch.sigmoid(step_l_logits).cpu().tolist()
-
-        generated_tokens[cur_pos] = tok
-
-        # Process hit objects strictly from neural tokens:
-        if tok > 0:
-            last_placed_note_ms = float(cur_time_ms)
-            active_cols = token_to_keys(tok)
-            for c in active_cols:
-                # Release existing LN if new note hits the same column
+        # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet outros
+        cur_energy_ratio = grid_metrics_list[cur_pos][5]
+        if cur_energy_ratio < effective_silence_gate:
+            consecutive_silence_ticks += 1
+            # Close any open sliders on song break or silence
+            for c in range(4):
                 if active_ln_starts[c] is not None:
                     start_t = active_ln_starts[c]
                     hold_len = cur_time_ms - start_t
@@ -624,34 +547,335 @@ def generate_patterns_with_model3(
                         hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
                         total_taps += 1
                     active_ln_starts[c] = None
+                    lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
 
-                # Check if this note is a Long Note (slider) or Tap
-                if ln_probs[c] >= effective_ln_thresh:
+            generated_tokens[cur_pos] = 0
+            all_ln_probs[cur_pos] = [0.0, 0.0, 0.0, 0.0]
+
+            # If song has been completely silent for more than 4 seconds past middle of track, exit gracefully
+            if consecutive_silence_ticks > 48 and (cur_time_ms > duration_ms * 0.6):
+                break
+
+            cur_pos = max(cur_pos + 1, bisect.bisect_left(tick_times_list, cur_time_ms + beat_len_ms / 2.0))
+            continue
+        else:
+            consecutive_silence_ticks = 0
+
+        window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+
+        window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
+        if cur_pos > ctx_start:
+            window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
+                generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
+            )
+
+        # Dynamic live strain trajectory computed over LOCAL rolling window (matching training distribution)
+        local_recent_notes = sum(1 for tok_v in generated_tokens[ctx_start:cur_pos] if tok_v > 0)
+        running_density = local_recent_notes / max(1, window_len)
+        density_ratio = min(5.0, running_density / target_density)
+        strain_metrics_tensor[cur_pos, 0] = float(running_density)
+        strain_metrics_tensor[cur_pos, 1] = float(density_ratio)
+
+        window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
+
+        with torch.no_grad():
+            try:
+                chord_logits, ln_logits, _, pred_time_deltas = model(
+                    window_mel,
+                    star_rating=sr_tensor,
+                    prev_tokens=window_prev_tokens,
+                    lane_states=window_lane_states,
+                    grid_metrics=window_grid_metrics,
+                    scaffold_tokens=window_scaffold,
+                    strain_metrics=window_strain,
+                    audio_memory=window_audio_memory,
+                    multiscale_audio=window_multiscale,
+                    return_sr=True,
+                    return_time_delta=True,
+                )
+                pred_dt_ms = float(pred_time_deltas[0, -1, 0].item())
+            except Exception:
+                chord_logits, ln_logits = model(
+                    window_mel,
+                    star_rating=sr_tensor,
+                    prev_tokens=window_prev_tokens,
+                    lane_states=window_lane_states,
+                    grid_metrics=window_grid_metrics,
+                    scaffold_tokens=window_scaffold,
+                    strain_metrics=window_strain,
+                    audio_memory=window_audio_memory,
+                    multiscale_audio=window_multiscale,
+                )
+                pred_dt_ms = beat_len_ms / (4.0 if star_rating >= 4.0 else 2.0)
+
+            cur_chord_logits = chord_logits[0, -1].clone()   # [16]
+            cur_ln_logits = ln_logits[0, -1].clone()         # [4]
+
+            active_logits = cur_chord_logits.clone()
+            active_logits[0] = -1e9  # Suppress idle class at hit anchors
+
+            # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
+            is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
+            prev_tok = active_notes_history[-1] if active_notes_history else 0
+            prev_k = bin(prev_tok).count("1")
+
+            for t_i in range(1, 16):
+                k_cnt = bin(t_i).count("1")
+                if star_rating < 2.0 and k_cnt > 1:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 3.5 and k_cnt > 2:
+                    active_logits[t_i] = -1e9
+                elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
+                    active_logits[t_i] = -1e9
+                elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
+                    # Quads only on heavy downbeats for 6.0*+
+                    active_logits[t_i] = -1e9
+
+                # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
+                if star_rating >= 5.0 and k_cnt >= 2:
+                    active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
+
+                # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
+                if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
+                    active_logits[t_i] -= 8.0
+
+            # 2. Discourage new taps on lanes currently occupied by a held slider
+            for c in range(4):
+                if active_ln_starts[c] is not None:
+                    for t_cand in range(1, 16):
+                        if (t_cand >> c) & 1:
+                            active_logits[t_cand] -= 10.0
+
+            # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            if len(active_notes_history) >= 4:
+                if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
+                    active_logits[active_notes_history[-1]] -= 12.0
+                    active_logits[active_notes_history[-2]] -= 12.0
+
+            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
+            if len(active_notes_history) >= 2 and star_rating < 8.0:
+                if active_notes_history[-1] == active_notes_history[-2]:
+                    active_logits[active_notes_history[-1]] -= 15.0
+
+            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
+            recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
+            if recent_active:
+                lane_usage = [0, 0, 0, 0]
+                for tok_val in recent_active:
+                    for c in token_to_keys(tok_val):
+                        lane_usage[c] += 1
+                for c in range(4):
+                    if lane_usage[c] >= 6:
+                        for t_cand in range(1, 16):
+                            if (t_cand >> c) & 1:
+                                active_logits[t_cand] -= 4.0
+
+            eff_temp = 0.35 if (temperature <= 0.05 and not greedy) else max(0.1, temperature)
+            if greedy:
+                tok = int(active_logits.argmax().item())
+            else:
+                scaled = active_logits / eff_temp
+                probs = F.softmax(scaled, dim=-1)
+                tok = int(torch.multinomial(probs, 1).item())
+
+            new_lns = torch.sigmoid(cur_ln_logits).cpu().tolist()
+
+        generated_tokens[cur_pos] = tok
+        all_ln_probs[cur_pos] = new_lns
+        active_notes_history.append(tok)
+
+        # -------------------------------------------------------------
+        # Continuous State Machine: Hold / Unhold across Neural Jumps
+        # -------------------------------------------------------------
+        new_cols = set(token_to_keys(tok))
+
+        # Check existing ongoing sliders: continue holding or unhold?
+        for c in range(4):
+            if active_ln_starts[c] is not None:
+                is_held = (new_lns[c] >= 0.35) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
+                if is_held:
+                    lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
+                else:
+                    start_t = active_ln_starts[c]
+                    hold_len = cur_time_ms - start_t
+                    if hold_len >= min_ln_ms:
+                        end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                        total_lns += 1
+                    else:
+                        # Graceful Tap fallback
+                        hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                        total_taps += 1
+                    active_ln_starts[c] = None
+                    lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
+
+        # Process new hit object strikes for this step
+        for c in new_cols:
+            if active_ln_starts[c] is None:
+                # If LN probability is strong, start a new slider
+                if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
                     active_ln_starts[c] = cur_time_ms
                     lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
                 else:
-                    hit_objects.append(ManiaHitObject(column=c, start_time=cur_time_ms, end_time=cur_time_ms, is_ln=False))
+                    # Standard Single Tap
+                    hit_objects.append(
+                        ManiaHitObject(
+                            column=c,
+                            start_time=cur_time_ms,
+                            end_time=cur_time_ms,
+                            is_ln=False,
+                        )
+                    )
                     total_taps += 1
                     lane_states_seq[cur_pos, c] = 1  # STATE_TAP
+            else:
+                # Lane was already held; re-striking closes previous note cleanly
+                start_t = active_ln_starts[c]
+                hold_len = cur_time_ms - start_t
+                if hold_len >= min_ln_ms:
+                    end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
+                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
+                    total_lns += 1
+                else:
+                    hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
+                    total_taps += 1
+
+                hit_objects.append(ManiaHitObject(column=c, start_time=cur_time_ms, end_time=cur_time_ms, is_ln=False))
+                total_taps += 1
+                active_ln_starts[c] = None
+                lane_states_seq[cur_pos, c] = 1
+
+        # -------------------------------------------------------------
+        # Time Advancement & Snapping Dispatcher (4 Configurable Modes):
+        # 1. 'soft_snap': Continuous model step with gentle magnetic lock (<=6.5ms) to any musical divisor
+        # 2. 'universal_grid': Universal multi-divisor grid (binary + ternary simultaneous)
+        # 3. 'residual': Macro meter anchor + continuous micro-timing residual offset
+        # 4. 'quantized': Legacy rigid 1/8 binary quantization (preserved as baseline)
+        # -------------------------------------------------------------
+        timing_mode_norm = str(timing_mode).lower().strip()
+        raw_beats = pred_dt_ms / beat_len_ms
+        has_dense_drop = (cur_energy_ratio >= 0.85) and (star_rating >= 3.2)
+        is_calm_section = (cur_energy_ratio < 0.60)
+
+        if timing_mode_norm in ("soft_snap", "soft", "magnetic", "free_snap"):
+            # Mode 1: Soft-Magnetic Snapping (Continuous time with magnetic lock to nearest tick)
+            raw_jump_ms = max(beat_len_ms * 0.0625, float(pred_dt_ms))
+            raw_target_ms = ticks[cur_pos].time_ms + raw_jump_ms
+            nearest_idx = bisect.bisect_left(tick_times_list, raw_target_ms)
+            cand_indices = []
+            if nearest_idx > 0:
+                cand_indices.append(nearest_idx - 1)
+            if nearest_idx < len(tick_times_list):
+                cand_indices.append(nearest_idx)
+            if nearest_idx + 1 < len(tick_times_list):
+                cand_indices.append(nearest_idx + 1)
+
+            best_idx = cand_indices[0] if cand_indices else cur_pos + 1
+            best_dist = abs(tick_times_list[best_idx] - raw_target_ms)
+            for c_i in cand_indices[1:]:
+                dist_cand = abs(tick_times_list[c_i] - raw_target_ms)
+                if dist_cand < best_dist:
+                    best_dist = dist_cand
+                    best_idx = c_i
+
+            # Magnetic lock to nearest tick
+            target_next_pos = max(cur_pos + 1, best_idx)
+
+        elif timing_mode_norm in ("universal_grid", "hybrid_grid", "universal"):
+            # Mode 2: Universal Multi-Divisor Grid (Binary + Ternary simultaneous: 1/1, 1/2, 1/3, 1/4, 1/6, 1/8, 1/12, 1/16)
+            if star_rating < 2.5:
+                cand_divs = [1.0, 0.5, 0.3333]
+            elif star_rating < 4.0:
+                cand_divs = [0.5, 0.3333, 0.25, 0.1667]
+            elif star_rating < 6.0:
+                cand_divs = [0.3333, 0.25, 0.1667, 0.125] if has_dense_drop else [0.5, 0.3333, 0.25]
+            elif star_rating < 9.0:
+                cand_divs = [0.25, 0.1667, 0.125, 0.0833]
+            else:
+                cand_divs = [0.125, 0.0833, 0.0625]
+
+            quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
+            quantized_jump_ms = quantized_fraction * beat_len_ms
+            target_time_ms = ticks[cur_pos].time_ms + quantized_jump_ms
+            next_pos = bisect.bisect_left(tick_times_list, target_time_ms - 3.0)
+            target_next_pos = max(cur_pos + 1, next_pos)
+
+        elif timing_mode_norm in ("residual", "anchor_residual", "micro"):
+            # Mode 3: Macro meter anchor + Continuous Micro-Timing Residual (+-25ms)
+            macro_divs = [1.0, 0.5, 0.3333, 0.25, 0.1667, 0.125]
+            anchor_frac = min(macro_divs, key=lambda d: abs(d - raw_beats))
+            anchor_jump_ms = anchor_frac * beat_len_ms
+            residual_ms = max(-25.0, min(25.0, float(pred_dt_ms) - anchor_jump_ms))
+            effective_jump_ms = max(beat_len_ms * 0.0625, anchor_jump_ms + residual_ms)
+            target_time_ms = ticks[cur_pos].time_ms + effective_jump_ms
+            next_pos = bisect.bisect_left(tick_times_list, target_time_ms - 4.0)
+            target_next_pos = max(cur_pos + 1, next_pos)
+
         else:
-            # Idle / Rest tick (tok == 0): manage ongoing slider holds/releases
-            for c in range(4):
-                if active_ln_starts[c] is not None:
-                    hold_duration = cur_time_ms - active_ln_starts[c]
-                    # Release slider when LN probability drops or after 4 full beats
-                    if (ln_probs[c] < effective_ln_thresh * 0.5) or (hold_duration >= (beat_len_ms * 4.0)):
-                        start_t = active_ln_starts[c]
-                        if hold_duration >= min_ln_ms:
-                            end_t = max(start_t + int(round(min_ln_ms)), cur_time_ms - 30)
-                            hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
-                            total_lns += 1
-                        else:
-                            hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
-                            total_taps += 1
-                        active_ln_starts[c] = None
-                        lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
-                    else:
-                        lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
+            # Mode 4: Legacy Rigid 1/8 Binary Quantization (Baseline preserved)
+            if star_rating < 2.5:
+                cand_divs = [1.0, 2.0] if is_calm_section else [0.5, 1.0]
+            elif star_rating < 4.0:
+                if has_dense_drop:
+                    cand_divs = [0.25, 0.5]
+                elif is_calm_section:
+                    cand_divs = [0.5, 1.0]
+                else:
+                    cand_divs = [0.25, 0.5, 1.0]
+            elif star_rating < 6.0:
+                if has_dense_drop:
+                    cand_divs = [0.25]  # Dense 1/4 streams during drops/kiai
+                elif is_calm_section:
+                    cand_divs = [0.5, 1.0]
+                else:
+                    cand_divs = [0.25, 0.5]
+            elif star_rating < 9.0:
+                # 6.0* - 9.0*: 1/4 streams with 1/8 burst rolls on drops
+                if has_dense_drop:
+                    cand_divs = [0.125, 0.25]
+                else:
+                    cand_divs = [0.25]
+            elif star_rating < 13.0:
+                # 9.0* - 13.0*: dense 1/8 streams and jumpstreams
+                cand_divs = [0.125] if has_dense_drop else [0.125, 0.25]
+            else:
+                # 13.0* - 16.0*+: extreme 1/12 and 1/8 chordstreams
+                cand_divs = [0.0833, 0.125]
+
+            quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
+            quantized_jump_ms = quantized_fraction * beat_len_ms
+            target_time_ms = ticks[cur_pos].time_ms + quantized_jump_ms
+            next_pos = bisect.bisect_left(tick_times_list, target_time_ms - 5.0)
+            target_next_pos = max(cur_pos + 1, next_pos)
+
+        # Ornith Watchdog Level 1: Anti-Overshoot Interceptor
+        # Prevents model from leaping over unmapped strong musical attacks (kicks/snares/downbeats)
+        if target_next_pos > cur_pos + 1:
+            for intermediate_i in range(cur_pos + 1, target_next_pos):
+                scaff_val = int(scaffold_tokens_tensor[intermediate_i].item())
+                inter_energy = grid_metrics_list[intermediate_i][5]
+                is_db = ticks[intermediate_i].is_downbeat
+                div_val = ticks[intermediate_i].divisor
+
+                should_intercept = False
+                if scaff_val > 0 and inter_energy >= effective_silence_gate:
+                    if is_db:
+                        should_intercept = True
+                    elif star_rating >= 3.0 and div_val in (1, 2, 4):
+                        should_intercept = True
+                    elif star_rating >= 6.0:
+                        should_intercept = True
+
+                if should_intercept:
+                    target_next_pos = intermediate_i
+                    break
+
+        cur_pos = target_next_pos
 
     # Close any lingering sliders at the end of track
     final_track_ms = min(duration_ms, int(round(ticks[-1].time_ms)))
@@ -667,6 +891,145 @@ def generate_patterns_with_model3(
                 hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
                 total_taps += 1
             active_ln_starts[c] = None
+
+    # -------------------------------------------------------------
+    # Ornith Self-Improvement Loop: Acoustic Critic & Refinement Inpainting Pass
+    # -------------------------------------------------------------
+    # Critic scans the full generated rollout: detects missed acoustic onsets and density gaps
+    existing_note_times = set(o.start_time for o in hit_objects)
+    missed_ticks_to_inpaint: List[int] = []
+
+    for k in range(num_ticks):
+        t_k = int(round(ticks[k].time_ms))
+        if t_k >= duration_ms - 100:
+            break
+
+        # Check if any note was already placed near this tick (within +-35ms)
+        has_nearby_note = False
+        for dt_chk in (-35, -20, 0, 20, 35):
+            if (t_k + dt_chk) in existing_note_times:
+                has_nearby_note = True
+                break
+
+        if has_nearby_note:
+            continue
+
+        scaff_val = int(scaffold_tokens_tensor[k].item())
+        k_energy = grid_metrics_list[k][5]
+        is_db = ticks[k].is_downbeat
+        div_val = ticks[k].divisor
+
+        # Critic criteria for a missed transient:
+        # 1. Audible energy above silence threshold
+        # 2. Presence of spectral onset or downbeat
+        # 3. Compatible with target difficulty (higher SR captures faster subdivisions)
+        is_missed_onset = False
+        if k_energy >= max(0.55, effective_silence_gate):
+            if is_db:
+                is_missed_onset = True
+            elif scaff_val > 0 and star_rating >= 3.0 and div_val in (1, 2, 4):
+                is_missed_onset = True
+            elif scaff_val > 0 and star_rating >= 6.0:
+                is_missed_onset = True
+
+        if is_missed_onset:
+            missed_ticks_to_inpaint.append(k)
+
+    if missed_ticks_to_inpaint:
+        print(f"  • [Ornith Critic] Detected {len(missed_ticks_to_inpaint)} unmapped acoustic transients; executing neural inpainting pass...")
+        infilled_count = 0
+        with torch.no_grad():
+            for k in missed_ticks_to_inpaint:
+                t_k = int(round(ticks[k].time_ms))
+                ctx_start = max(0, k - ctx_len)
+                w_len = (k + 1) - ctx_start
+
+                # Query Model 3 with bidirectional audio context centered on the missed transient
+                w_mel = tick_mel_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_multi = multiscale_pyramid_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_lane = lane_states_seq[ctx_start : k + 1].unsqueeze(0)
+                w_grid = grid_metrics_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_scaff = scaffold_tokens_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_strain = strain_metrics_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_audio = full_audio_memory[:, ctx_start : k + 1]
+
+                w_prev = torch.zeros(1, w_len, dtype=torch.int64, device=dev)
+                if k > ctx_start:
+                    w_prev[0, 1 : k - ctx_start + 1] = torch.tensor(
+                        generated_tokens[ctx_start:k], dtype=torch.int64, device=dev
+                    )
+
+                try:
+                    c_logits, l_logits, _, _ = model(
+                        w_mel,
+                        star_rating=sr_tensor,
+                        prev_tokens=w_prev,
+                        lane_states=w_lane,
+                        grid_metrics=w_grid,
+                        scaffold_tokens=w_scaff,
+                        strain_metrics=w_strain,
+                        audio_memory=w_audio,
+                        multiscale_audio=w_multi,
+                        return_sr=True,
+                        return_time_delta=True,
+                    )
+                except Exception:
+                    c_logits, l_logits = model(
+                        w_mel,
+                        star_rating=sr_tensor,
+                        prev_tokens=w_prev,
+                        lane_states=w_lane,
+                        grid_metrics=w_grid,
+                        scaffold_tokens=w_scaff,
+                        strain_metrics=w_strain,
+                        audio_memory=w_audio,
+                        multiscale_audio=w_multi,
+                    )
+
+                cur_c_logits = c_logits[0, -1].clone()
+                cur_c_logits[0] = -1e9  # We require a hit note at the missed onset
+
+                # Mask lanes currently held by long notes at time t_k
+                for col_idx in range(4):
+                    is_lane_busy = any(
+                        (o.column == col_idx and o.is_ln and o.start_time < t_k < o.end_time)
+                        for o in hit_objects
+                    )
+                    if is_lane_busy:
+                        for cand_tok in range(1, 16):
+                            if (cand_tok >> col_idx) & 1:
+                                cur_c_logits[cand_tok] = -1e9
+
+                infill_tok = int(cur_c_logits.argmax().item())
+                if infill_tok > 0:
+                    generated_tokens[k] = infill_tok
+                    infill_cols = token_to_keys(infill_tok)
+                    infill_ln_probs = torch.sigmoid(l_logits[0, -1]).cpu().tolist()
+                    all_ln_probs[k] = infill_ln_probs
+
+                    for c in infill_cols:
+                        if (star_rating >= 2.5) and (infill_ln_probs[c] >= 0.50):
+                            hit_objects.append(ManiaHitObject(
+                                column=c,
+                                start_time=t_k,
+                                end_time=t_k + int(round(min_ln_ms)),
+                                is_ln=True,
+                            ))
+                            total_lns += 1
+                        else:
+                            hit_objects.append(ManiaHitObject(
+                                column=c,
+                                start_time=t_k,
+                                end_time=t_k,
+                                is_ln=False,
+                            ))
+                            total_taps += 1
+
+                    existing_note_times.add(t_k)
+                    infilled_count += 1
+
+        if infilled_count > 0:
+            print(f"  ✓ [Ornith Critic] Successfully self-corrected {infilled_count} missed notes via neural inpainting.")
 
     # -------------------------------------------------------------
     # Ranked-Compliant Slider & Collision Solver (Zero Lost Notes, Zero Overlaps)

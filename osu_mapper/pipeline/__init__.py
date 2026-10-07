@@ -44,9 +44,6 @@ def generate_beatmap_pipeline(
     ln_conf_thresh: float = 0.78,
     silence_gate: float = 0.0,
     timing_mode: str = "soft_snap",
-    diffusion_steps: int = 30,
-    cfg_scale: float = 3.0,
-    use_diffusion: Optional[bool] = None,
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
@@ -133,38 +130,25 @@ def generate_beatmap_pipeline(
             rms_profile=audio_analysis.rms_profile,
         )
 
-    # Step 3: Neural Pattern Synthesis (ManiaDiffusion or Model 3 Transformer)
-    diff_ckpt = None
-    for cand in (Path("checkpoints/mania_diffusion_best.pt"), Path("checkpoints/mania_diffusion_latest.pt")):
-        if cand.exists():
-            diff_ckpt = str(cand)
-            break
-
+    # Step 3: Model 3 (ManiaPatternTransformer) Neural Pattern Synthesis
     m3_ckpt = pattern_model_checkpoint
-    if m3_ckpt is not None:
-        if "diff" in str(m3_ckpt).lower():
-            diff_ckpt = str(m3_ckpt)
-            m3_ckpt = None
-
-    if m3_ckpt is None and diff_ckpt is None and not prefer_algorithmic:
+    if m3_ckpt is None and not prefer_algorithmic:
         for cand in (Path("checkpoints/model_3_transformer_best.pt"), Path("checkpoints/model_3_transformer_last.pt")):
             if cand.exists():
                 m3_ckpt = str(cand)
                 break
 
-    should_use_diffusion = bool(use_diffusion or (diff_ckpt is not None and not prefer_algorithmic and (use_diffusion is not False)))
-
-    if force_neural and (m3_ckpt is None and diff_ckpt is None):
+    if force_neural and (m3_ckpt is None or not Path(m3_ckpt).exists()):
         raise FileNotFoundError(
-            f"Neural generation was requested (--neural), but no trained checkpoint was found!\n"
-            f"Expected file: checkpoints/mania_diffusion_best.pt or checkpoints/model_3_transformer_best.pt.\n"
-            f"To train ManiaDiffusion weights first, run:\n"
-            f"  python train_diffusion.py --epochs 100"
+            f"Neural generation was requested (--neural), but Model 3 checkpoint was not found!\n"
+            f"Expected file: checkpoints/model_3_transformer_best.pt (or specify with -c <path>).\n"
+            f"To train Model 3 weights first, run:\n"
+            f"  python train.py --model transformer --epochs 15"
         )
 
     # Pre-extract spectrogram once for all difficulties
     mel = None
-    if (m3_ckpt or diff_ckpt) and not prefer_algorithmic:
+    if m3_ckpt and Path(m3_ckpt).exists() and not prefer_algorithmic:
         try:
             from osu_mapper.dataset.feature_extractor import compute_mel_spectrogram, extract_audio_waveform
             audio_wav = extract_audio_waveform(wav_path, target_sr=16000)
@@ -183,31 +167,7 @@ def generate_beatmap_pipeline(
         hit_objects: List[ManiaHitObject] = []
         used_neural = False
 
-        # Mode A: ManiaDiffusion (1D Latent Beatmap Diffusion)
-        if should_use_diffusion and mel is not None and not prefer_algorithmic:
-            try:
-                from .diffusion_generator import generate_patterns_with_diffusion
-                active_diff_ckpt = diff_ckpt or m3_ckpt or "checkpoints/mania_diffusion_best.pt"
-                hit_objects = generate_patterns_with_diffusion(
-                    checkpoint_path=active_diff_ckpt,
-                    audio_mel=mel,
-                    bpm=effective_bpm,
-                    offset_ms=effective_offset,
-                    duration_ms=audio_analysis.duration_ms,
-                    star_rating=sr,
-                    timing_points=timing_points,
-                    num_inference_steps=diffusion_steps,
-                    cfg_scale=cfg_scale,
-                )
-                used_neural = True
-                print(f"✨ [ManiaDiffusion] Successfully synthesized {len(hit_objects)} beatmap hit objects via DDIM.")
-            except Exception as err:
-                if force_neural and diff_ckpt:
-                    raise RuntimeError(f"ManiaDiffusion generation failed: {err}")
-                print(f"⚠️ [ManiaDiffusion Notice] Diffusion synthesis ({err}), falling back to Model 3 / algorithmic.")
-
-        # Mode B: Model 3 (Autoregressive Transformer)
-        if not used_neural and m3_ckpt and Path(m3_ckpt).exists() and mel is not None and not prefer_algorithmic:
+        if m3_ckpt and Path(m3_ckpt).exists() and mel is not None and not prefer_algorithmic:
             try:
                 hit_objects = generate_patterns_with_model3(
                     checkpoint_path=m3_ckpt,
@@ -232,7 +192,6 @@ def generate_beatmap_pipeline(
                     raise RuntimeError(f"Neural pattern generation failed: {err}")
                 print(f"⚠️ [Model 3 Warning] Neural pattern synthesis failed ({err}), falling back to algorithmic generation.")
 
-        # Mode C: Algorithmic fallback
         if not used_neural or not hit_objects:
             print(f"ℹ️ [Pattern Generator] Using algorithmic pattern synthesis (Conditioned on SR {sr:.2f}*)...")
             hit_objects = generate_patterns(
@@ -266,11 +225,53 @@ def generate_beatmap_pipeline(
         )
         delta = validated_sr - sr
 
-        # Pack single difficulty package directly without artificial multi-pass inflation
+        # Level 2: Closed-Loop Multi-Pass Difficulty Self-Refinement (Ornith Refinement Loop)
+        # If neural generation shows significant deviation from target difficulty, refine with adaptive feedback!
+        if used_neural and (delta < -0.35 or delta > 0.60):
+            print(f"  ⚡ [Ornith Refinement Pass 2] Target: {sr:.2f}* vs Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*). Initiating calibration & density elevation...")
+            # Compute calibrated target for Model 3's density controller
+            calibrated_sr = sr * ((sr / max(0.6, validated_sr)) ** 0.65)
+            calibrated_sr = min(16.0, max(1.0, calibrated_sr))
+            try:
+                refined_objects = generate_patterns_with_model3(
+                    checkpoint_path=m3_ckpt,
+                    audio_mel=mel,
+                    bpm=effective_bpm,
+                    offset_ms=effective_offset,
+                    duration_ms=audio_analysis.duration_ms,
+                    star_rating=calibrated_sr,
+                    timing_points=timing_points,
+                    temperature=temperature,
+                    top_p=top_p,
+                    greedy=greedy,
+                    note_conf_thresh=note_conf_thresh,
+                    ln_conf_thresh=ln_conf_thresh,
+                    silence_gate=silence_gate,
+                    timing_mode=timing_mode,
+                )
+                refined_osu = packager.generate_osu_content(timing_points, refined_objects)
+                refined_val_sr = calculate_osu_mania_star_rating(
+                    osu_text=refined_osu,
+                    keys=4,
+                    overall_difficulty=meta.overall_difficulty,
+                )
+                refined_delta = refined_val_sr - sr
+                # Accept refinement if it brought validated SR closer to target!
+                if abs(refined_delta) < abs(delta):
+                    print(f"  ✓ [Ornith Refinement] Pass 2 converged: {validated_sr:.2f}* -> {refined_val_sr:.2f}* (Delta: {refined_delta:+.2f}*)")
+                    hit_objects = refined_objects
+                    osu_str = refined_osu
+                    validated_sr = refined_val_sr
+                    delta = refined_delta
+                else:
+                    print(f"  ℹ️ [Ornith Refinement] Retaining Pass 1 (Pass 2 Delta: {refined_delta:+.2f}*)")
+            except Exception as ref_err:
+                print(f"  ⚠️ [Ornith Refinement] Refinement pass skipped: {ref_err}")
+
         diff_packages.append((meta, osu_str))
         osu_contents.append(osu_str)
 
-        status_tag = "✓ EXACT" if abs(delta) <= 0.25 else ("~ CLOSE" if abs(delta) <= 0.60 else "ℹ️ VALIDATED")
+        status_tag = "✓ EXACT" if abs(delta) <= 0.15 else ("~ CLOSE" if abs(delta) <= 0.40 else "⚠️ DEVIATION")
         print(f"  🔍 [rosu-pp Difficulty Validation] Target: {sr:.2f}* -> Validated: {validated_sr:.2f}* (Delta: {delta:+.2f}*) [{status_tag}]")
 
     # Bundle all difficulties into single .osz archive

@@ -42,50 +42,35 @@ def compute_acoustic_onset_scaffold(
     # 1. Compute spectral energy and spectral flux in linear power domain
     linear_mel = audio_mel.exp()
     frame_energy = linear_mel.mean(dim=-1)                                 # [B, T]
-
-    # Local adaptive running energy (5-second window ~300 frames) to prevent loud drops from silencing verses
-    win_size = min(301, max(31, (T // 16) * 2 + 1))
-    pad_w = win_size // 2
-    padded_e = F.pad(frame_energy.unsqueeze(1), (pad_w, pad_w), mode='replicate')
-    local_mean_energy = F.avg_pool1d(padded_e, kernel_size=win_size, stride=1).squeeze(1).clamp(min=1e-4) # [B, T]
-    rel_energy = (frame_energy / local_mean_energy).clamp(0.0, 10.0)      # [B, T]
-
-    # Global noise floor check (true silence vs quiet acoustic section)
-    global_max_e = frame_energy.max(dim=-1, keepdim=True)[0].clamp(min=1e-4)
-    abs_energy_ratio = frame_energy / global_max_e                         # [B, T]
-    not_silent = (abs_energy_ratio >= max(0.015, silence_threshold * 0.15)) # [B, T]
+    mean_energy = frame_energy.mean(dim=-1, keepdim=True).clamp(min=1e-4)   # [B, 1]
+    rel_energy = frame_energy / mean_energy                                # [B, T]
 
     # Spectral flux (half-wave rectified difference between consecutive frames)
     diff = torch.zeros_like(linear_mel)
     diff[:, 1:] = (linear_mel[:, 1:] - linear_mel[:, :-1]).clamp(min=0.0)
     flux = diff.mean(dim=-1)                                              # [B, T]
-    padded_f = F.pad(flux.unsqueeze(1), (pad_w, pad_w), mode='replicate')
-    local_mean_flux = F.avg_pool1d(padded_f, kernel_size=win_size, stride=1).squeeze(1).clamp(min=1e-4)
-    rel_flux = (flux / local_mean_flux).clamp(0.0, 10.0)                  # [B, T]
+    mean_flux = flux.mean(dim=-1, keepdim=True).clamp(min=1e-4)           # [B, 1]
+    rel_flux = flux / mean_flux                                            # [B, T]
 
     # Multi-band energy (Low: kick/bass 0..20)
     low_band = linear_mel[:, :, :20].mean(dim=-1)                         # [B, T]
     low_flux = torch.zeros_like(low_band)
     low_flux[:, 1:] = (low_band[:, 1:] - low_band[:, :-1]).clamp(min=0.0)
-    padded_lf = F.pad(low_flux.unsqueeze(1), (pad_w, pad_w), mode='replicate')
-    local_mean_lf = F.avg_pool1d(padded_lf, kernel_size=win_size, stride=1).squeeze(1).clamp(min=1e-4)
-    rel_low_flux = (low_flux / local_mean_lf).clamp(0.0, 10.0)
+    rel_low_flux = low_flux / (low_flux.mean(dim=-1, keepdim=True).clamp(min=1e-4))
 
     # Star rating & onset sensitivity
     sr_tensor = star_rating.view(B, 1) if star_rating.ndim == 1 else star_rating[:, :1]  # [B, 1]
-    onset_sens = (1.5 - (sr_tensor * 0.12)).clamp(min=0.4)                                # [B, 1]
+    onset_sens = (1.8 - (sr_tensor * 0.15)).clamp(min=0.5)                                # [B, 1]
 
     # Active mask based on audio transients
-    has_strong_onset = (rel_flux > onset_sens) | (rel_low_flux > (onset_sens * 1.1))
+    not_silent = (rel_energy >= silence_threshold)                                        # [B, T]
+    has_strong_onset = (rel_flux > onset_sens) | (rel_low_flux > (onset_sens * 1.2))
 
     if grid_metrics is not None:
         is_downbeat = (grid_metrics[:, :, 2] > 0.5)                                       # [B, T]
         div_f = grid_metrics[:, :, 0]                                                     # [B, T]
-        is_1_1_beat = (div_f < 0.05) | (div_f > 0.95)
-        is_1_2_beat = ((div_f >= 0.45) & (div_f <= 0.55))
-
-        # Downbeats & 1/1 beats always get pulse in audible sections; 1/2 beats pulse on SR >= 3.0
-        has_rhythm_pulse = is_downbeat | (is_1_1_beat & (rel_energy > 0.3)) | (is_1_2_beat & (sr_tensor >= 3.0) & (rel_energy > 0.5))
+        is_beat = (div_f < 0.05) | (div_f > 0.95)
+        has_rhythm_pulse = (is_downbeat & (rel_energy > 0.4)) | (is_beat & (rel_energy > 0.6) & (rel_flux > 0.8))
     else:
         is_downbeat = torch.zeros(B, T, dtype=torch.bool, device=device)
         has_rhythm_pulse = torch.zeros(B, T, dtype=torch.bool, device=device)
