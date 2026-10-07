@@ -32,6 +32,7 @@ export default function App() {
     durationSec: 30,
     lnProbability: 0.18,
     svFluctuation: 0.25,
+    passes: 2,
   });
 
   // Playback & Playfield simulation
@@ -747,11 +748,40 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Multi-Pass Generation Control */}
+                <div className="space-y-1.5 pt-1">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-300 font-medium flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-pink-400" />
+                      Neural Refinement Passes
+                    </span>
+                    <span className="font-mono text-pink-400 font-bold">
+                      {settings.passes} {settings.passes === 1 ? "Pass (Draft)" : settings.passes === 2 ? "Passes (Draft + Refine)" : "Passes (Iterative Polish)"}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="5"
+                    step="1"
+                    value={settings.passes}
+                    onChange={(e) => setSettings({ ...settings, passes: parseInt(e.target.value) || 1 })}
+                    className="w-full accent-pink-500 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-500 font-mono">
+                    <span>1 (Draft)</span>
+                    <span>2 (Recommended)</span>
+                    <span>3 (Sculpt)</span>
+                    <span>4 (High Polish)</span>
+                    <span>5 (Maximum)</span>
+                  </div>
+                </div>
+
                 {/* CLI Command Helper */}
                 <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-1 font-mono">
                   <span className="text-slate-500 text-[10px]">Equivalent CLI Command:</span>
                   <div className="text-pink-300 break-all">
-                    python3 generate_beatmap.py audio.wav --sr {settings.starRating.toFixed(1)} --bpm {settings.bpm}
+                    python generate_beatmap.py audio.wav --sr {settings.starRating.toFixed(1)} --bpm {settings.bpm} --passes {settings.passes} --neural
                   </div>
                 </div>
 
@@ -1013,6 +1043,51 @@ export default function App() {
                     <div className="p-2 rounded bg-slate-950 font-mono text-[11px] text-indigo-300 border border-slate-800 mt-2">
                       python train.py --model 3 --timing_source model1
                     </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Multi-Pass Iterative Refinement Architecture Breakdown */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-pink-400" />
+                    Multi-Pass Neural Refinement & Self-Revision Architecture
+                  </h4>
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-pink-500/10 text-pink-300 border border-pink-500/20">
+                    N-Pass Iterative Engine
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Instead of generating patterns in a single crude pass, the model employs multi-stage iterative refinement:
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+                  <div className="p-3 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1.5">
+                    <div className="text-xs font-bold text-indigo-400 flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-[10px] font-bold">1</span>
+                      Pass 1: Algorithmic / Onset Draft
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      Model synthesizes initial hit object candidates conditioned on the acoustic onset scaffold and musical grid metrics.
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1.5">
+                    <div className="text-xs font-bold text-pink-400 flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-pink-500/20 text-pink-300 flex items-center justify-center text-[10px] font-bold">2</span>
+                      Pass 2: Neural Self-Refinement
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      The model takes its OWN previous draft as input scaffold: prunes noise in quiet sections, fills missed downbeats, and shapes LNs.
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1.5">
+                    <div className="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-300 flex items-center justify-center text-[10px] font-bold">3</span>
+                      Pass 3+: Iterative Polish & SR Anchor
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      Tightly anneals sampling temperature and calibrates density to exactly lock target Star Rating and ranked ergonomics.
+                    </p>
                   </div>
                 </div>
               </div>

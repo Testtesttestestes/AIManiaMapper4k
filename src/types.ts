@@ -16,4 +16,5 @@ export interface BeatmapGenerationSettings {
   durationSec: number;
   lnProbability: number;
   svFluctuation: number;
+  passes: number;
 }
