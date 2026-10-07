@@ -377,34 +377,19 @@ def compute_multi_scenario_scaffold_and_strain(
     for b in range(B):
         scenario_choice = torch.rand(1).item()
 
-        if scenario_choice < 0.35:
-            # Scenario A: Standard Acoustic Spectral Onset Scaffold
-            scaffold_tokens[b] = acoustic_scaffold[b]
-
-        elif scenario_choice < 0.70:
-            # Scenario B: Extreme Debris & Spam (Injected into acoustic scaffold, NOT ground truth)
-            debris = acoustic_scaffold[b].clone()
-            noise_rate = torch.empty(1).uniform_(0.40, 0.75).item()
-            noise_mask = torch.rand(T, device=device) < noise_rate
-            debris[noise_mask] = torch.randint(0, 16, (noise_mask.sum(),), device=device)
-
-            # Inject uncoordinated minijacks (repeated identical tokens in a single column)
-            if torch.rand(1).item() < 0.5:
-                jack_span = torch.randint(4, 16, (1,)).item()
-                start_j = torch.randint(0, max(1, T - jack_span), (1,)).item()
-                debris[start_j : start_j + jack_span] = 1 << torch.randint(0, 4, (1,)).item()
-
-            scaffold_tokens[b] = debris
-
-        elif scenario_choice < 0.85:
-            # Scenario C: Blank Scaffold (Forces model to synthesize 100% from audio)
+        if scenario_choice < 0.40:
+            # Scenario A: Blank Scaffold (Forces model to synthesize purely from audio & grid metrics)
             scaffold_tokens[b] = torch.zeros(T, dtype=torch.int64, device=device)
 
+        elif scenario_choice < 0.75:
+            # Scenario B: Realistic Acoustic Spectral Onset Scaffold
+            scaffold_tokens[b] = acoustic_scaffold[b]
+
         else:
-            # Scenario D: Soft Draft (15% jitter)
+            # Scenario C: Realistic Draft Refinement (Draft with minor missed notes and slight jitter)
             soft = acoustic_scaffold[b].clone()
             soft_mask = torch.rand(T, device=device) < 0.15
-            soft[soft_mask] = torch.randint(0, 16, (soft_mask.sum(),), device=device)
+            soft[soft_mask] = 0  # Mostly dropouts / missed notes rather than random spam
             scaffold_tokens[b] = soft
 
     return scaffold_tokens, strain_metrics

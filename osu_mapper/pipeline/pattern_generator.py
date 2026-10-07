@@ -530,20 +530,32 @@ def _run_single_neural_pass(
             cur_chord_logits = chord_logits[0, -1].clone()
             cur_ln_logits = ln_logits[0, -1].clone()
 
-            active_logits = cur_chord_logits.clone()
-            active_logits[0] = -1e9  # Suppress idle token at hit step
+            # Calibrate note activation: Allow token 0 (rest) naturally so model doesn't spam notes on every tick!
+            raw_probs = F.softmax(cur_chord_logits, dim=-1)
+            p_rest = float(raw_probs[0].item())
+            p_active = 1.0 - p_rest
 
-            # Scaffold Prior Reinforcement in Refinement Mode:
-            # If previous pass had a note here, give a positive prior bias if acoustic energy agrees
+            # Adaptive threshold for placing a note based on Star Rating & acoustic energy
+            target_nps = max(1.0, min(16.0, 1.2 + (star_rating - 1.0) * 1.3))
+            expected_note_prob = min(0.85, max(0.12, target_nps / (1000.0 / max(50.0, beat_len_ms / 4.0))))
+            active_thresh = max(0.08, min(0.55, 0.50 - (star_rating - 2.5) * 0.05))
+
             if is_refinement_pass:
                 prev_draft_tok = int(initial_scaffold_tokens[cur_pos].item())
-                if prev_draft_tok > 0 and cur_energy_ratio >= 0.70:
-                    active_logits[prev_draft_tok] += 2.5
+                # If previous pass had a note here, support it if audio has energy, but PRUNE if audio is quiet
+                if prev_draft_tok > 0:
+                    if cur_energy_ratio < 0.40:
+                        # Prune noise/debris in quiet passages
+                        cur_chord_logits[0] += 3.0
+                    else:
+                        cur_chord_logits[prev_draft_tok] += 1.5
 
+            active_logits = cur_chord_logits.clone()
             is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
             prev_tok = active_notes_history[-1] if active_notes_history else 0
             prev_k = bin(prev_tok).count("1")
 
+            # Apply ergonomic chord rules to active classes (1..15)
             for t_i in range(1, 16):
                 k_cnt = bin(t_i).count("1")
                 if star_rating < 2.0 and k_cnt > 1:
@@ -556,10 +568,10 @@ def _run_single_neural_pass(
                     active_logits[t_i] = -1e9
 
                 if star_rating >= 5.0 and k_cnt >= 2:
-                    active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
+                    active_logits[t_i] += min(8.0, (float(star_rating) - 4.0) * 0.6)
 
                 if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
-                    active_logits[t_i] -= 8.0
+                    active_logits[t_i] -= 6.0
 
             # Discourage active taps on held LN lanes
             for c in range(4):
@@ -571,27 +583,14 @@ def _run_single_neural_pass(
             # Anti-Trill & Anti-Jack limiters
             if len(active_notes_history) >= 4:
                 if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
-                    active_logits[active_notes_history[-1]] -= 12.0
-                    active_logits[active_notes_history[-2]] -= 12.0
+                    active_logits[active_notes_history[-1]] -= 8.0
+                    active_logits[active_notes_history[-2]] -= 8.0
 
             if len(active_notes_history) >= 2 and star_rating < 8.0:
-                if active_notes_history[-1] == active_notes_history[-2]:
-                    active_logits[active_notes_history[-1]] -= 15.0
+                if active_notes_history[-1] == active_notes_history[-2] and active_notes_history[-1] > 0:
+                    active_logits[active_notes_history[-1]] -= 10.0
 
-            # Lane usage balance
-            recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
-            if recent_active:
-                lane_usage = [0, 0, 0, 0]
-                for tok_val in recent_active:
-                    for c in token_to_keys(tok_val):
-                        lane_usage[c] += 1
-                for c in range(4):
-                    if lane_usage[c] >= 6:
-                        for t_cand in range(1, 16):
-                            if (t_cand >> c) & 1:
-                                active_logits[t_cand] -= 4.0
-
-            eff_temp = 0.35 if (pass_temp <= 0.05 and not greedy) else max(0.1, pass_temp)
+            eff_temp = 0.30 if (pass_temp <= 0.05 and not greedy) else max(0.1, pass_temp)
             if greedy or pass_temp <= 0.05:
                 tok = int(active_logits.argmax().item())
             else:
@@ -603,13 +602,15 @@ def _run_single_neural_pass(
 
         generated_tokens[cur_pos] = tok
         all_ln_probs[cur_pos] = new_lns
-        active_notes_history.append(tok)
+        if tok > 0:
+            active_notes_history.append(tok)
 
         # LN tracking state machine
         new_cols = set(token_to_keys(tok))
+        effective_ln_thresh = max(0.30, min(0.60, float(ln_conf_thresh) if (0.0 < ln_conf_thresh < 0.70) else 0.38))
         for c in range(4):
             if active_ln_starts[c] is not None:
-                is_held = (new_lns[c] >= 0.35) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
+                is_held = (new_lns[c] >= 0.28) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
                 if is_held:
                     lane_states_seq[cur_pos, c] = 3  # STATE_LN_HOLD
                 else:
@@ -627,7 +628,7 @@ def _run_single_neural_pass(
 
         for c in new_cols:
             if active_ln_starts[c] is None:
-                if (star_rating >= 1.5) and (new_lns[c] >= (ln_conf_thresh if ln_conf_thresh > 0 else 0.45)):
+                if (star_rating >= 1.5) and (new_lns[c] >= effective_ln_thresh):
                     active_ln_starts[c] = cur_time_ms
                     lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
                 else:
