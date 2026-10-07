@@ -334,193 +334,111 @@ def compute_audio_sustain_duration(
         return candidate_ticks[0]
 
 
-def generate_patterns_with_model3(
-    checkpoint_path: str | Path,
-    audio_mel: Any,  # torch.Tensor [Total_T, 80]
+def hit_objects_to_grid_tokens(
+    hit_objects: List[ManiaHitObject],
+    ticks: List[MusicalGridTick],
+    duration_ms: int,
+    device: Optional[Any] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Projects hit objects back onto discrete musical grid ticks.
+    Returns:
+        (tokens_tensor [num_ticks], lane_states_tensor [num_ticks, 4])
+    """
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is required for hit_objects_to_grid_tokens.")
+
+    num_ticks = len(ticks)
+    tokens = torch.zeros(num_ticks, dtype=torch.int64, device=device)
+    lane_states = torch.zeros(num_ticks, 4, dtype=torch.int64, device=device)
+    tick_times = [float(t.time_ms) for t in ticks]
+
+    if not hit_objects or num_ticks == 0:
+        return tokens, lane_states
+
+    for obj in hit_objects:
+        if not (0 <= obj.column < 4):
+            continue
+        idx = bisect.bisect_left(tick_times, float(obj.start_time))
+        best_i = idx
+        if idx > 0 and (idx >= len(tick_times) or abs(tick_times[idx - 1] - obj.start_time) < abs(tick_times[idx] - obj.start_time)):
+            best_i = idx - 1
+
+        if 0 <= best_i < num_ticks and abs(tick_times[best_i] - obj.start_time) <= 45.0:
+            tokens[best_i] = int(tokens[best_i].item()) | (1 << obj.column)
+            lane_states[best_i, obj.column] = 2 if obj.is_ln else 1  # STATE_LN_START or STATE_TAP
+
+            if obj.is_ln and obj.end_time > obj.start_time:
+                end_idx = bisect.bisect_left(tick_times, float(obj.end_time))
+                for h_i in range(best_i + 1, min(num_ticks, end_idx)):
+                    lane_states[h_i, obj.column] = 3  # STATE_LN_HOLD
+                if 0 <= end_idx < num_ticks:
+                    lane_states[end_idx, obj.column] = 4  # STATE_LN_RELEASE
+
+    return tokens, lane_states
+
+
+def _run_single_neural_pass(
+    model: Any,
+    dev: Any,
+    ticks: List[MusicalGridTick],
+    tick_times_list: List[float],
+    tick_mel_tensor: torch.Tensor,
+    grid_metrics_tensor: torch.Tensor,
+    grid_metrics_list: List[List[float]],
+    multiscale_pyramid_tensor: torch.Tensor,
+    full_audio_memory: torch.Tensor,
+    initial_scaffold_tokens: torch.Tensor,
+    star_rating: float,
     bpm: float,
     offset_ms: int,
     duration_ms: int,
-    star_rating: float = 4.0,
-    device: Optional[Any] = None,
-    chunk_frames: int = 128,
-    warmup_lead_in_frames: int = 64,
-    timing_points: Optional[List[TimingPoint]] = None,
-    temperature: float = 0.0,
-    top_p: float = 0.90,
-    greedy: bool = False,
-    note_conf_thresh: float = 0.0,
-    ln_conf_thresh: float = 0.78,
-    silence_gate: float = 0.0,
-    timing_mode: str = "soft_snap",
-) -> List[ManiaHitObject]:
+    timing_mode: str,
+    temperature: float,
+    top_p: float,
+    greedy: bool,
+    note_conf_thresh: float,
+    ln_conf_thresh: float,
+    silence_gate: float,
+    pass_index: int = 1,
+    is_refinement_pass: bool = False,
+) -> Tuple[List[ManiaHitObject], torch.Tensor, torch.Tensor]:
     """
-    Generates 4K Hit Objects using the trained Model 3 (ManiaPatternTransformer).
-    
-    Features:
-    1. Deterministic Musical Grid Ticks: Supports multiple timing & snapping paradigms:
-       - 'soft_snap': Continuous model time advancement with soft magnetic lock to any musical divisor (1/4, 1/3, 1/6, 1/8, 1/12, 1/16).
-       - 'universal_grid': Universal multi-divisor grid (binary + ternary simultaneous).
-       - 'residual': Macro meter anchor + continuous micro-timing residual offset.
-       - 'quantized': Legacy rigid 1/8 binary quantization.
-    2. Deep Audio Cross-Attention & Acoustic Grounding across frequency bins and transients.
-    3. 8-Channel Musical Metric Conditioning: Ingests beat divisor fractions, meter, bar phase, downbeats, progress, and energy.
-    4. Model-driven Hit Object Synthesis: Zero silence gating hacks, zero arbitrary physical filters.
+    Executes a single neural rollout pass (either initial draft generation or iterative self-refinement).
     """
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch is required for Model 3 neural inference.")
-
-    from osu_mapper.models.transformer import ManiaPatternTransformer, TransformerConfig
-
-    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    ckpt_p = Path(checkpoint_path)
-    if not ckpt_p.exists():
-        raise FileNotFoundError(f"Model 3 checkpoint not found at: {ckpt_p}")
-
-    print(f"🧠 [Model 3 Neural Generator] Loading transformer checkpoint: {ckpt_p} (Timing Mode: {timing_mode})")
-    cfg = TransformerConfig(
-        audio_dim=80,
-        d_model=256,
-        nhead=8,
-        num_layers=4,
-        dim_feedforward=512,
-        num_classes=16,
-        max_seq_len=512,
-        dropout=0.1,
-    )
-    model = ManiaPatternTransformer(cfg).to(dev)
-
-    ckpt_data = torch.load(ckpt_p, map_location=dev, weights_only=False)
-    state = ckpt_data.get("model_state", ckpt_data.get("model_state_dict", ckpt_data.get("state_dict", ckpt_data)))
-    model.load_state_dict(state, strict=False)
-    model.eval()
-
-    orig_total_mel_frames = audio_mel.shape[0]
-    sr_tensor = torch.tensor([[star_rating]], dtype=torch.float32, device=dev)
-    frame_ms = 16.0
-
-    # 1. Generate full-resolution musical grid ticks (1/8 straight & 1/6 triplet subdivisions)
-    # Allows model to freely place notes at any 1/1, 1/2, 1/4, 1/6, 1/8 timestamp across the track.
-    subdiv_b = 8
-    subdiv_t = 6
-    use_universal = (str(timing_mode).lower().strip() in ("universal_grid", "hybrid_grid", "soft_snap", "residual"))
-
-    resolved_tps = timing_points or [
-        TimingPoint(
-            time=float(offset_ms),
-            beat_length=60000.0 / max(30.0, bpm),
-            meter=4,
-            uninherited=1,
-        )
-    ]
-    ticks = generate_musical_grid_ticks_from_timing_points(
-        timing_points=resolved_tps,
-        duration_ms=duration_ms,
-        default_bpm=bpm,
-        default_offset_ms=offset_ms,
-        subdiv_binary=subdiv_b,
-        subdiv_ternary=subdiv_t,
-        universal_grid=use_universal,
-    )
     num_ticks = len(ticks)
-    if num_ticks == 0:
-        print("  ⚠️ Notice: No musical ticks generated; returning empty beatmap.")
-        return []
+    sr_tensor = torch.tensor([[star_rating]], dtype=torch.float32, device=dev)
+    beat_len_ms = 60000.0 / max(30.0, bpm)
+    min_ln_ms = max(110.0, beat_len_ms * 0.35)
+    effective_silence_gate = max(0.12, float(silence_gate))
 
-    print(f"  • Generated {num_ticks} full-resolution musical grid ticks (1/8 & 1/6 precision) across {duration_ms}ms.")
-
-    # 2. Extract Mel audio frames sampled at each tick timestamp & Multi-Scale Audio Pyramid
-    with torch.no_grad():
-        frame_energies_t = audio_mel.exp().mean(dim=-1)
-        mean_energy_val = float(frame_energies_t.mean().item()) if frame_energies_t.numel() > 0 else 1.0
-        mean_energy = max(1e-4, mean_energy_val)
-
-        tick_mel_list = []
-        grid_metrics_list = []
-        tick_times_arr = np.array([t_obj.time_ms for t_obj in ticks], dtype=np.float32)
-
-        for i, t_obj in enumerate(ticks):
-            f = max(0, min(orig_total_mel_frames - 1, int(round(t_obj.time_ms / frame_ms))))
-            tick_mel_list.append(audio_mel[f])
-
-            local_e = float(frame_energies_t[f].item()) if f < frame_energies_t.shape[0] else 1.0
-            energy_ratio = float(local_e / mean_energy)
-            progress = float(i / max(1, num_ticks))
-            time_to_end = float((num_ticks - i) / max(1, num_ticks))
-
-            grid_metrics_list.append([
-                float(t_obj.divisor_fraction),
-                float(t_obj.bar_phase),
-                1.0 if t_obj.is_downbeat else 0.0,
-                progress,
-                time_to_end,
-                energy_ratio,
-                float(t_obj.meter),
-                1.0 if t_obj.is_ternary else 0.0,
-            ])
-
-        tick_mel_tensor = torch.stack(tick_mel_list).to(dev)             # [num_ticks, 80]
-        grid_metrics_tensor = torch.tensor(grid_metrics_list, dtype=torch.float32, device=dev)  # [num_ticks, 8]
-
-        # Multi-scale pyramid: Micro (±50ms), Meso (±10s), Macro (±25s) with genuine silence padding outside track
-        from osu_mapper.dataset.feature_extractor import compute_multiscale_pyramid_features
-        multiscale_pyramid_tensor = compute_multiscale_pyramid_features(audio_mel, tick_times_arr, frame_ms=frame_ms).to(dev)
-
-    # Pre-generate Stage 1 Acoustic Onset Scaffold for the Neural Refiner
-    print(f"  • Generating Stage 1 Acoustic Onset Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
-    scaffold_tokens_tensor = compute_acoustic_onset_scaffold(
-        audio_mel=tick_mel_tensor.unsqueeze(0),
-        grid_metrics=grid_metrics_tensor.unsqueeze(0),
-        star_rating=sr_tensor,
-        silence_threshold=silence_gate,
-    ).squeeze(0)
-
-    # Real-time progressive strain trajectory metrics matching training distribution [B, T, 2]
-    # strain_metrics = [running_density (notes/tick in 0.05-0.40), density_ratio (running / target)]
     target_density = max(0.05, float(star_rating) / 10.0)
     strain_metrics_tensor = torch.zeros(num_ticks, 2, dtype=torch.float32, device=dev)
     for ti in range(num_ticks):
         time_steps = ti + 1
-        run_notes = int(scaffold_tokens_tensor[:ti+1].gt(0).sum().item())
+        run_notes = int(initial_scaffold_tokens[:ti+1].gt(0).sum().item())
         running_density = run_notes / max(1, time_steps)
         density_ratio = min(5.0, running_density / target_density)
         strain_metrics_tensor[ti, 0] = float(running_density)
         strain_metrics_tensor[ti, 1] = float(density_ratio)
 
-    # Pre-encode full tick audio representation with deep audio encoder
-    print(f"  • Pre-encoding tick audio features via Bidirectional Audio Encoder...")
-    with torch.no_grad():
-        full_audio_memory = model.audio_encoder(tick_mel_tensor.unsqueeze(0))  # [1, num_ticks, d_model]
-
-    # Maintain real-time 4-lane physical activity state
     lane_states_seq = torch.zeros(num_ticks, 4, dtype=torch.int64, device=dev)
-    tick_times_list = [float(t_obj.time_ms) for t_obj in ticks]
-    beat_len_ms = 60000.0 / max(30.0, bpm)
-
     generated_tokens: List[int] = [0] * num_ticks
     all_ln_probs: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(num_ticks)]
     active_notes_history: List[int] = []
 
-    # State Machine tracking for Long Notes (Sliders) across neural jumps
     active_ln_starts: Dict[int, Optional[int]] = {0: None, 1: None, 2: None, 3: None}
     hit_objects: List[ManiaHitObject] = []
     total_taps = 0
     total_lns = 0
 
-    # 1. Acoustic Silence & Break Gating threshold
-    effective_silence_gate = max(0.12, float(silence_gate))
-
-    print(f"  • Generating neural 4K patterns with dynamic time step jumps (SR: {star_rating:.1f}*, {num_ticks} potential grid anchors)...")
-
-    # Calibrated minimum physical LN duration (in ms)
-    min_ln_ms = max(110.0, beat_len_ms * 0.35)
-
-    # Autoregressive generation: neural step jump causality with rolling context
     ctx_len = 64
-    
-    # Start generation at first active timing offset
     target_start_ms = float(offset_ms) if offset_ms is not None else 0.0
     cur_pos = max(0, bisect.bisect_left(tick_times_list, target_start_ms))
     consecutive_silence_ticks = 0
+
+    # For refinement passes, anneal temperature slightly for greater precision and coherence
+    pass_temp = max(0.10, temperature * (0.85 ** (pass_index - 1))) if not greedy else 0.0
 
     while cur_pos < num_ticks:
         cur_time_ms = int(round(ticks[cur_pos].time_ms))
@@ -530,11 +448,10 @@ def generate_patterns_with_model3(
         ctx_start = max(0, cur_pos - ctx_len)
         window_len = (cur_pos + 1) - ctx_start
 
-        # Acoustic Silence & Break Gating: strictly suppress notes during song silence, breaks, and quiet outros
+        # Acoustic Silence & Break Gating
         cur_energy_ratio = grid_metrics_list[cur_pos][5]
         if cur_energy_ratio < effective_silence_gate:
             consecutive_silence_ticks += 1
-            # Close any open sliders on song break or silence
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     start_t = active_ln_starts[c]
@@ -552,7 +469,6 @@ def generate_patterns_with_model3(
             generated_tokens[cur_pos] = 0
             all_ln_probs[cur_pos] = [0.0, 0.0, 0.0, 0.0]
 
-            # If song has been completely silent for more than 4 seconds past middle of track, exit gracefully
             if consecutive_silence_ticks > 48 and (cur_time_ms > duration_ms * 0.6):
                 break
 
@@ -562,14 +478,12 @@ def generate_patterns_with_model3(
             consecutive_silence_ticks = 0
 
         window_mel = tick_mel_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-
         window_prev_tokens = torch.zeros(1, window_len, dtype=torch.int64, device=dev)
         if cur_pos > ctx_start:
             window_prev_tokens[0, 1 : cur_pos - ctx_start + 1] = torch.tensor(
                 generated_tokens[ctx_start:cur_pos], dtype=torch.int64, device=dev
             )
 
-        # Dynamic live strain trajectory computed over LOCAL rolling window (matching training distribution)
         local_recent_notes = sum(1 for tok_v in generated_tokens[ctx_start:cur_pos] if tok_v > 0)
         running_density = local_recent_notes / max(1, window_len)
         density_ratio = min(5.0, running_density / target_density)
@@ -579,7 +493,7 @@ def generate_patterns_with_model3(
         window_multiscale = multiscale_pyramid_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_lane_states = lane_states_seq[ctx_start : cur_pos + 1].unsqueeze(0)
         window_grid_metrics = grid_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
-        window_scaffold = scaffold_tokens_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
+        window_scaffold = initial_scaffold_tokens[ctx_start : cur_pos + 1].unsqueeze(0)
         window_strain = strain_metrics_tensor[ctx_start : cur_pos + 1].unsqueeze(0)
         window_audio_memory = full_audio_memory[:, ctx_start : cur_pos + 1]
 
@@ -613,13 +527,19 @@ def generate_patterns_with_model3(
                 )
                 pred_dt_ms = beat_len_ms / (4.0 if star_rating >= 4.0 else 2.0)
 
-            cur_chord_logits = chord_logits[0, -1].clone()   # [16]
-            cur_ln_logits = ln_logits[0, -1].clone()         # [4]
+            cur_chord_logits = chord_logits[0, -1].clone()
+            cur_ln_logits = ln_logits[0, -1].clone()
 
             active_logits = cur_chord_logits.clone()
-            active_logits[0] = -1e9  # Suppress idle class at hit anchors
+            active_logits[0] = -1e9  # Suppress idle token at hit step
 
-            # 1. Ergonomic Chord Limits & Progressive Scaling based on Star Rating
+            # Scaffold Prior Reinforcement in Refinement Mode:
+            # If previous pass had a note here, give a positive prior bias if acoustic energy agrees
+            if is_refinement_pass:
+                prev_draft_tok = int(initial_scaffold_tokens[cur_pos].item())
+                if prev_draft_tok > 0 and cur_energy_ratio >= 0.70:
+                    active_logits[prev_draft_tok] += 2.5
+
             is_downbeat = ticks[cur_pos].is_downbeat or (ticks[cur_pos].divisor == 1)
             prev_tok = active_notes_history[-1] if active_notes_history else 0
             prev_k = bin(prev_tok).count("1")
@@ -633,36 +553,32 @@ def generate_patterns_with_model3(
                 elif star_rating < 5.0 and k_cnt > 2 and not is_downbeat:
                     active_logits[t_i] = -1e9
                 elif k_cnt == 4 and not (is_downbeat and star_rating >= 6.0):
-                    # Quads only on heavy downbeats for 6.0*+
                     active_logits[t_i] = -1e9
 
-                # Progressive Jumpstream / Handstream scaling on higher diffs (5.0* - 16.0*)
                 if star_rating >= 5.0 and k_cnt >= 2:
                     active_logits[t_i] += min(12.0, (float(star_rating) - 4.0) * 0.8)
 
-                # Jumpstream rule: after a double/triple chord on medium diffs, next 1/4 note prefers single tap
                 if star_rating < 7.0 and prev_k >= 2 and k_cnt >= 2 and not is_downbeat:
                     active_logits[t_i] -= 8.0
 
-            # 2. Discourage new taps on lanes currently occupied by a held slider
+            # Discourage active taps on held LN lanes
             for c in range(4):
                 if active_ln_starts[c] is not None:
                     for t_cand in range(1, 16):
                         if (t_cand >> c) & 1:
                             active_logits[t_cand] -= 10.0
 
-            # 3. Anti-Trill Limiter: Breaks infinite 2-token oscillation (e.g. col1 <-> col2)
+            # Anti-Trill & Anti-Jack limiters
             if len(active_notes_history) >= 4:
                 if (active_notes_history[-1] == active_notes_history[-3]) and (active_notes_history[-2] == active_notes_history[-4]):
                     active_logits[active_notes_history[-1]] -= 12.0
                     active_logits[active_notes_history[-2]] -= 12.0
 
-            # 4. Anti-Jack Limiter: Prevents uncomfortable single-column mini-jacks on streams
             if len(active_notes_history) >= 2 and star_rating < 8.0:
                 if active_notes_history[-1] == active_notes_history[-2]:
                     active_logits[active_notes_history[-1]] -= 15.0
 
-            # 5. Ergonomic 4-Lane Balance: Prevents over-clustering on center lanes
+            # Lane usage balance
             recent_active = active_notes_history[-16:] if len(active_notes_history) >= 6 else []
             if recent_active:
                 lane_usage = [0, 0, 0, 0]
@@ -675,8 +591,8 @@ def generate_patterns_with_model3(
                             if (t_cand >> c) & 1:
                                 active_logits[t_cand] -= 4.0
 
-            eff_temp = 0.35 if (temperature <= 0.05 and not greedy) else max(0.1, temperature)
-            if greedy:
+            eff_temp = 0.35 if (pass_temp <= 0.05 and not greedy) else max(0.1, pass_temp)
+            if greedy or pass_temp <= 0.05:
                 tok = int(active_logits.argmax().item())
             else:
                 scaled = active_logits / eff_temp
@@ -689,12 +605,8 @@ def generate_patterns_with_model3(
         all_ln_probs[cur_pos] = new_lns
         active_notes_history.append(tok)
 
-        # -------------------------------------------------------------
-        # Continuous State Machine: Hold / Unhold across Neural Jumps
-        # -------------------------------------------------------------
+        # LN tracking state machine
         new_cols = set(token_to_keys(tok))
-
-        # Check existing ongoing sliders: continue holding or unhold?
         for c in range(4):
             if active_ln_starts[c] is not None:
                 is_held = (new_lns[c] >= 0.35) and (c not in new_cols) and ((cur_time_ms - active_ln_starts[c]) < int(round(beat_len_ms * 3.0)))
@@ -708,21 +620,17 @@ def generate_patterns_with_model3(
                         hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=end_t, is_ln=True))
                         total_lns += 1
                     else:
-                        # Graceful Tap fallback
                         hit_objects.append(ManiaHitObject(column=c, start_time=start_t, end_time=start_t, is_ln=False))
                         total_taps += 1
                     active_ln_starts[c] = None
                     lane_states_seq[cur_pos, c] = 4  # STATE_LN_RELEASE
 
-        # Process new hit object strikes for this step
         for c in new_cols:
             if active_ln_starts[c] is None:
-                # If LN probability is strong, start a new slider
-                if (star_rating >= 1.5) and (new_lns[c] >= 0.45):
+                if (star_rating >= 1.5) and (new_lns[c] >= (ln_conf_thresh if ln_conf_thresh > 0 else 0.45)):
                     active_ln_starts[c] = cur_time_ms
                     lane_states_seq[cur_pos, c] = 2  # STATE_LN_START
                 else:
-                    # Standard Single Tap
                     hit_objects.append(
                         ManiaHitObject(
                             column=c,
@@ -734,7 +642,6 @@ def generate_patterns_with_model3(
                     total_taps += 1
                     lane_states_seq[cur_pos, c] = 1  # STATE_TAP
             else:
-                # Lane was already held; re-striking closes previous note cleanly
                 start_t = active_ln_starts[c]
                 hold_len = cur_time_ms - start_t
                 if hold_len >= min_ln_ms:
@@ -750,20 +657,13 @@ def generate_patterns_with_model3(
                 active_ln_starts[c] = None
                 lane_states_seq[cur_pos, c] = 1
 
-        # -------------------------------------------------------------
-        # Time Advancement & Snapping Dispatcher (4 Configurable Modes):
-        # 1. 'soft_snap': Continuous model step with gentle magnetic lock (<=6.5ms) to any musical divisor
-        # 2. 'universal_grid': Universal multi-divisor grid (binary + ternary simultaneous)
-        # 3. 'residual': Macro meter anchor + continuous micro-timing residual offset
-        # 4. 'quantized': Legacy rigid 1/8 binary quantization (preserved as baseline)
-        # -------------------------------------------------------------
+        # Timing advancement
         timing_mode_norm = str(timing_mode).lower().strip()
         raw_beats = pred_dt_ms / beat_len_ms
         has_dense_drop = (cur_energy_ratio >= 0.85) and (star_rating >= 3.2)
         is_calm_section = (cur_energy_ratio < 0.60)
 
         if timing_mode_norm in ("soft_snap", "soft", "magnetic", "free_snap"):
-            # Mode 1: Soft-Magnetic Snapping (Continuous time with magnetic lock to nearest tick)
             raw_jump_ms = max(beat_len_ms * 0.0625, float(pred_dt_ms))
             raw_target_ms = ticks[cur_pos].time_ms + raw_jump_ms
             nearest_idx = bisect.bisect_left(tick_times_list, raw_target_ms)
@@ -783,11 +683,9 @@ def generate_patterns_with_model3(
                     best_dist = dist_cand
                     best_idx = c_i
 
-            # Magnetic lock to nearest tick
             target_next_pos = max(cur_pos + 1, best_idx)
 
         elif timing_mode_norm in ("universal_grid", "hybrid_grid", "universal"):
-            # Mode 2: Universal Multi-Divisor Grid (Binary + Ternary simultaneous: 1/1, 1/2, 1/3, 1/4, 1/6, 1/8, 1/12, 1/16)
             if star_rating < 2.5:
                 cand_divs = [1.0, 0.5, 0.3333]
             elif star_rating < 4.0:
@@ -806,7 +704,6 @@ def generate_patterns_with_model3(
             target_next_pos = max(cur_pos + 1, next_pos)
 
         elif timing_mode_norm in ("residual", "anchor_residual", "micro"):
-            # Mode 3: Macro meter anchor + Continuous Micro-Timing Residual (+-25ms)
             macro_divs = [1.0, 0.5, 0.3333, 0.25, 0.1667, 0.125]
             anchor_frac = min(macro_divs, key=lambda d: abs(d - raw_beats))
             anchor_jump_ms = anchor_frac * beat_len_ms
@@ -817,34 +714,17 @@ def generate_patterns_with_model3(
             target_next_pos = max(cur_pos + 1, next_pos)
 
         else:
-            # Mode 4: Legacy Rigid 1/8 Binary Quantization (Baseline preserved)
             if star_rating < 2.5:
                 cand_divs = [1.0, 2.0] if is_calm_section else [0.5, 1.0]
             elif star_rating < 4.0:
-                if has_dense_drop:
-                    cand_divs = [0.25, 0.5]
-                elif is_calm_section:
-                    cand_divs = [0.5, 1.0]
-                else:
-                    cand_divs = [0.25, 0.5, 1.0]
+                cand_divs = [0.25, 0.5] if has_dense_drop else ([0.5, 1.0] if is_calm_section else [0.25, 0.5, 1.0])
             elif star_rating < 6.0:
-                if has_dense_drop:
-                    cand_divs = [0.25]  # Dense 1/4 streams during drops/kiai
-                elif is_calm_section:
-                    cand_divs = [0.5, 1.0]
-                else:
-                    cand_divs = [0.25, 0.5]
+                cand_divs = [0.25] if has_dense_drop else ([0.5, 1.0] if is_calm_section else [0.25, 0.5])
             elif star_rating < 9.0:
-                # 6.0* - 9.0*: 1/4 streams with 1/8 burst rolls on drops
-                if has_dense_drop:
-                    cand_divs = [0.125, 0.25]
-                else:
-                    cand_divs = [0.25]
+                cand_divs = [0.125, 0.25] if has_dense_drop else [0.25]
             elif star_rating < 13.0:
-                # 9.0* - 13.0*: dense 1/8 streams and jumpstreams
                 cand_divs = [0.125] if has_dense_drop else [0.125, 0.25]
             else:
-                # 13.0* - 16.0*+: extreme 1/12 and 1/8 chordstreams
                 cand_divs = [0.0833, 0.125]
 
             quantized_fraction = min(cand_divs, key=lambda d: abs(d - raw_beats))
@@ -853,11 +733,10 @@ def generate_patterns_with_model3(
             next_pos = bisect.bisect_left(tick_times_list, target_time_ms - 5.0)
             target_next_pos = max(cur_pos + 1, next_pos)
 
-        # Ornith Watchdog Level 1: Anti-Overshoot Interceptor
-        # Prevents model from leaping over unmapped strong musical attacks (kicks/snares/downbeats)
+        # Anti-overshoot check
         if target_next_pos > cur_pos + 1:
             for intermediate_i in range(cur_pos + 1, target_next_pos):
-                scaff_val = int(scaffold_tokens_tensor[intermediate_i].item())
+                scaff_val = int(initial_scaffold_tokens[intermediate_i].item())
                 inter_energy = grid_metrics_list[intermediate_i][5]
                 is_db = ticks[intermediate_i].is_downbeat
                 div_val = ticks[intermediate_i].divisor
@@ -877,7 +756,7 @@ def generate_patterns_with_model3(
 
         cur_pos = target_next_pos
 
-    # Close any lingering sliders at the end of track
+    # Close trailing sliders
     final_track_ms = min(duration_ms, int(round(ticks[-1].time_ms)))
     for c in range(4):
         if active_ln_starts[c] is not None:
@@ -892,10 +771,7 @@ def generate_patterns_with_model3(
                 total_taps += 1
             active_ln_starts[c] = None
 
-    # -------------------------------------------------------------
-    # Ornith Self-Improvement Loop: Acoustic Critic & Refinement Inpainting Pass
-    # -------------------------------------------------------------
-    # Critic scans the full generated rollout: detects missed acoustic onsets and density gaps
+    # Acoustic Critic & Refinement Inpainting Pass
     existing_note_times = set(o.start_time for o in hit_objects)
     missed_ticks_to_inpaint: List[int] = []
 
@@ -904,25 +780,15 @@ def generate_patterns_with_model3(
         if t_k >= duration_ms - 100:
             break
 
-        # Check if any note was already placed near this tick (within +-35ms)
-        has_nearby_note = False
-        for dt_chk in (-35, -20, 0, 20, 35):
-            if (t_k + dt_chk) in existing_note_times:
-                has_nearby_note = True
-                break
-
+        has_nearby_note = any((t_k + dt_chk) in existing_note_times for dt_chk in (-35, -20, 0, 20, 35))
         if has_nearby_note:
             continue
 
-        scaff_val = int(scaffold_tokens_tensor[k].item())
+        scaff_val = int(initial_scaffold_tokens[k].item())
         k_energy = grid_metrics_list[k][5]
         is_db = ticks[k].is_downbeat
         div_val = ticks[k].divisor
 
-        # Critic criteria for a missed transient:
-        # 1. Audible energy above silence threshold
-        # 2. Presence of spectral onset or downbeat
-        # 3. Compatible with target difficulty (higher SR captures faster subdivisions)
         is_missed_onset = False
         if k_energy >= max(0.55, effective_silence_gate):
             if is_db:
@@ -936,20 +802,17 @@ def generate_patterns_with_model3(
             missed_ticks_to_inpaint.append(k)
 
     if missed_ticks_to_inpaint:
-        print(f"  • [Ornith Critic] Detected {len(missed_ticks_to_inpaint)} unmapped acoustic transients; executing neural inpainting pass...")
-        infilled_count = 0
         with torch.no_grad():
             for k in missed_ticks_to_inpaint:
                 t_k = int(round(ticks[k].time_ms))
                 ctx_start = max(0, k - ctx_len)
                 w_len = (k + 1) - ctx_start
 
-                # Query Model 3 with bidirectional audio context centered on the missed transient
                 w_mel = tick_mel_tensor[ctx_start : k + 1].unsqueeze(0)
                 w_multi = multiscale_pyramid_tensor[ctx_start : k + 1].unsqueeze(0)
                 w_lane = lane_states_seq[ctx_start : k + 1].unsqueeze(0)
                 w_grid = grid_metrics_tensor[ctx_start : k + 1].unsqueeze(0)
-                w_scaff = scaffold_tokens_tensor[ctx_start : k + 1].unsqueeze(0)
+                w_scaff = initial_scaffold_tokens[ctx_start : k + 1].unsqueeze(0)
                 w_strain = strain_metrics_tensor[ctx_start : k + 1].unsqueeze(0)
                 w_audio = full_audio_memory[:, ctx_start : k + 1]
 
@@ -987,9 +850,8 @@ def generate_patterns_with_model3(
                     )
 
                 cur_c_logits = c_logits[0, -1].clone()
-                cur_c_logits[0] = -1e9  # We require a hit note at the missed onset
+                cur_c_logits[0] = -1e9
 
-                # Mask lanes currently held by long notes at time t_k
                 for col_idx in range(4):
                     is_lane_busy = any(
                         (o.column == col_idx and o.is_ln and o.start_time < t_k < o.end_time)
@@ -1024,29 +886,262 @@ def generate_patterns_with_model3(
                                 is_ln=False,
                             ))
                             total_taps += 1
-
                     existing_note_times.add(t_k)
-                    infilled_count += 1
 
-        if infilled_count > 0:
-            print(f"  ✓ [Ornith Critic] Successfully self-corrected {infilled_count} missed notes via neural inpainting.")
-
-    # -------------------------------------------------------------
-    # Ranked-Compliant Slider & Collision Solver (Zero Lost Notes, Zero Overlaps)
-    # -------------------------------------------------------------
     solved_objects = solve_sliders_and_collisions(hit_objects, beat_len_ms=beat_len_ms, min_ln_ms=min_ln_ms)
+    out_tokens_tensor = torch.tensor(generated_tokens, dtype=torch.int64, device=dev)
+    return solved_objects, out_tokens_tensor, lane_states_seq
+
+
+def generate_patterns_with_model3(
+    checkpoint_path: str | Path,
+    audio_mel: Any,  # torch.Tensor [Total_T, 80]
+    bpm: float,
+    offset_ms: int,
+    duration_ms: int,
+    star_rating: float = 4.0,
+    device: Optional[Any] = None,
+    chunk_frames: int = 128,
+    warmup_lead_in_frames: int = 64,
+    timing_points: Optional[List[TimingPoint]] = None,
+    temperature: float = 0.0,
+    top_p: float = 0.90,
+    greedy: bool = False,
+    note_conf_thresh: float = 0.0,
+    ln_conf_thresh: float = 0.78,
+    silence_gate: float = 0.0,
+    timing_mode: str = "soft_snap",
+    num_passes: int = 2,
+    initial_draft_objects: Optional[List[ManiaHitObject]] = None,
+) -> List[ManiaHitObject]:
+    """
+    Generates 4K Hit Objects using trained Model 3 (ManiaPatternTransformer) with Multi-Pass Iterative Refinement.
     
-    total_objs = len(solved_objects)
-    final_lns = sum(1 for o in solved_objects if o.is_ln)
-    final_taps = total_objs - final_lns
-    duration_sec = max(0.001, duration_ms / 1000.0)
-    avg_nps = total_objs / duration_sec
-    ln_pct = (final_lns / max(1, total_objs)) * 100.0
-    print(
-        f"  ✓ Neural pattern synthesis finished: generated {total_objs} hit objects "
-        f"({final_taps} taps, {final_lns} sliders/LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS, SR: {star_rating:.1f}*)."
+    Multi-Pass Workflow:
+    - Pass 1 (Draft Generation): Generates the initial layout from the acoustic onset scaffold or algorithmic draft.
+    - Pass 2..N (Neural Self-Refinement & Revision):
+      The model is fed its OWN previously generated beatmap as a draft scaffold.
+      In each iteration, the model evaluates and sculpts the map:
+      * Preserves strong rhythmic hits aligned with music energy.
+      * Prunes noise/hallucinations in quiet/silent passages.
+      * Fills in missed transients and downbeats.
+      * Adjusts LN sustain tails to match acoustic decay.
+      * Calibrates chord density to match target Star Rating.
+    """
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is required for Model 3 neural inference.")
+
+    from osu_mapper.models.transformer import ManiaPatternTransformer, TransformerConfig
+
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    ckpt_p = Path(checkpoint_path)
+    if not ckpt_p.exists():
+        raise FileNotFoundError(f"Model 3 checkpoint not found at: {ckpt_p}")
+
+    total_passes = max(1, int(num_passes))
+    pass_label = f"{total_passes}-Pass Iterative Refinement" if total_passes > 1 else "Single-Pass Generation"
+    print(f"🧠 [Model 3 Neural Generator] Loading transformer checkpoint: {ckpt_p} (Mode: {timing_mode}, {pass_label})")
+
+    cfg = TransformerConfig(
+        audio_dim=80,
+        d_model=256,
+        nhead=8,
+        num_layers=4,
+        dim_feedforward=512,
+        num_classes=16,
+        max_seq_len=512,
+        dropout=0.1,
     )
-    return solved_objects
+    model = ManiaPatternTransformer(cfg).to(dev)
+
+    ckpt_data = torch.load(ckpt_p, map_location=dev, weights_only=False)
+    state = ckpt_data.get("model_state", ckpt_data.get("model_state_dict", ckpt_data.get("state_dict", ckpt_data)))
+    model.load_state_dict(state, strict=False)
+    model.eval()
+
+    orig_total_mel_frames = audio_mel.shape[0]
+    frame_ms = 16.0
+
+    # 1. Generate full-resolution musical grid ticks
+    subdiv_b = 8
+    subdiv_t = 6
+    use_universal = (str(timing_mode).lower().strip() in ("universal_grid", "hybrid_grid", "soft_snap", "residual"))
+
+    resolved_tps = timing_points or [
+        TimingPoint(
+            time=float(offset_ms),
+            beat_length=60000.0 / max(30.0, bpm),
+            meter=4,
+            uninherited=1,
+        )
+    ]
+    ticks = generate_musical_grid_ticks_from_timing_points(
+        timing_points=resolved_tps,
+        duration_ms=duration_ms,
+        default_bpm=bpm,
+        default_offset_ms=offset_ms,
+        subdiv_binary=subdiv_b,
+        subdiv_ternary=subdiv_t,
+        universal_grid=use_universal,
+    )
+    num_ticks = len(ticks)
+    if num_ticks == 0:
+        print("  ⚠️ Notice: No musical ticks generated; returning empty beatmap.")
+        return []
+
+    print(f"  • Generated {num_ticks} full-resolution musical grid ticks across {duration_ms}ms.")
+
+    # 2. Extract Mel audio frames sampled at each tick timestamp & Multi-Scale Audio Pyramid
+    with torch.no_grad():
+        frame_energies_t = audio_mel.exp().mean(dim=-1)
+        mean_energy_val = float(frame_energies_t.mean().item()) if frame_energies_t.numel() > 0 else 1.0
+        mean_energy = max(1e-4, mean_energy_val)
+
+        tick_mel_list = []
+        grid_metrics_list = []
+        tick_times_arr = np.array([t_obj.time_ms for t_obj in ticks], dtype=np.float32)
+
+        for i, t_obj in enumerate(ticks):
+            f = max(0, min(orig_total_mel_frames - 1, int(round(t_obj.time_ms / frame_ms))))
+            tick_mel_list.append(audio_mel[f])
+
+            local_e = float(frame_energies_t[f].item()) if f < frame_energies_t.shape[0] else 1.0
+            energy_ratio = float(local_e / mean_energy)
+            progress = float(i / max(1, num_ticks))
+            time_to_end = float((num_ticks - i) / max(1, num_ticks))
+
+            grid_metrics_list.append([
+                float(t_obj.divisor_fraction),
+                float(t_obj.bar_phase),
+                1.0 if t_obj.is_downbeat else 0.0,
+                progress,
+                time_to_end,
+                energy_ratio,
+                float(t_obj.meter),
+                1.0 if t_obj.is_ternary else 0.0,
+            ])
+
+        tick_mel_tensor = torch.stack(tick_mel_list).to(dev)             # [num_ticks, 80]
+        grid_metrics_tensor = torch.tensor(grid_metrics_list, dtype=torch.float32, device=dev)  # [num_ticks, 8]
+
+        from osu_mapper.dataset.feature_extractor import compute_multiscale_pyramid_features
+        multiscale_pyramid_tensor = compute_multiscale_pyramid_features(audio_mel, tick_times_arr, frame_ms=frame_ms).to(dev)
+
+        # Pre-encode full tick audio representation with deep audio encoder
+        print(f"  • Pre-encoding tick audio features via Bidirectional Audio Encoder...")
+        full_audio_memory = model.audio_encoder(tick_mel_tensor.unsqueeze(0))
+
+    tick_times_list = [float(t_obj.time_ms) for t_obj in ticks]
+    sr_tensor = torch.tensor([[star_rating]], dtype=torch.float32, device=dev)
+
+    # Prepare initial scaffold for Pass 1
+    if initial_draft_objects is not None and len(initial_draft_objects) > 0:
+        print(f"  • Using user-provided draft beatmap ({len(initial_draft_objects)} objects) as Pass 1 scaffold...")
+        current_scaffold_tokens, _ = hit_objects_to_grid_tokens(initial_draft_objects, ticks, duration_ms, device=dev)
+    else:
+        print(f"  • Generating Stage 1 Acoustic Onset Rhythm Scaffold (Target SR: {star_rating:.2f}*)...")
+        current_scaffold_tokens = compute_acoustic_onset_scaffold(
+            audio_mel=tick_mel_tensor.unsqueeze(0),
+            grid_metrics=grid_metrics_tensor.unsqueeze(0),
+            star_rating=sr_tensor,
+            silence_threshold=silence_gate,
+        ).squeeze(0)
+
+    current_objects: List[ManiaHitObject] = []
+
+    # Multi-Pass Execution Loop
+    for p in range(1, total_passes + 1):
+        is_refinement = (p > 1)
+        pass_name = f"Pass {p}/{total_passes} (Initial Draft)" if p == 1 else f"Pass {p}/{total_passes} (Neural Self-Refinement)"
+        print(f"\n  🔄 [Multi-Pass Iteration {p}/{total_passes}] Executing {pass_name} (Target SR: {star_rating:.2f}*)...")
+
+        pass_objects, pass_tokens, pass_lanes = _run_single_neural_pass(
+            model=model,
+            dev=dev,
+            ticks=ticks,
+            tick_times_list=tick_times_list,
+            tick_mel_tensor=tick_mel_tensor,
+            grid_metrics_tensor=grid_metrics_tensor,
+            grid_metrics_list=grid_metrics_list,
+            multiscale_pyramid_tensor=multiscale_pyramid_tensor,
+            full_audio_memory=full_audio_memory,
+            initial_scaffold_tokens=current_scaffold_tokens,
+            star_rating=star_rating,
+            bpm=bpm,
+            offset_ms=offset_ms,
+            duration_ms=duration_ms,
+            timing_mode=timing_mode,
+            temperature=temperature,
+            top_p=top_p,
+            greedy=greedy,
+            note_conf_thresh=note_conf_thresh,
+            ln_conf_thresh=ln_conf_thresh,
+            silence_gate=silence_gate,
+            pass_index=p,
+            is_refinement_pass=is_refinement,
+        )
+
+        # Log pass results and compare with previous pass
+        total_objs = len(pass_objects)
+        final_lns = sum(1 for o in pass_objects if o.is_ln)
+        final_taps = total_objs - final_lns
+        duration_sec = max(0.001, duration_ms / 1000.0)
+        avg_nps = total_objs / duration_sec
+        ln_pct = (final_lns / max(1, total_objs)) * 100.0
+
+        if is_refinement:
+            # Calculate changes relative to previous pass
+            prev_times = set((o.column, o.start_time) for o in current_objects)
+            cur_times = set((o.column, o.start_time) for o in pass_objects)
+            added_notes = len(cur_times - prev_times)
+            removed_notes = len(prev_times - cur_times)
+            retained_notes = len(cur_times & prev_times)
+            print(
+                f"  ✓ [{pass_name}] Completed: {total_objs} objects ({final_taps} taps, {final_lns} LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS) | "
+                f"Changes: +{added_notes} added, -{removed_notes} pruned, {retained_notes} confirmed."
+            )
+        else:
+            print(
+                f"  ✓ [{pass_name}] Completed: {total_objs} objects ({final_taps} taps, {final_lns} LNs [{ln_pct:.1f}%], {avg_nps:.1f} NPS)."
+            )
+
+        current_objects = pass_objects
+        # Set up the scaffold for next pass from the model's own current output!
+        current_scaffold_tokens, _ = hit_objects_to_grid_tokens(current_objects, ticks, duration_ms, device=dev)
+
+    print(f"\n  🎉 [Multi-Pass Complete] Finished {total_passes} generation pass(es) -> Final result: {len(current_objects)} ranked-solved objects.")
+    return current_objects
+
+
+def refine_patterns_with_model3(
+    checkpoint_path: str | Path,
+    audio_mel: Any,
+    existing_objects: List[ManiaHitObject],
+    bpm: float,
+    offset_ms: int,
+    duration_ms: int,
+    star_rating: float = 4.0,
+    passes: int = 1,
+    timing_points: Optional[List[TimingPoint]] = None,
+    timing_mode: str = "soft_snap",
+    temperature: float = 0.15,
+) -> List[ManiaHitObject]:
+    """
+    Refines an existing beatmap (or algorithmic draft) using Model 3 over N refinement iterations.
+    """
+    return generate_patterns_with_model3(
+        checkpoint_path=checkpoint_path,
+        audio_mel=audio_mel,
+        bpm=bpm,
+        offset_ms=offset_ms,
+        duration_ms=duration_ms,
+        star_rating=star_rating,
+        timing_points=timing_points,
+        timing_mode=timing_mode,
+        temperature=temperature,
+        num_passes=passes,
+        initial_draft_objects=existing_objects,
+    )
 
 
 def generate_patterns(

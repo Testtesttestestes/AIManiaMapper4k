@@ -307,6 +307,12 @@ def main():
     parser.add_argument("--silence", "--silence_gate", type=float, default=0.0, help="Acoustic silence noise gate threshold (default: 0.0, zero artificial gating).")
     parser.add_argument("--ln_conf", "--ln-thresh", type=float, default=0.78, help="Long Note sustain threshold (default: 0.78)")
     parser.add_argument(
+        "--passes", "--iterations", "--num_passes",
+        type=int,
+        default=2,
+        help="Number of neural multi-pass generation & refinement iterations (default: 2; 1=single pass draft, 2=draft + neural self-refinement, 3+=iterative polishing).",
+    )
+    parser.add_argument(
         "--timing_mode",
         type=str,
         choices=["soft_snap", "universal_grid", "residual", "quantized"],
@@ -446,6 +452,7 @@ def main():
     print(f"  • Artist:         {final_artist}")
     print(f"  • Difficulties:   {len(sr_list)} diff(s) -> [{sr_display}]")
     print(f"  • Generation Mode:{mode_display}")
+    print(f"  • Refinement Passes:{args.passes} pass(es) ({'Single Pass (Draft)' if args.passes == 1 else ('2-Pass (Draft + Neural Self-Refinement)' if args.passes == 2 else f'{args.passes}-Pass (Iterative Self-Sculpting & Polish)')})")
     print(f"  • Timing / Snap:  {args.timing_mode.upper()} ({'Continuous + Magnetic Snap' if args.timing_mode == 'soft_snap' else ('Universal Multi-Divisor Grid' if args.timing_mode == 'universal_grid' else ('Macro Anchor + Residual Offset' if args.timing_mode == 'residual' else 'Legacy 1/8 Binary Snapping'))})")
     print(f"  • BPM:            {f'{final_bpm:.2f} (Preset/Manual)' if final_bpm else 'Auto Sync Inference'}")
     print(f"  • Offset:         {f'{final_offset} ms (Preset/Manual)' if final_offset is not None else 'Auto Sync Inference'}")
@@ -477,6 +484,7 @@ def main():
             ln_conf_thresh=args.ln_conf,
             silence_gate=args.silence,
             timing_mode=args.timing_mode,
+            passes=args.passes,
         )
 
         print("\n" + "=" * 65)

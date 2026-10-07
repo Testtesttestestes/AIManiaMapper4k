@@ -44,12 +44,14 @@ def generate_beatmap_pipeline(
     ln_conf_thresh: float = 0.78,
     silence_gate: float = 0.0,
     timing_mode: str = "soft_snap",
+    passes: int = 2,
+    num_passes: Optional[int] = None,
 ) -> Tuple[List[str], str, AudioRhythmResult]:
     """
     Executes the full generation pipeline:
     1. Step 1 (Model 1 / Sync or Manual): BPM and offset synchronization
     2. Step 2 (Model 2 / Dynamics or Pre-set): SV & timing zones
-    3. Step 3 (Model 3 / Transformer Neural Patterns): 4K Hit Object pattern synthesis using trained weights
+    3. Step 3 (Model 3 / Transformer Neural Patterns): 4K Hit Object pattern synthesis with Multi-Pass Refinement
     4. Step 4 (Packaging): Serialization to .osu v14 and bundling into a single .osz archive.
 
     Supports generating MULTIPLE difficulties in one call by passing a list of star_ratings:
@@ -58,6 +60,7 @@ def generate_beatmap_pipeline(
     Returns:
         (list_of_osu_content_strings, generated_osz_path, audio_analysis_result)
     """
+    effective_passes = max(1, int(num_passes if num_passes is not None else passes))
     audio_analysis = analyze_audio_rhythm(wav_path)
 
     effective_bpm = audio_analysis.bpm
@@ -184,9 +187,10 @@ def generate_beatmap_pipeline(
                     ln_conf_thresh=ln_conf_thresh,
                     silence_gate=silence_gate,
                     timing_mode=timing_mode,
+                    num_passes=effective_passes,
                 )
                 used_neural = True
-                print(f"✨ [Model 3 Transformer] Successfully generated {len(hit_objects)} neural hit objects.")
+                print(f"✨ [Model 3 Transformer] Successfully completed {effective_passes}-pass neural generation ({len(hit_objects)} objects).")
             except Exception as err:
                 if force_neural:
                     raise RuntimeError(f"Neural pattern generation failed: {err}")

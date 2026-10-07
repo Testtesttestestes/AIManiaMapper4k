@@ -138,6 +138,20 @@ class TestOsuSyntax(unittest.TestCase):
             self.assertEqual(len(osu_files), 1, "Archive must contain exactly one .osu file")
             self.assertEqual(len(audio_files), 1, "Archive must contain audio file")
 
+    def test_multipass_generation_pipeline(self):
+        """Verify pipeline execution with multi-pass (passes=3) generation."""
+        multi_osz_path = os.path.join(self.test_dir, "test_multipass_output.osz")
+        osu_content, osz_path, analysis = generate_beatmap_pipeline(
+            wav_path=self.wav_path,
+            output_osz_path=multi_osz_path,
+            star_rating=[3.0, 4.5],
+            title="Multi-Pass Test",
+            artist="Test Artist",
+            passes=3,
+        )
+        self.assertEqual(len(osu_content), 2, "Should generate 2 difficulties")
+        self.assertTrue(os.path.exists(multi_osz_path), "Multi-pass .osz must exist")
+
 
 if __name__ == "__main__":
     unittest.main()

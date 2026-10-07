@@ -1,1 +1,8 @@
-python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0,4.5,5,5.5 --neural
+# 1. Генерация с многопроходным рефайнментом (2 прохода: Черновик + Нейронный саморефайнмент):
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 2.0,2.5,3.0,3.5,4.0,4.5,5,5.5 --neural --passes 2
+
+# 2. Генерация с глубоким итеративным редактированием и полировкой (3 прохода):
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 4.5 --neural --passes 3
+
+# 3. Быстрая генерация в 1 проход:
+python generate_beatmap.py --template "C:\Users\SASEN1\AppData\Roaming\osu\exports\unknown artist - unknown title (MrSpookyFridays).osz" --sr 4.0 --neural --passes 1
