@@ -32,6 +32,7 @@ from osu_mapper.dataset.audio_tokenizers import (
 )
 from osu_mapper.models.diffusion_scheduler import DiffusionScheduler
 from osu_mapper.models.diffusion_unet import ManiaDiffusionUNet
+from osu_mapper.pipeline.pattern_generator import ManiaHitObject
 
 
 if TORCH_AVAILABLE and torch is not None:
@@ -58,7 +59,7 @@ class ManiaDiffusion(BaseModule):
         self,
         audio_in_dim: int = 128,
         audio_d_model: int = 256,
-        unet_base_channels: int = 128,
+        unet_base_channels: int = 64,
         channel_multipliers: Tuple[int, ...] = (1, 2, 4),
         time_dim: int = 256,
         in_channels: int = 12,  # 4 tap + 4 LN start + 4 LN sustain
@@ -178,13 +179,45 @@ class ManiaDiffusion(BaseModule):
         # 5. Predict the noise using 1D UNet
         predicted_noise = self.unet(noisy_beatmap, timesteps, audio_context, star_rating)
 
-        # 6. Compute loss
-        loss = F.mse_loss(predicted_noise, noise)
+        # 6. Reconstruct predicted clean beatmap x_0
+        self.scheduler.to(device)
+        alpha_prod_t = self.scheduler.alphas_cumprod[timesteps].view(B, 1, 1)
+        beta_prod_t = (1.0 - alpha_prod_t).clamp(min=1e-5)
+        pred_x0 = (noisy_beatmap - torch.sqrt(beta_prod_t) * predicted_noise) / torch.sqrt(alpha_prod_t).clamp(min=1e-5)
+        pred_x0 = torch.clamp(pred_x0, -1.5, 1.5)
+
+        # 7. Note-weighted reconstruction loss
+        # Human notes have target +1.0, silence is -1.0.
+        # Give 5x weight to note positions so the model doesn't just predict silence to minimize noise MSE!
+        is_note = (beatmap_tensor > 0.0).float()
+        note_weight = 1.0 + 4.0 * is_note  # 5.0 for notes, 1.0 for empty space
+
+        diff_loss = F.mse_loss(predicted_noise, noise)
+        x0_loss = torch.mean(note_weight * (pred_x0 - beatmap_tensor) ** 2)
+
+        total_loss = diff_loss + 0.35 * x0_loss
+
+        # 8. Compute discrete note-matching metrics (Precision, Recall, F1)
+        with torch.no_grad():
+            pred_notes = (pred_x0 > 0.0)
+            true_notes = (beatmap_tensor > 0.0)
+            tp = (pred_notes & true_notes).sum().float()
+            fp = (pred_notes & (~true_notes)).sum().float()
+            fn = ((~pred_notes) & true_notes).sum().float()
+
+            precision = (tp / (tp + fp).clamp(min=1.0)).item()
+            recall = (tp / (tp + fn).clamp(min=1.0)).item()
+            f1 = (2.0 * tp / (2.0 * tp + fp + fn).clamp(min=1.0)).item()
+
         loss_dict = {
-            "loss_diffusion": loss.item(),
+            "loss_diffusion": diff_loss.item(),
+            "loss_x0": x0_loss.item(),
             "l1_error": F.l1_loss(predicted_noise, noise).item(),
+            "note_precision": precision,
+            "note_recall": recall,
+            "note_f1": f1,
         }
-        return loss, loss_dict
+        return total_loss, loss_dict
 
     @no_grad()
     def sample(
@@ -263,9 +296,10 @@ def beatmap_tensor_to_hit_objects(
     ticks: List[MusicalGridTick],
     duration_ms: float,
     beat_len_ms: float,
-    tap_threshold: float = 0.05,
-    ln_threshold: float = 0.15,
+    tap_threshold: float = 0.20,
+    ln_threshold: float = 0.20,
     min_ln_ms: Optional[float] = None,
+    min_lane_gap_ms: float = 40.0,
 ) -> List[ManiaHitObject]:
     """
     Decodes the 12-channel continuous diffusion tensor [12, T] into validated discrete ManiaHitObjects.
@@ -279,6 +313,8 @@ def beatmap_tensor_to_hit_objects(
     arr = denoised_tensor.detach().cpu().numpy()
     if arr.ndim == 3:
         arr = arr[0]  # [12, T]
+
+    from osu_mapper.pipeline.pattern_generator import ManiaHitObject
 
     num_channels, num_ticks = arr.shape
     num_ticks = min(num_ticks, len(ticks))
@@ -318,7 +354,7 @@ def beatmap_tensor_to_hit_objects(
             if active_ln_starts[c] is None:
                 is_tap = (tap_val > tap_threshold)
                 is_ln = (ln_start_val > ln_threshold)
-                gap_ok = (cur_ms - last_note_ms[c]) >= 40  # Physical minimum gap per lane
+                gap_ok = (cur_ms - last_note_ms[c]) >= min_lane_gap_ms
 
                 if is_ln and gap_ok:
                     active_ln_starts[c] = cur_ms
