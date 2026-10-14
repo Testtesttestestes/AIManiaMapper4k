@@ -100,7 +100,10 @@ class DecodeKnobs:
     ln_conflict: str = "avoid"          # "avoid": choose free lanes while an LN is held; "truncate": cut the LN
     ln_release_gap_ms: int = 1          # an LN must end at least this long before the next note on its lane
     use_stagger: bool = True
-    snap_ms: float = 0.0                # snap event times / LN ends to the musical grid within this tolerance
+    onset_shift_ms: int = 0             # constant correction of note times (calibrated on validation, e.g. MP3 decoder delay)
+    ln_length_scale: float = 1.0        # multiplies predicted LN lengths (calibrated on validation)
+    snap_ms: float = 0.0                # snap note times to the nearest musical tick within this tolerance
+    ln_snap_ms: Optional[float] = None  # snap LN releases to the PREVIOUS tick within this tolerance (None = same as snap_ms)
     snap_divisors: Tuple[int, ...] = (1, 2, 4, 3, 6, 8, 12, 16)
     seed: int = 0
 
@@ -170,11 +173,28 @@ class GridSnapper:
             best_tick = np.where(better, tick, best_tick)
         return best_tick, best
 
-    def snap(self, t: np.ndarray, tol_ms: float) -> np.ndarray:
+    def previous_tick(self, t: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Latest tick at or before t (used for long-note releases, which must never move later)."""
+        t = np.asarray(t, dtype=np.float64)
+        idx = np.clip(np.searchsorted(self.times, t, side="right") - 1, 0, self.times.size - 1)
+        off = self.times[idx]
+        bl = self.beat_lens[idx]
+        beats = (t - off) / bl
+        best = np.full(t.shape, np.inf)
+        best_tick = t.copy()
+        for d in self.divisors:
+            tick = off + np.floor(beats * d + 1e-6) * bl / d
+            dist = t - tick
+            better = dist < best - 1e-9
+            best = np.where(better, dist, best)
+            best_tick = np.where(better, tick, best_tick)
+        return best_tick, best
+
+    def snap(self, t: np.ndarray, tol_ms: float, direction: str = "nearest") -> np.ndarray:
         t = np.asarray(t)
         if not self.available or tol_ms <= 0 or t.size == 0:
             return t.astype(np.int64)
-        tick, dist = self.nearest_tick(t)
+        tick, dist = self.previous_tick(t) if direction == "down" else self.nearest_tick(t)
         # osu! stores integer ms; editor-placed notes sit on floor(tick) in most clients, round is within 1 ms
         snapped = np.where(dist <= tol_ms, np.round(tick), t)
         return snapped.astype(np.int64)
@@ -224,9 +244,12 @@ def decode_outputs(
     if events is None:
         events = extract_events(out.time_probs, k.onset_threshold, H, k.merge_ms, k.min_event_gap_ms)
     ev_t, ev_f, ev_p = events
+    if k.onset_shift_ms:
+        ev_t = ev_t + int(k.onset_shift_ms)
+    ln_snap = k.snap_ms if k.ln_snap_ms is None else k.ln_snap_ms
 
-    snapper = GridSnapper(timing_points or [], k.snap_divisors) if (k.snap_ms > 0 and timing_points) else None
-    if snapper is not None and snapper.available and ev_t.size:
+    snapper = GridSnapper(timing_points or [], k.snap_divisors) if ((k.snap_ms > 0 or ln_snap > 0) and timing_points) else None
+    if snapper is not None and snapper.available and ev_t.size and k.snap_ms > 0:
         ev_t = snapper.snap(ev_t, k.snap_ms)
         order = np.argsort(ev_t, kind="stable")
         ev_t, ev_f, ev_p = ev_t[order], ev_f[order], ev_p[order]
@@ -276,10 +299,10 @@ def decode_outputs(
             p_ln = 1.0 / (1.0 + math.exp(-float(out.ln_logits[f, m])))
             if p_ln >= k.ln_threshold:
                 b = int(out.ln_bucket[f, m])
-                L = int(ln_bucket_to_length(b, float(out.ln_resid[f, m])))
+                L = int(round(float(ln_bucket_to_length(b, float(out.ln_resid[f, m]))) * k.ln_length_scale))
                 e = s + L
-                if snapper is not None and snapper.available:
-                    e = int(snapper.snap(np.array([e]), k.snap_ms)[0])
+                if snapper is not None and snapper.available and ln_snap > 0:
+                    e = int(snapper.snap(np.array([e]), ln_snap, direction="down")[0])
                 if e - s >= k.ln_min_ms:
                     notes.append(Note(s, c, e, True))
                     busy_until[c] = e
