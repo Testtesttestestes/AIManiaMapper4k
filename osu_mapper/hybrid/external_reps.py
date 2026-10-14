@@ -52,6 +52,37 @@ def external_dim(name: str) -> int:
     return EXTERNAL_REGISTRY[name].dim
 
 
+INSTALL_HINTS: Dict[str, str] = {
+    "encodec24": "pip install encodec",
+    "mert95m": "pip install transformers",
+    "demucs_stems": "pip install demucs",
+}
+
+
+def preflight_external(names, sample_rate: int = 24000, log: Callable[[str], None] = print) -> None:
+    """Imports every requested encoder and runs it once on 1 s of silence BEFORE any real work.
+
+    This is where the weights are downloaded on first use (Hugging Face / torch hub cache), so a missing
+    package or a blocked download stops the run immediately with an explanation instead of failing per song.
+    """
+    for name in names:
+        if name not in EXTERNAL_REGISTRY:
+            raise SystemExit(f"[external] unknown encoder '{name}'. Available: {', '.join(sorted(EXTERNAL_REGISTRY))}")
+        rep = EXTERNAL_REGISTRY[name]
+        log(f"[external] {name}: loading model (the first run downloads the weights, this can take a few minutes)...")
+        try:
+            out = np.asarray(rep.fn(np.zeros(sample_rate, dtype=np.float32), sample_rate))
+        except ImportError as err:
+            hint = INSTALL_HINTS.get(name, f"pip install {rep.requires}")
+            raise SystemExit(f"[external] {name}: missing Python package ({err}).\n  Install it with: {hint}")
+        except Exception as err:
+            raise SystemExit(f"[external] {name}: could not load/run the model: {type(err).__name__}: {err}\n"
+                             f"  Check the internet connection (weights are downloaded on first use) and the package version.")
+        if out.ndim != 2 or out.shape[1] != rep.dim:
+            raise SystemExit(f"[external] {name}: unexpected output shape {out.shape}, expected [T, {rep.dim}]")
+        log(f"[external] {name}: OK ({rep.dim}-d @ {rep.rate_hz:g} Hz)")
+
+
 def compute_external(name: str, wave: np.ndarray, sample_rate: int, num_frames: int, frame_ms: int = 10) -> np.ndarray:
     """Runs an external encoder chunk-wise over the whole track and resamples it to ``num_frames``."""
     rep = EXTERNAL_REGISTRY[name]

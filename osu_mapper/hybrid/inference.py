@@ -113,6 +113,9 @@ class HybridPredictor:
         state = ckpt.get("ema_state") if (use_ema and ckpt.get("ema_state")) else ckpt["model_state"]
         model.load_state_dict(state)
         fcfg = FeatureConfig.from_dict(ckpt["feature_config"])
+        if fcfg.external:  # the model was trained with neural encoders: they must be available for generation too
+            from .external_reps import preflight_external
+            preflight_external(fcfg.external, fcfg.sample_rate)
         return cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5))
 
     @torch.no_grad()
