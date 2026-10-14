@@ -100,6 +100,19 @@ class TestUniversalAlgorithm(unittest.TestCase):
         b, r = ln_length_to_bucket(L)
         self.assertTrue(np.array_equal(ln_bucket_to_length(b, r)[L < 65536], L[L < 65536]))
 
+    def test_params_json_file_roundtrip(self):
+        """hybrid_params.py: map -> JSON parameters -> algorithm reading only the JSON -> identical map."""
+        import json
+        sys.path.insert(0, str(REPO))
+        from hybrid_params import compare, json_to_map, track_to_json
+
+        m = random_map(random.Random(11), 200, degenerate=True)
+        m.notes = [n for n in m.notes if n.ln or n.end == n.start]
+        text = json.dumps(track_to_json(solve_map(m), m, "test"))
+        rendered = parse_osu_mania(map_to_osu_text(json_to_map(json.loads(text))))
+        ok, msg = compare(m, rendered)
+        self.assertTrue(ok, msg)
+
     def test_track_npz_roundtrip(self):
         m = random_map(random.Random(3), 120, degenerate=True)
         track = solve_map(m)
