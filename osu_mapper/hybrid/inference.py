@@ -23,7 +23,7 @@ from .audio_features import BEAT_DIM, FeatureConfig, beat_features, coarse_featu
 from .beatmap import ManiaMap, Note, RawTimingPoint, map_to_osu_text
 from .model import HybridModelConfig, HybridParamNet
 from .params import PARAM_VERSION
-from .renderer import DecodeKnobs, HeadOutputs, decode_outputs
+from .renderer import HeadOutputs
 from .solver import STYLE_DIM, STYLE_KEYS
 
 CHECKPOINT_FORMAT = "hybrid-checkpoint-v1"
@@ -220,47 +220,6 @@ def star_rating_of(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint
     text = map_to_osu_text(ManiaMap(notes=list(notes), timing_points=tps, overall_difficulty=od))
     hits = [(n.col, n.start, n.end, n.ln) for n in notes]
     return float(calculate_osu_mania_star_rating(osu_text=text, hit_objects=hits, overall_difficulty=od, keys=4))
-
-
-def calibrate_to_star_rating(
-    out: HeadOutputs,
-    target_sr: float,
-    knobs: DecodeKnobs,
-    timing_points: Sequence[RawTimingPoint],
-    od: float = 8.0,
-    tolerance: float = 0.05,
-    iterations: int = 12,
-) -> Tuple[List[Note], float, float]:
-    """Binary search of the event threshold so the rendered map hits the target star rating.
-
-    Rendering is instant, so this replaces the old weight-changing "self-correction": the network
-    weights are never touched, only the algorithm's density knob. Returns (notes, threshold, sr).
-    """
-    def run(th: float) -> Tuple[List[Note], float]:
-        k = DecodeKnobs(**{**knobs.__dict__, "onset_threshold": th})
-        notes = decode_outputs(out, k, timing_points)
-        return notes, star_rating_of(notes, timing_points, od)
-
-    lo, hi = 0.02, 0.98
-    notes_lo, sr_lo = run(lo)
-    if sr_lo <= target_sr:
-        return notes_lo, lo, sr_lo
-    notes_hi, sr_hi = run(hi)
-    if sr_hi >= target_sr:
-        return notes_hi, hi, sr_hi
-    best = (abs(sr_lo - target_sr), notes_lo, lo, sr_lo)
-    for _ in range(iterations):
-        mid = 0.5 * (lo + hi)
-        notes_mid, sr_mid = run(mid)
-        if abs(sr_mid - target_sr) < best[0]:
-            best = (abs(sr_mid - target_sr), notes_mid, mid, sr_mid)
-        if abs(sr_mid - target_sr) <= tolerance:
-            break
-        if sr_mid > target_sr:
-            lo = mid
-        else:
-            hi = mid
-    return best[1], best[2], best[3]
 
 
 def estimated_timing_points(reps: Dict[str, np.ndarray], frame_ms: int) -> List[RawTimingPoint]:

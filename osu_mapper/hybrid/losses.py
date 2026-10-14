@@ -94,7 +94,10 @@ def compute_losses(
     ev = (tc > 0) & (valid > 0)
     n_ev = int(ev.sum())
     logs["events"] = float(n_ev)
-    zero = out["time_logits"].sum() * 0.0
+    # zero-valued terms stay connected to their heads, so every parameter receives a (zero) gradient:
+    # required by DistributedDataParallel and harmless otherwise
+    def zero(*keys: str) -> torch.Tensor:
+        return sum(out[k].float().sum() for k in keys) * 0.0
     if n_ev > 0:
         # --- lane code -----------------------------------------------------------------------
         loss_lane = F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing)
@@ -108,16 +111,20 @@ def compute_losses(
         if chord_member.any():
             loss_stagger = F.cross_entropy(out["stagger_logits"][chord_member].float(), batch["stagger"][chord_member].clamp(0, frame_ms - 1))
         else:
-            loss_stagger = zero
+            loss_stagger = zero("stagger_logits")
         loss_lnf = F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float())
         ln_member = member & (batch["ln_flag"] > 0.5)
         if ln_member.any():
             b_t, r_t = ln_targets(batch["ln_len"][ln_member])
             loss_lnl = F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t) + F.l1_loss(out["ln_resid"][ln_member].float(), r_t)
         else:
-            loss_lnl = zero
+            loss_lnl = zero("ln_bucket_logits", "ln_resid")
     else:
-        loss_lane = loss_chord = loss_stagger = loss_lnf = loss_lnl = zero
+        loss_lane = zero("lane_logits")
+        loss_chord = zero("chord_logits")
+        loss_stagger = zero("stagger_logits")
+        loss_lnf = zero("ln_logits")
+        loss_lnl = zero("ln_bucket_logits", "ln_resid")
 
     total = total + weights.lane * loss_lane + weights.chord * loss_chord + weights.stagger * loss_stagger + weights.ln_flag * loss_lnf + weights.ln_len * loss_lnl
     logs["lane"] = float(loss_lane.detach())
@@ -131,7 +138,7 @@ def compute_losses(
     if sm.sum() > 0:
         loss_style = (F.smooth_l1_loss(out["style_pred"].float(), batch["style"].float(), reduction="none", beta=0.1) * sm).sum() / sm.sum()
     else:
-        loss_style = zero
+        loss_style = zero("style_pred")
     total = total + weights.style * loss_style
     logs["style"] = float(loss_style.detach())
     logs["total"] = float(total.detach())
