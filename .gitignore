@@ -38,3 +38,11 @@ node_modules/
 dist/
 .vite/
 *.log
+
+# Hybrid mapper outputs
+dataset_hybrid/
+checkpoints/
+hybrid_demo/
+hybrid_audit_report.json
+hybrid_long_track_report.json
+output_beatmaps/
