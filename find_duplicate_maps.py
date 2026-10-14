@@ -17,11 +17,11 @@ import argparse
 import hashlib
 import re
 import zipfile
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
 from osu_mapper.hybrid.beatmap import parse_osu_mania
+from osu_mapper.hybrid.sources import LFS_HINT, is_lfs_pointer
 
 
 def osu_keys(raw: bytes) -> List[str]:
@@ -42,6 +42,9 @@ def main() -> None:
     args = ap.parse_args()
 
     archives = sorted(Path(args.dir).glob("*.osz"), key=lambda p: (re.match(r"^\d+ ", p.name) is None, p.name))
+    pointers = [p for p in archives if is_lfs_pointer(p)]
+    if pointers:
+        raise SystemExit(f"{len(pointers)} of {len(archives)} .osz files are not downloaded yet.\n{LFS_HINT}")
     owner: Dict[str, str] = {}
     redundant: List[Path] = []
     dup_osu = 0

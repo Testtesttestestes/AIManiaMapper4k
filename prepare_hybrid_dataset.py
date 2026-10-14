@@ -52,8 +52,17 @@ def main() -> None:
     ap.add_argument("--max_songs", type=int, default=0, help="stop after N songs (0 = all)")
     ap.add_argument("--overwrite", action="store_true", help="recompute features even if they exist")
     ap.add_argument("--device", default="auto", help="where to compute STFT features: auto/cpu/cuda")
-    ap.add_argument("--external", nargs="*", default=[], help="optional neural encoders: encodec24 mert95m demucs_stems (see osu_mapper/hybrid/external_reps.py)")
+    ap.add_argument("--external", nargs="*", default=None, metavar="NAME",
+                    help="neural encoders: '--external' alone = all of them (encodec24 mert95m demucs_stems), "
+                         "or list a subset, e.g. --external encodec24 mert95m")
     args = ap.parse_args()
+    if args.external is not None and len(args.external) == 0:
+        from osu_mapper.hybrid.external_reps import EXTERNAL_REGISTRY
+        args.external = sorted(EXTERNAL_REGISTRY)
+    args.external = args.external or []
+    if args.external:
+        from osu_mapper.hybrid.external_reps import preflight_external
+        preflight_external(args.external)
 
     out = Path(args.output_dir)
     (out / "features").mkdir(parents=True, exist_ok=True)

@@ -42,6 +42,27 @@ def stable_id(*parts: str) -> str:
     return h[:16]
 
 
+LFS_HINT = (
+    "The .osz files are Git LFS pointers, not the real archives (Git LFS objects were not downloaded).\n"
+    "  Fix: install Git LFS (https://git-lfs.com) and run in the repository folder:\n"
+    "       git lfs install\n"
+    "       git lfs pull\n"
+    "  After that every .osz is a real zip archive of several MB instead of a ~130-byte text file."
+)
+
+
+def is_lfs_pointer(path: str | Path) -> bool:
+    """True if the file is a Git LFS pointer text file instead of the real content."""
+    try:
+        p = Path(path)
+        if p.stat().st_size > 1024:
+            return False
+        with open(p, "rb") as fh:
+            return fh.read(64).startswith(b"version https://git-lfs.github.com/spec/")
+    except OSError:
+        return False
+
+
 def _read_zip_entry(path: str, name: str) -> bytes:
     with zipfile.ZipFile(path, "r") as z:
         return z.read(name)
@@ -70,6 +91,10 @@ def iter_song_groups(input_dir: str | Path, keys: int = 4, log: Callable[[str], 
     from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
 
     osz_files, folders = resolve_beatmap_sources(input_dir)
+    pointers = [p for p in osz_files if is_lfs_pointer(p)]
+    if pointers:
+        log(f"[error] {len(pointers)} of {len(osz_files)} .osz files are skipped.\n  {LFS_HINT}")
+        osz_files = [p for p in osz_files if p not in set(pointers)]
     for osz in osz_files:
         try:
             with zipfile.ZipFile(osz, "r") as z:
