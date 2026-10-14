@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 
 from osu_mapper.hybrid.dataset import HybridCropDataset, HybridIndex, collate_hybrid
 from osu_mapper.hybrid.inference import CHECKPOINT_FORMAT, HybridPredictor, SongInputs, resolve_device, star_rating_of
+from osu_mapper.hybrid.calibration import calibrate
 from osu_mapper.hybrid.losses import LossWeights, compute_losses, crop_metrics
 from osu_mapper.hybrid.metrics import per_ms_report, summarize_reports
 from osu_mapper.hybrid.model import HybridModelConfig, HybridParamNet, PRESETS, build_config, count_parameters
@@ -162,6 +163,7 @@ def validate_full_maps(
         if f1 > best_ln_f1:
             best_ln, best_ln_f1 = lt, f1
     best_summary["ln_f1_at_best_ln_threshold"] = best_ln_f1
+    best_summary.update(calibrate(((o, r, tps) for o, r, tps, _ in cache), best_th, best_ln))
     # does the network itself produce the requested difficulty? (no density calibration at generation)
     sr_err = []
     for o, _r, tps, target in cache:
@@ -264,6 +266,7 @@ def main() -> None:
     step, start_epoch, best_score, history = 0, 0, -float("inf"), []
     decode_threshold = 0.5
     ln_threshold = 0.5
+    calib = {"onset_shift_ms": 0, "ln_length_scale": 1.0}
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"])
         if ema is not None and resume_ckpt.get("ema_state"):
@@ -276,6 +279,7 @@ def main() -> None:
         history = list(resume_ckpt.get("history", []))
         decode_threshold = float(resume_ckpt.get("decode_threshold", 0.5))
         ln_threshold = float(resume_ckpt.get("ln_threshold", 0.5))
+        calib = {"onset_shift_ms": int(resume_ckpt.get("onset_shift_ms", 0)), "ln_length_scale": float(resume_ckpt.get("ln_length_scale", 1.0))}
 
     # wrap after loading the checkpoint; all ranks start from identical weights (DDP broadcasts rank 0)
     train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
@@ -312,6 +316,8 @@ def main() -> None:
             "best_score": best_score,
             "decode_threshold": decode_threshold,
             "ln_threshold": ln_threshold,
+            "onset_shift_ms": calib["onset_shift_ms"],
+            "ln_length_scale": calib["ln_length_scale"],
             "val_summary": summary,
             "history": history,
             "args": vars(args),
@@ -369,11 +375,14 @@ def main() -> None:
                 record.update({f"map_{k}": v for k, v in summary.items()})
                 record["decode_threshold"] = decode_threshold
                 record["ln_threshold"] = ln_threshold
+                calib = {"onset_shift_ms": int(summary.get("onset_shift_ms", 0)), "ln_length_scale": float(summary.get("ln_length_scale", 1.0))}
                 print(f"[epoch {epoch}] RENDERED MAPS vs reference ({len(val_full)} songs, thresholds event {decode_threshold} / LN {ln_threshold}, {time.time() - t1:.1f}s): "
                       f"per-ms loss {summary.get('per_ms_loss', float('nan')):.4f} | event F1 @0ms {summary.get('event_f1@0', 0):.3f} @2ms {summary.get('event_f1@2', 0):.3f} "
                       f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | timing MAE {summary.get('timing_mae_ms', float('nan')):.2f}ms "
                       f"| chord acc {summary.get('chord_size_acc', 0):.3f} | LN F1 {summary.get('ln_f1_at_best_ln_threshold', 0):.3f} | density x{summary.get('density_ratio', float('nan')):.2f} "
-                      f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f})")
+                      f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f}) "
+                      f"| start error median {summary.get('start_error_median_ms', float('nan')):+.1f}ms, LN length x{summary.get('ln_length_ratio_median', float('nan')):.2f} "
+                      f"-> calibration shift {calib['onset_shift_ms']:+d}ms, LN scale {calib['ln_length_scale']:.2f}")
             history.append(record)
             if summary:
                 score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs

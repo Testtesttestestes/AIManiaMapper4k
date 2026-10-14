@@ -148,6 +148,15 @@ class TestUniversalAlgorithm(unittest.TestCase):
         self.assertEqual(list(snap.snap(np.array([233]), 5)), [233])
         self.assertEqual(int(snap.snap(np.array([234]), 5)[0]), 233)  # 1/3 beat after 100 = 233.33
 
+    def test_release_snapping_never_moves_later_and_calibration_knobs(self):
+        snap = GridSnapper([RawTimingPoint(0.0, 400.0)], divisors=(1, 2, 4))
+        self.assertEqual(list(snap.snap(np.array([195, 205, 290]), 20, direction="down")), [195, 200, 290])
+        track = solve_map([Note(1000, 0, 1400, True), Note(2000, 1, 2000, False)])
+        out = oracle_outputs(track)
+        notes = decode_outputs(out, DecodeKnobs(onset_shift_ms=-3, ln_length_scale=0.5))
+        self.assertIn(Note(997, 0, 1197, True), notes)
+        self.assertIn(Note(1997, 1, 1997, False), notes)
+
     def test_style_vector(self):
         m = random_map(random.Random(5), 100)
         track = solve_map(m)

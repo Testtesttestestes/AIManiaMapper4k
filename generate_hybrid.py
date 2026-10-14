@@ -105,7 +105,11 @@ def main() -> None:
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
     ap.add_argument("--jack_min_ms", type=int, default=0, help="forbid lane repeats faster than this many ms")
     ap.add_argument("--max_chord", type=int, default=4)
-    ap.add_argument("--snap_ms", type=float, default=0.0, help="snap notes to the red-line grid within this tolerance")
+    ap.add_argument("--snap_ms", type=float, default=0.0, help="snap note starts to the nearest red-line tick within this tolerance")
+    ap.add_argument("--ln_snap_ms", type=float, default=None, help="snap LN releases to the PREVIOUS tick within this tolerance (default: = --snap_ms)")
+    ap.add_argument("--snap_divisors", default="1,2,4,3,6,8,12,16", help="allowed beat divisors for snapping, e.g. 1,2,4 for a straight 4/4 song")
+    ap.add_argument("--onset_shift_ms", type=int, default=None, help="constant note-time correction (default: calibrated value from the checkpoint)")
+    ap.add_argument("--ln_scale", type=float, default=None, help="LN length multiplier (default: calibrated value from the checkpoint)")
     ap.add_argument("--lane_temperature", type=float, default=0.0)
     ap.add_argument("--no_stagger", action="store_true")
     ap.add_argument("--od", type=float, default=8.0)
@@ -158,11 +162,18 @@ def main() -> None:
             jack_min_ms=args.jack_min_ms,
             max_chord=args.max_chord,
             snap_ms=args.snap_ms,
+            ln_snap_ms=args.ln_snap_ms,
+            snap_divisors=tuple(int(x) for x in args.snap_divisors.replace(" ", "").split(",") if x),
+            onset_shift_ms=args.onset_shift_ms if args.onset_shift_ms is not None else predictor.onset_shift_ms,
+            ln_length_scale=args.ln_scale if args.ln_scale is not None else predictor.ln_length_scale,
             lane_temperature=args.lane_temperature,
             use_stagger=not args.no_stagger,
             seed=args.seed,
         )
 
+        print(f"[decode] event threshold {knobs.onset_threshold:.2f}, LN threshold {knobs.ln_threshold:.2f}, "
+              f"note shift {knobs.onset_shift_ms:+d} ms, LN scale {knobs.ln_length_scale:.2f}, snap {knobs.snap_ms:g} ms "
+              f"(LN release snap {knobs.ln_snap_ms if knobs.ln_snap_ms is not None else knobs.snap_ms:g} ms back), divisors {knobs.snap_divisors}")
         title = args.title or meta.get("Title") or audio_path.stem
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         audio_name = audio_path.name

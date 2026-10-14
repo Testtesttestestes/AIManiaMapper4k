@@ -93,13 +93,16 @@ def style_from_dict(values: Optional[Dict[str, float]]) -> Tuple[np.ndarray, np.
 
 class HybridPredictor:
     def __init__(self, model: HybridParamNet, feature_cfg: FeatureConfig, window_frames: int, device: torch.device,
-                 decode_threshold: float = 0.5, ln_threshold: float = 0.5):
+                 decode_threshold: float = 0.5, ln_threshold: float = 0.5,
+                 onset_shift_ms: int = 0, ln_length_scale: float = 1.0):
         self.model = model.to(device).eval()
         self.feature_cfg = feature_cfg
         self.window = int(window_frames)
         self.device = device
         self.decode_threshold = float(decode_threshold)
         self.ln_threshold = float(ln_threshold)
+        self.onset_shift_ms = int(onset_shift_ms)
+        self.ln_length_scale = float(ln_length_scale)
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, device: str = "auto", use_ema: bool = True) -> "HybridPredictor":
@@ -116,7 +119,8 @@ class HybridPredictor:
         if fcfg.external:  # the model was trained with neural encoders: they must be available for generation too
             from .external_reps import preflight_external
             preflight_external(fcfg.external, fcfg.sample_rate)
-        return cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5))
+        return cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
+                   int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
 
     @torch.no_grad()
     def predict(
