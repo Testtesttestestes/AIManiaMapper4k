@@ -8,8 +8,8 @@ Generate osu!mania 4K maps with the hybrid mapper (network -> parameters -> univ
     python generate_hybrid.py song.mp3 --sr 4 --style ln_ratio=0.35 jack_ratio=0.02
 
 Works for tracks of any length (1 hour is fine): the network runs window by window and the
-algorithm renders the whole track in one pass. The star rating of every difficulty is calibrated
-with rosu-pp by adjusting only the algorithm's density knob (the network is never modified).
+algorithm renders the whole track in one pass. Density follows the requested star rating through the
+network's own conditioning; the rosu-pp star rating of the result is printed for reference.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from osu_mapper.hybrid.audio_features import load_audio
 from osu_mapper.hybrid.beatmap import ManiaMap, RawTimingPoint, _kv, _split_sections, map_to_osu_text, parse_timing_point
 from osu_mapper.hybrid.inference import (
     HybridPredictor,
-    calibrate_to_star_rating,
     estimated_timing_points,
     prepare_song_inputs,
     star_rating_of,
@@ -103,7 +102,6 @@ def main() -> None:
     ap.add_argument("--beat_features", default="auto", choices=["auto", "on", "off"], help="feed red-line phase to the network (auto: only for template/manual timing)")
     ap.add_argument("--style", nargs="*", default=[], help="style controls key=value: " + "sr nps ln_ratio chord_mean jack_ratio alt_ratio roll_ratio symmetric_ratio explicit_ratio offgrid_ratio od")
     ap.add_argument("--threshold", type=float, default=None, help="event threshold (default: calibrated value stored in the checkpoint)")
-    ap.add_argument("--no_calibrate", action="store_true", help="do not calibrate density to the target star rating")
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
     ap.add_argument("--jack_min_ms", type=int, default=0, help="forbid lane repeats faster than this many ms")
     ap.add_argument("--max_chord", type=int, default=4)
@@ -174,11 +172,8 @@ def main() -> None:
         for target in parse_sr_list(args.sr):
             t1 = time.time()
             out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size)
-            if args.no_calibrate:
-                notes = decode_outputs(out, knobs, timing)
-                sr_val, th = star_rating_of(notes, timing, args.od), knobs.onset_threshold
-            else:
-                notes, th, sr_val = calibrate_to_star_rating(out, target, knobs, timing, args.od)
+            notes = decode_outputs(out, knobs, timing)
+            sr_val, th = star_rating_of(notes, timing, args.od), knobs.onset_threshold
             version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*"
             m = ManiaMap(
                 notes=notes,

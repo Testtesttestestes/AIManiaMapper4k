@@ -4,6 +4,7 @@ Training of the hybrid network (neural parameter predictor for the universal map
 
     python train_hybrid.py --data dataset_hybrid --preset base --epochs 40
     python train_hybrid.py --data dataset_hybrid --resume            # continue exactly where it stopped
+    torchrun --nproc_per_node=4 train_hybrid.py --data dataset_hybrid  # several GPUs (DistributedDataParallel)
 
 Design decisions that fix the problems of the old Model 3 training:
   * ONE objective, ONE checkpoint namespace (checkpoints/hybrid/). There is no second training mode
@@ -29,16 +30,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from osu_mapper.hybrid.dataset import HybridCropDataset, HybridIndex, collate_hybrid
-from osu_mapper.hybrid.inference import CHECKPOINT_FORMAT, HybridPredictor, SongInputs, resolve_device
+from osu_mapper.hybrid.inference import CHECKPOINT_FORMAT, HybridPredictor, SongInputs, resolve_device, star_rating_of
 from osu_mapper.hybrid.losses import LossWeights, compute_losses, crop_metrics
 from osu_mapper.hybrid.metrics import per_ms_report, summarize_reports
 from osu_mapper.hybrid.model import HybridModelConfig, HybridParamNet, PRESETS, build_config, count_parameters
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs, render_track
 from osu_mapper.hybrid.audio_features import beat_features
+
+
+def init_distributed(requested_device: str) -> Tuple[bool, int, int, torch.device]:
+    """Sets up DistributedDataParallel when launched with torchrun (WORLD_SIZE > 1)."""
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world <= 1:
+        return False, 0, 1, resolve_device(requested_device)
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_cuda = torch.cuda.is_available() and requested_device != "cpu"
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+        dev = torch.device("cuda", local_rank)
+    else:
+        dev = torch.device("cpu")
+    # NCCL is the fast GPU backend but does not exist on Windows; gloo works everywhere
+    backend = "nccl" if (use_cuda and dist.is_nccl_available() and sys.platform != "win32") else "gloo"
+    dist.init_process_group(backend=backend)
+    return True, rank, world, dev
 
 
 def set_seed(seed: int) -> None:
@@ -124,7 +146,7 @@ def validate_full_maps(
         smask = np.asarray(entry["style_mask"], np.float32) if style_known else np.zeros_like(style)
         out = predictor.predict(inputs, float(entry.get("sr", 0.0)), style, smask)
         ref = render_track(track)
-        cache.append((out, ref, track.timing_points))
+        cache.append((out, ref, track.timing_points, float(entry.get("sr", 0.0))))
         for th in thresholds:
             notes = decode_outputs(out, DecodeKnobs(onset_threshold=th), track.timing_points)
             per_threshold[th].append(per_ms_report(notes, ref))
@@ -136,10 +158,19 @@ def validate_full_maps(
             best_th, best_score, best_summary = th, score, summ
     best_ln, best_ln_f1 = 0.5, -1.0
     for lt in ln_thresholds:
-        f1 = float(np.mean([per_ms_report(decode_outputs(o, DecodeKnobs(onset_threshold=best_th, ln_threshold=lt), tps), r)["ln_f1"] for o, r, tps in cache]))
+        f1 = float(np.mean([per_ms_report(decode_outputs(o, DecodeKnobs(onset_threshold=best_th, ln_threshold=lt), tps), r)["ln_f1"] for o, r, tps, _ in cache]))
         if f1 > best_ln_f1:
             best_ln, best_ln_f1 = lt, f1
     best_summary["ln_f1_at_best_ln_threshold"] = best_ln_f1
+    # does the network itself produce the requested difficulty? (no density calibration at generation)
+    sr_err = []
+    for o, _r, tps, target in cache:
+        if target > 0:
+            notes = decode_outputs(o, DecodeKnobs(onset_threshold=best_th, ln_threshold=best_ln), tps)
+            sr_err.append(star_rating_of(notes, tps) - target)
+    if sr_err:
+        best_summary["sr_mae"] = float(np.mean(np.abs(sr_err)))
+        best_summary["sr_bias"] = float(np.mean(sr_err))
     return best_summary, best_th, best_ln
 
 
@@ -178,8 +209,12 @@ def main() -> None:
     ap.add_argument("--log_every", type=int, default=50)
     args = ap.parse_args()
 
+    distributed, rank, world, dev = init_distributed(args.device)
+    is_main = rank == 0
+    if not is_main:  # only rank 0 prints and writes checkpoints
+        import builtins
+        builtins.print = lambda *a, **k: None
     set_seed(args.seed)
-    dev = resolve_device(args.device)
     index = HybridIndex(args.data)
     fcfg = index.feature_config
     crop_frames = int(round(args.crop_sec * 1000.0 / fcfg.frame_ms))
@@ -190,7 +225,8 @@ def main() -> None:
     print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps / val {len(val_idx)} maps (split by song)")
 
     ckpt_dir = Path(args.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
     last_path, best_path = ckpt_dir / "hybrid_last.pt", ckpt_dir / "hybrid_best.pt"
 
     resume_ckpt: Optional[Dict[str, Any]] = None
@@ -212,7 +248,7 @@ def main() -> None:
         cfg = build_config(fcfg.dims(), fcfg.total_dim(), args.preset)
 
     model = HybridParamNet(cfg).to(dev)
-    ema = copy.deepcopy(model).eval() if args.ema > 0 else None
+    ema = copy.deepcopy(model).eval() if (args.ema > 0 and is_main) else None
     if ema is not None:
         for p in ema.parameters():
             p.requires_grad_(False)
@@ -241,12 +277,17 @@ def main() -> None:
         decode_threshold = float(resume_ckpt.get("decode_threshold", 0.5))
         ln_threshold = float(resume_ckpt.get("ln_threshold", 0.5))
 
+    # wrap after loading the checkpoint; all ranks start from identical weights (DDP broadcasts rank 0)
+    train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
+
     weights = LossWeights()
     total_steps = (start_epoch + args.epochs) * args.steps_per_epoch if resume_ckpt is None else max(int(resume_ckpt.get("total_steps", 0)), (start_epoch + args.epochs) * args.steps_per_epoch)
     print(f"[model] preset={args.preset if resume_ckpt is None else 'from checkpoint'} params={count_parameters(model):,} device={dev} amp={'on ' + str(amp_dtype) if use_amp else 'off'}")
-    print(f"[train] window={crop_frames} frames ({crop_frames * fcfg.frame_ms / 1000:.2f} s), batch={args.batch_size}, steps/epoch={args.steps_per_epoch}, total steps={total_steps}")
+    print(f"[train] window={crop_frames} frames ({crop_frames * fcfg.frame_ms / 1000:.2f} s), batch={args.batch_size} x {world} GPU(s) = {args.batch_size * world}, "
+          f"steps/epoch={args.steps_per_epoch}, total steps={total_steps}")
 
-    train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed)
+    # every rank draws its own random crops (different seed), so no sampler is needed
+    train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -280,7 +321,7 @@ def main() -> None:
     try:
         for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
             train_ds.set_epoch(epoch)
-            model.train()
+            train_model.train()
             t0 = time.time()
             run: Dict[str, float] = {}
             n_run = 0
@@ -291,7 +332,7 @@ def main() -> None:
                     g["lr"] = lr
                 sigma = sigma_at(step, total_steps, args.sigma_start, args.sigma_end)
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
-                    out = forward_batch(model, batch)
+                    out = forward_batch(train_model, batch)
                 loss, logs = compute_losses(out, batch, weights, cfg.frame_ms, sigma_ms=sigma, event_weight=args.event_weight)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -311,6 +352,9 @@ def main() -> None:
                           f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f}", flush=True)
                     run, n_run = {}, 0
 
+            if not is_main:  # validation and checkpoints happen on rank 0; the others wait
+                dist.barrier()
+                continue
             eval_model = ema if ema is not None else model
             record: Dict[str, Any] = {"epoch": epoch, "step": step, "train_sec": round(time.time() - t0, 1)}
             summary: Dict[str, float] = {}
@@ -328,7 +372,8 @@ def main() -> None:
                 print(f"[epoch {epoch}] RENDERED MAPS vs reference ({len(val_full)} songs, thresholds event {decode_threshold} / LN {ln_threshold}, {time.time() - t1:.1f}s): "
                       f"per-ms loss {summary.get('per_ms_loss', float('nan')):.4f} | event F1 @0ms {summary.get('event_f1@0', 0):.3f} @2ms {summary.get('event_f1@2', 0):.3f} "
                       f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | timing MAE {summary.get('timing_mae_ms', float('nan')):.2f}ms "
-                      f"| chord acc {summary.get('chord_size_acc', 0):.3f} | LN F1 {summary.get('ln_f1_at_best_ln_threshold', 0):.3f} | density x{summary.get('density_ratio', float('nan')):.2f}")
+                      f"| chord acc {summary.get('chord_size_acc', 0):.3f} | LN F1 {summary.get('ln_f1_at_best_ln_threshold', 0):.3f} | density x{summary.get('density_ratio', float('nan')):.2f} "
+                      f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f})")
             history.append(record)
             if summary:
                 score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
@@ -343,11 +388,16 @@ def main() -> None:
                 print(f"  * new best ({score:.4f}) -> {best_path}")
             with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
                 json.dump(history, fh, indent=1)
+            if distributed:
+                dist.barrier()
     except KeyboardInterrupt:
-        print(f"\n[paused] saving {last_path} (resume with: python train_hybrid.py --data {args.data} --resume)")
-        save_checkpoint(last_path, **payload(max(start_epoch, epoch - 1), {}))
+        if is_main:
+            print(f"\n[paused] saving {last_path} (resume with: python train_hybrid.py --data {args.data} --resume)")
+            save_checkpoint(last_path, **payload(max(start_epoch, epoch - 1), {}))
         return
     print(f"[done] best score {best_score:.4f}; checkpoints in {ckpt_dir}")
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

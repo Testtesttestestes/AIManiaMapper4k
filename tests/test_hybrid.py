@@ -354,6 +354,12 @@ class TestEndToEndSmoke(unittest.TestCase):
                     "--steps_per_epoch", "2", "--batch_size", "2", "--val_maps", "1", "--val_crops", "2", "--val_fraction", "0.34", "--resume")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("[resume]", r.stdout)
+            r = run("-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", "train_hybrid.py", "--data", str(work / "ds"),
+                    "--checkpoint_dir", str(work / "ck_ddp"), "--preset", "tiny", "--epochs", "1", "--steps_per_epoch", "2",
+                    "--batch_size", "2", "--crop_sec", "5.12", "--val_maps", "1", "--val_crops", "2", "--val_fraction", "0.34", "--device", "cpu")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("x 2 GPU(s)", r.stdout)
+            self.assertTrue((work / "ck_ddp" / "hybrid_last.pt").exists())
             osz = sorted((work / "osz").glob("*.osz"))[0]
             r = run("generate_hybrid.py", "--template", str(osz), "--sr", "2.5,4", "--checkpoint", str(work / "ck" / "hybrid_best.pt"),
                     "--output", str(work / "out.osz"), "--threshold", "0.05")
