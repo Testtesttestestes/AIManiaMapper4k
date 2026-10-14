@@ -190,6 +190,10 @@ python hybrid_long_track_test.py --synthetic_minutes 60 --sr 4
 ```powershell
 pip install -r requirements.txt            # torch, numpy, scipy, rosu-pp-py; ffmpeg.exe в папке ffmpeg\
 
+# .osz в репозитории хранятся через Git LFS: без этого шага в папке лежат 130-байтные указатели, а не архивы
+git lfs install
+git lfs pull
+
 # 0) 5–15 минут: весь пайплайн на синтетической музыке (проверка, что всё работает, до траты GPU-часов)
 #    ожидаемо (CPU, ~10 мин): на невиданной песне F1 событий @2 мс ≈ 0.9, MAE тайминга 1–3 мс, проверки длинного
 #    трека — PASS. Если сильно хуже — сломано окружение (ffmpeg, версии библиотек), а не данные.
