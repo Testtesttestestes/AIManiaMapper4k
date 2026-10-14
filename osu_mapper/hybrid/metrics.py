@@ -125,3 +125,18 @@ def summarize_reports(reports: Sequence[Dict[str, float]]) -> Dict[str, float]:
         vals = vals[np.isfinite(vals)]
         out[k] = float(vals.mean()) if vals.size else float("nan")
     return out
+
+
+def calibration_samples(pred_notes: Sequence[Note], ref_notes: Sequence[Note], tol: int = 40):
+    """Signed start errors of matched events and log2 length ratios of matched long notes (pred vs ref)."""
+    pt, pg = _events(sorted(pred_notes))
+    rt, rg = _events(sorted(ref_notes))
+    starts, ln_ratios = [], []
+    for i, j in match_times(pt, rt, tol):
+        starts.append(float(pt[i] - rt[j]))
+        pn = sorted(pg[int(pt[i])], key=lambda n: n.col)
+        rn = sorted(rg[int(rt[j])], key=lambda n: n.col)
+        for a, b in zip(pn, rn):
+            if a.ln and b.ln and a.end > a.start and b.end > b.start:
+                ln_ratios.append(float(np.log2((a.end - a.start) / (b.end - b.start))))
+    return starts, ln_ratios
