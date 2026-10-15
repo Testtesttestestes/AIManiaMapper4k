@@ -87,8 +87,12 @@ class DecodeKnobs:
     """Inference controls of the algorithm. Defaults reproduce the network's own decisions."""
 
     onset_threshold: float = 0.5        # P(event in frame) needed to place an event
-    merge_ms: int = 3                   # events closer than this are merged (frame-boundary duplicates)
+    merge_ms: int = 12                  # events closer than this are merged (frame-boundary duplicates; <0.05% of real gaps)
     min_event_gap_ms: int = 0           # optional hard minimum distance between events
+    hedge_ms: int = 60                  # two events closer than this whose probabilities sum to < hedge_sum are
+    hedge_sum: float = 1.5              #   alternatives of ONE note (the network hesitates where it is): keep the stronger
+    jack_hedge_ms: int = 50             # an event that would repeat a lane hit less than this ago is a duplicate: dropped
+                                        #   (real 4K maps never do this: 0 of 185k events). 0 disables a rule.
     lane_temperature: float = 0.0       # 0 = argmax over valid lane codes, >0 = sampling
     lane_bias: Optional[np.ndarray] = None     # [N_LANE_CODES] additive logit bias (style control)
     chord_bias: Optional[np.ndarray] = None    # [5] additive logit bias by chord size 0..4
@@ -114,8 +118,14 @@ def extract_events(
     frame_ms: int = FRAME_MS,
     merge_ms: int = 3,
     min_event_gap_ms: int = 0,
+    hedge_ms: int = 0,
+    hedge_sum: float = 1.5,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Event detection from per-frame {none, ms_0..ms_H-1} probabilities.
+
+    ``hedge_ms``: two neighbouring events closer than this whose probabilities add up to less than
+    ``hedge_sum`` are treated as two guesses for the position of one note (e.g. 0.55 + 0.6), and only the
+    stronger is kept. Two confident events (e.g. 0.9 + 0.85, a real 1/8) are both kept.
 
     Returns (times_ms, frames, probs) sorted by time.
     """
@@ -132,6 +142,19 @@ def extract_events(
         keep_t, keep_f, keep_p = [int(times[0])], [int(frames[0])], [float(probs[0])]
         for t, f, p in zip(times[1:], frames[1:], probs[1:]):
             if int(t) - keep_t[-1] < gap:
+                if p > keep_p[-1]:
+                    keep_t[-1], keep_f[-1], keep_p[-1] = int(t), int(f), float(p)
+            else:
+                keep_t.append(int(t))
+                keep_f.append(int(f))
+                keep_p.append(float(p))
+        times = np.array(keep_t, dtype=np.int64)
+        frames = np.array(keep_f, dtype=np.int64)
+        probs = np.array(keep_p, dtype=np.float32)
+    if hedge_ms > 0 and times.size > 1:
+        keep_t, keep_f, keep_p = [int(times[0])], [int(frames[0])], [float(probs[0])]
+        for t, f, p in zip(times[1:], frames[1:], probs[1:]):
+            if int(t) - keep_t[-1] < hedge_ms and float(p) + keep_p[-1] < hedge_sum:
                 if p > keep_p[-1]:
                     keep_t[-1], keep_f[-1], keep_p[-1] = int(t), int(f), float(p)
             else:
@@ -242,7 +265,8 @@ def decode_outputs(
     k = knobs or DecodeKnobs()
     H = int(out.frame_ms)
     if events is None:
-        events = extract_events(out.time_probs, k.onset_threshold, H, k.merge_ms, k.min_event_gap_ms)
+        events = extract_events(out.time_probs, k.onset_threshold, H, k.merge_ms, k.min_event_gap_ms,
+                                k.hedge_ms, k.hedge_sum)
     ev_t, ev_f, ev_p = events
     if k.onset_shift_ms:
         ev_t = ev_t + int(k.onset_shift_ms)
@@ -285,6 +309,12 @@ def decode_outputs(
                 break
         if candidates is None:
             continue
+        if k.jack_hedge_ms > 0:
+            # the network's own choice repeats a lane it hit a moment ago -> it is the same note again, drop it
+            recent = int(lane_bits[(t - last_start) < k.jack_hedge_ms].sum())
+            top = int(np.flatnonzero(valid)[np.argmax(logits[valid])]) if valid.any() else -1
+            if recent and top >= 0 and (int(masks[top]) & recent):
+                continue
         cand_idx = np.flatnonzero(candidates)
         if k.lane_temperature > 0:
             probs = _softmax_np(logits[cand_idx] / k.lane_temperature)
