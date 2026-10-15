@@ -118,7 +118,7 @@ class HybridPredictor:
         fcfg = FeatureConfig.from_dict(ckpt["feature_config"])
         if fcfg.external:  # the model was trained with neural encoders: they must be available for generation too
             from .external_reps import preflight_external
-            preflight_external(fcfg.external, fcfg.sample_rate)
+            preflight_external(fcfg.external, fcfg.sample_rate, device=str(resolve_device(device)))
         return cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
 
