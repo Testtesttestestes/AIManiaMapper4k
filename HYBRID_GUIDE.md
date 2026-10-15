@@ -251,6 +251,12 @@ torchrun --standalone --nproc_per_node=4 train_hybrid.py --data dataset_hybrid -
 #     только часть карт:  $env:CUDA_VISIBLE_DEVICES="0,1"; torchrun --standalone --nproc_per_node=2 train_hybrid.py ...
 #     продолжение — тот же torchrun с --resume (чекпоинт общий, можно продолжать и на одной карте)
 
+# 3c) только валидация готового чекпоинта (без обучения): те же метрики, что печатаются после каждой эпохи
+python train_hybrid.py --data dataset_hybrid --eval_only                  # hybrid_best.pt
+python train_hybrid.py --data dataset_hybrid --eval_only last             # hybrid_last.pt или путь к файлу
+python train_hybrid.py --data dataset_hybrid --eval_only --update_checkpoint   # + записать пороги/калибровку в чекпоинт
+#     результат: checkpoints/hybrid/eval_<имя>.json и eval.log; лог обучения всегда пишется в checkpoints/hybrid/train.log
+
 # 4) генерация (любая длина трека, несколько сложностей в одном .osz)
 python generate_hybrid.py song.mp3 --sr 2.5,3.5,4.5,5.5
 python generate_hybrid.py --template "шаблон.osz" --sr 4.0 --snap_ms 8
