@@ -103,6 +103,7 @@ class HybridPredictor:
         self.ln_threshold = float(ln_threshold)
         self.onset_shift_ms = int(onset_shift_ms)
         self.ln_length_scale = float(ln_length_scale)
+        self.sr_range = None
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, device: str = "auto", use_ema: bool = True) -> "HybridPredictor":
@@ -119,8 +120,10 @@ class HybridPredictor:
         if fcfg.external:  # the model was trained with neural encoders: they must be available for generation too
             from .external_reps import preflight_external
             preflight_external(fcfg.external, fcfg.sample_rate, device=str(resolve_device(device)))
-        return cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
+        pred = cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
+        pred.sr_range = ckpt.get("sr_range")  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
+        return pred
 
     @torch.no_grad()
     def predict(
