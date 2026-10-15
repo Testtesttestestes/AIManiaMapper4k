@@ -59,8 +59,9 @@ def prepare_song_inputs(
     timing_points: Optional[Sequence[RawTimingPoint]] = None,
     keep_reps: bool = False,
     device: str = "cpu",
+    skip_external: Sequence[str] = (),
 ) -> SongInputs:
-    feats = compute_stacked_features(wave, feature_cfg, device=device)
+    feats = compute_stacked_features(wave, feature_cfg, device=device, skip_external=skip_external)
     F = feats.shape[0]
     beat = beat_features(timing_points, 0, F, feature_cfg.frame_ms) if timing_points else np.zeros((F, BEAT_DIM), np.float32)
     duration_ms = int(round(len(wave) * 1000.0 / feature_cfg.sample_rate))
@@ -104,9 +105,10 @@ class HybridPredictor:
         self.onset_shift_ms = int(onset_shift_ms)
         self.ln_length_scale = float(ln_length_scale)
         self.sr_range = None
+        self.disabled_reps: Tuple[str, ...] = ()  # representations replaced by the learned "missing" embedding
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path, device: str = "auto", use_ema: bool = True) -> "HybridPredictor":
+    def from_checkpoint(cls, path: str | Path, device: str = "auto", use_ema: bool = True, disable_reps: Sequence[str] = ()) -> "HybridPredictor":
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if ckpt.get("format") != CHECKPOINT_FORMAT:
             raise ValueError(f"'{path}' is not a hybrid checkpoint (format={ckpt.get('format')})")
@@ -117,12 +119,17 @@ class HybridPredictor:
         state = ckpt.get("ema_state") if (use_ema and ckpt.get("ema_state")) else ckpt["model_state"]
         model.load_state_dict(state)
         fcfg = FeatureConfig.from_dict(ckpt["feature_config"])
-        if fcfg.external:  # the model was trained with neural encoders: they must be available for generation too
+        unknown = [r for r in disable_reps if r not in model.rep_names]
+        if unknown:
+            raise ValueError(f"cannot disable {unknown}: this model's representations are {model.rep_names}")
+        needed = [e for e in fcfg.external if e not in disable_reps]
+        if needed:  # the model was trained with neural encoders: they must be available for generation too
             from .external_reps import preflight_external
-            preflight_external(fcfg.external, fcfg.sample_rate, device=str(resolve_device(device)))
+            preflight_external(needed, fcfg.sample_rate, device=str(resolve_device(device)))
         pred = cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
-        pred.sr_range = ckpt.get("sr_range")  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
+        pred.sr_range = ckpt.get("sr_range")
+        pred.disabled_reps = tuple(disable_reps)  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
         return pred
 
     @torch.no_grad()
@@ -160,6 +167,9 @@ class HybridPredictor:
         st = np.zeros(STYLE_DIM, np.float32) if style is None else np.asarray(style, np.float32)
         sm = np.zeros(STYLE_DIM, np.float32) if style_mask is None else np.asarray(style_mask, np.float32)
         coarse = torch.from_numpy(inputs.coarse.astype(np.float32)).unsqueeze(0).to(dev)
+        rep_present = None
+        if self.disabled_reps:
+            rep_present = torch.tensor([[0.0 if r in self.disabled_reps else 1.0 for r in self.model.rep_names]], device=dev)
 
         def window_slice(arr: np.ndarray, s: int) -> np.ndarray:
             out = np.zeros((W,) + arr.shape[1:], dtype=np.float32)
@@ -180,6 +190,7 @@ class HybridPredictor:
                 torch.from_numpy(sm).to(dev).expand(n, -1),
                 coarse.expand(n, -1, -1),
                 None,
+                rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
             )
             tp = torch.softmax(out["time_logits"].float(), dim=-1).cpu().numpy()
             lg = out["lane_logits"].float().cpu().numpy()

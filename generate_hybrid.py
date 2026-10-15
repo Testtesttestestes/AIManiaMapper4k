@@ -156,6 +156,9 @@ def main() -> None:
     ap.add_argument("--style", nargs="*", default=[], help="style controls key=value: " + "sr nps ln_ratio chord_mean jack_ratio alt_ratio roll_ratio symmetric_ratio explicit_ratio offgrid_ratio od")
     ap.add_argument("--style_from", default=None, help="copy the style of an existing map (.osz/.osu): pattern mix, LN share, density...; --style keys override it")
     ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from .osz")
+    ap.add_argument("--disable_reps", nargs="*", default=[], metavar="NAME",
+                    help="switch off audio representations, e.g. mert95m or demucs_stems: the model uses its learned 'missing' input "
+                         "(trained with 15%% modality dropout), disabled neural encoders are not even loaded")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--reference", default=None, help="reference map (.osz/.osu) of the same audio: prints event F1 / density / missed notes of every generated difficulty against it")
@@ -206,12 +209,15 @@ def main() -> None:
             timing = [tp for tp in timing if not tp.uninherited] + [RawTimingPoint(float(args.offset or 0.0), 60000.0 / args.bpm, 4, 0, 0, 70, True, 0)]
             timing_from_user = True
 
-        predictor = HybridPredictor.from_checkpoint(ckpt, device=args.device)
+        predictor = HybridPredictor.from_checkpoint(ckpt, device=args.device, disable_reps=args.disable_reps)
+        if args.disable_reps:
+            print(f"[model] representations: {', '.join(r + (' (OFF)' if r in args.disable_reps else '') for r in predictor.model.rep_names)}")
         fcfg = predictor.feature_cfg
         t0 = time.time()
         wave = load_audio(audio_path, fcfg.sample_rate)
         use_beat = args.beat_features == "on" or (args.beat_features == "auto" and timing_from_user)
-        inputs = prepare_song_inputs(wave, fcfg, timing if use_beat else None, keep_reps=True, device="cuda" if predictor.device.type == "cuda" else "cpu")
+        inputs = prepare_song_inputs(wave, fcfg, timing if use_beat else None, keep_reps=True, device="cuda" if predictor.device.type == "cuda" else "cpu",
+                                     skip_external=args.disable_reps)
         if not any(tp.uninherited for tp in timing):
             timing = estimated_timing_points(inputs.reps or {}, fcfg.frame_ms) + timing
             print(f"[timing] estimated red line: {60000.0 / timing[0].beat_len:.2f} BPM, offset {timing[0].time:.0f} ms (use --bpm/--offset or a template for exact timing)")
