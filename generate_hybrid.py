@@ -109,6 +109,8 @@ def main() -> None:
     ap.add_argument("--hedge_sum", type=float, default=1.5, help="...unsure means their probabilities add up to less than this")
     ap.add_argument("--jack_hedge_ms", type=int, default=50, help="drop an event that repeats a lane hit less than this ago (0 = off)")
     ap.add_argument("--merge_ms", type=int, default=12, help="events closer than this are always merged")
+    ap.add_argument("--ln_gap_ms", type=int, default=40, help="minimum pause between an LN release and the next note on its lane")
+    ap.add_argument("--ln_gap_beats", type=float, default=0.25, help="...and at least this fraction of a beat (0.125 = 1/8, 0 = off)")
     ap.add_argument("--snap_ms", type=float, default=0.0, help="snap note starts to the nearest red-line tick within this tolerance")
     ap.add_argument("--ln_snap_ms", type=float, default=None, help="snap LN releases to the PREVIOUS tick within this tolerance (default: = --snap_ms)")
     ap.add_argument("--snap_divisors", default="1,2,4,3,6,8,12,16", help="allowed beat divisors for snapping, e.g. 1,2,4 for a straight 4/4 song")
@@ -169,6 +171,8 @@ def main() -> None:
             hedge_ms=args.hedge_ms,
             hedge_sum=args.hedge_sum,
             jack_hedge_ms=args.jack_hedge_ms,
+            ln_release_gap_ms=args.ln_gap_ms,
+            ln_release_gap_beats=args.ln_gap_beats,
             snap_ms=args.snap_ms,
             ln_snap_ms=args.ln_snap_ms,
             snap_divisors=tuple(int(x) for x in args.snap_divisors.replace(" ", "").split(",") if x),
@@ -182,7 +186,8 @@ def main() -> None:
         print(f"[decode] event threshold {knobs.onset_threshold:.2f}, LN threshold {knobs.ln_threshold:.2f}, "
               f"note shift {knobs.onset_shift_ms:+d} ms, LN scale {knobs.ln_length_scale:.2f}, snap {knobs.snap_ms:g} ms "
               f"(LN release snap {knobs.ln_snap_ms if knobs.ln_snap_ms is not None else knobs.snap_ms:g} ms back), divisors {knobs.snap_divisors}, "
-              f"hedge {knobs.hedge_ms} ms / sum {knobs.hedge_sum:g}, duplicate-jack {knobs.jack_hedge_ms} ms")
+              f"hedge {knobs.hedge_ms} ms / sum {knobs.hedge_sum:g}, duplicate-jack {knobs.jack_hedge_ms} ms, "
+              f"LN release gap >= {knobs.ln_release_gap_ms} ms and {knobs.ln_release_gap_beats:g} beat")
         title = args.title or meta.get("Title") or audio_path.stem
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         audio_name = audio_path.name

@@ -125,7 +125,7 @@ class TestUniversalAlgorithm(unittest.TestCase):
 
     def test_oracle_decode_equals_exact_render(self):
         rng = random.Random(99)
-        knobs = DecodeKnobs(merge_ms=0, hedge_ms=0, jack_hedge_ms=0, ln_conflict="truncate", ln_release_gap_ms=0, ln_min_ms=1)
+        knobs = DecodeKnobs(merge_ms=0, hedge_ms=0, jack_hedge_ms=0, ln_conflict="truncate", ln_release_gap_ms=0, ln_release_gap_beats=0, ln_min_ms=1)
         for _ in range(60):
             clean = resolve_lane_conflicts(random_map(rng, 150).notes, release_gap_ms=0, ln_min_ms=1)
             track = solve_map(clean)
@@ -152,6 +152,17 @@ class TestUniversalAlgorithm(unittest.TestCase):
         self.assertEqual([n.start for n in notes if n.start >= 2500], [3000])
         plain = decode_outputs(out, DecodeKnobs(hedge_ms=0, jack_hedge_ms=0))
         self.assertEqual(len([n for n in plain if n.start < 1500]), 2)
+
+    def test_ln_release_leaves_a_real_gap(self):
+        # network: LN on lane 0 released at 1395, the next lane-0 note comes at 1400 (5 ms pause - unplayable)
+        track = solve_map([Note(1000, 0, 1390, True), Note(1400, 0, 1400, False)])
+        out = oracle_outputs(track)
+        bucket, resid = ln_length_to_bucket(np.array([395]))
+        out.ln_bucket[100, 0], out.ln_resid[100, 0] = bucket[0], resid[0]
+        notes = decode_outputs(out, DecodeKnobs(ln_release_gap_beats=0))
+        self.assertIn(Note(1000, 0, 1360, True), notes)            # 40 ms gap without red lines
+        notes = decode_outputs(out, DecodeKnobs(), [RawTimingPoint(0.0, 400.0)])
+        self.assertIn(Note(1000, 0, 1300, True), notes)            # 1/4 beat = 100 ms gap with a 150 BPM red line
 
     def test_decoder_respects_held_long_notes(self):
         track = solve_map([Note(0, 0, 2000, True), Note(500, 1, 500, False)])
