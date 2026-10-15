@@ -105,6 +105,10 @@ def main() -> None:
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
     ap.add_argument("--jack_min_ms", type=int, default=0, help="forbid lane repeats faster than this many ms")
     ap.add_argument("--max_chord", type=int, default=4)
+    ap.add_argument("--hedge_ms", type=int, default=60, help="two unsure events closer than this = one note, keep the stronger (0 = off)")
+    ap.add_argument("--hedge_sum", type=float, default=1.5, help="...unsure means their probabilities add up to less than this")
+    ap.add_argument("--jack_hedge_ms", type=int, default=50, help="drop an event that repeats a lane hit less than this ago (0 = off)")
+    ap.add_argument("--merge_ms", type=int, default=12, help="events closer than this are always merged")
     ap.add_argument("--snap_ms", type=float, default=0.0, help="snap note starts to the nearest red-line tick within this tolerance")
     ap.add_argument("--ln_snap_ms", type=float, default=None, help="snap LN releases to the PREVIOUS tick within this tolerance (default: = --snap_ms)")
     ap.add_argument("--snap_divisors", default="1,2,4,3,6,8,12,16", help="allowed beat divisors for snapping, e.g. 1,2,4 for a straight 4/4 song")
@@ -161,6 +165,10 @@ def main() -> None:
             ln_threshold=args.ln_threshold if args.ln_threshold is not None else predictor.ln_threshold,
             jack_min_ms=args.jack_min_ms,
             max_chord=args.max_chord,
+            merge_ms=args.merge_ms,
+            hedge_ms=args.hedge_ms,
+            hedge_sum=args.hedge_sum,
+            jack_hedge_ms=args.jack_hedge_ms,
             snap_ms=args.snap_ms,
             ln_snap_ms=args.ln_snap_ms,
             snap_divisors=tuple(int(x) for x in args.snap_divisors.replace(" ", "").split(",") if x),
@@ -173,7 +181,8 @@ def main() -> None:
 
         print(f"[decode] event threshold {knobs.onset_threshold:.2f}, LN threshold {knobs.ln_threshold:.2f}, "
               f"note shift {knobs.onset_shift_ms:+d} ms, LN scale {knobs.ln_length_scale:.2f}, snap {knobs.snap_ms:g} ms "
-              f"(LN release snap {knobs.ln_snap_ms if knobs.ln_snap_ms is not None else knobs.snap_ms:g} ms back), divisors {knobs.snap_divisors}")
+              f"(LN release snap {knobs.ln_snap_ms if knobs.ln_snap_ms is not None else knobs.snap_ms:g} ms back), divisors {knobs.snap_divisors}, "
+              f"hedge {knobs.hedge_ms} ms / sum {knobs.hedge_sum:g}, duplicate-jack {knobs.jack_hedge_ms} ms")
         title = args.title or meta.get("Title") or audio_path.stem
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         audio_name = audio_path.name
