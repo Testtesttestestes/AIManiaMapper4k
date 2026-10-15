@@ -102,7 +102,9 @@ class DecodeKnobs:
     ln_threshold: float = 0.5
     ln_min_ms: int = 30                 # shorter predicted LNs become taps
     ln_conflict: str = "avoid"          # "avoid": choose free lanes while an LN is held; "truncate": cut the LN
-    ln_release_gap_ms: int = 1          # an LN must end at least this long before the next note on its lane
+    ln_release_gap_ms: int = 40         # an LN must end at least this long before the next note on its lane
+    ln_release_gap_beats: float = 0.25  # ...and at least this fraction of a beat (when red lines are known). Real maps:
+                                        #   gap >= 40 ms in 99.9%, >= 1/4 beat in 96% of 59k LN -> note pairs
     use_stagger: bool = True
     onset_shift_ms: int = 0             # constant correction of note times (calibrated on validation, e.g. MP3 decoder delay)
     ln_length_scale: float = 1.0        # multiplies predicted LN lengths (calibrated on validation)
@@ -229,8 +231,25 @@ def _softmax_np(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def resolve_lane_conflicts(notes: List[Note], release_gap_ms: int = 1, ln_min_ms: int = 30) -> List[Note]:
-    """Playability safety net: one note per lane per ms, no note inside a held LN on the same lane."""
+def release_gap_fn(timing_points: Optional[Sequence[RawTimingPoint]], gap_ms: int, gap_beats: float):
+    """Required pause between an LN release and the next note on the same lane, as a function of time."""
+    reds = sorted((tp for tp in (timing_points or []) if tp.uninherited and tp.beat_len > 0), key=lambda t: t.time)
+    if gap_beats <= 0 or not reds:
+        return lambda t: int(gap_ms)
+    times = np.array([tp.time for tp in reds], dtype=np.float64)
+    beats = np.array([tp.beat_len for tp in reds], dtype=np.float64)
+
+    def gap(t: int) -> int:
+        i = max(0, int(np.searchsorted(times, t, side="right")) - 1)
+        return int(max(gap_ms, math.floor(gap_beats * beats[i])))
+    return gap
+
+
+def resolve_lane_conflicts(notes: List[Note], release_gap_ms: int = 1, ln_min_ms: int = 30, gap_fn=None) -> List[Note]:
+    """Playability safety net: one note per lane per ms, no note inside a held LN on the same lane.
+
+    ``gap_fn(t)`` (optional) gives the required release gap before a note at time t instead of ``release_gap_ms``.
+    """
     by_lane: List[List[Note]] = [[] for _ in range(NUM_LANES)]
     for n in notes:
         if 0 <= n.col < NUM_LANES:
@@ -245,7 +264,7 @@ def resolve_lane_conflicts(notes: List[Note], release_gap_ms: int = 1, ln_min_ms
             dedup.append(n)
         for i, n in enumerate(dedup):
             if n.ln and i + 1 < len(dedup):
-                limit = dedup[i + 1].start - release_gap_ms
+                limit = dedup[i + 1].start - (gap_fn(dedup[i + 1].start) if gap_fn is not None else release_gap_ms)
                 if n.end > limit:
                     n = Note(n.start, n.col, limit, True)
             if n.ln and n.end - n.start < ln_min_ms:
@@ -285,6 +304,7 @@ def decode_outputs(
     lane_bias = np.zeros(N_LANE_CODES) if k.lane_bias is None else np.asarray(k.lane_bias, dtype=np.float64)
     chord_bias = np.zeros(5) if k.chord_bias is None else np.asarray(k.chord_bias, dtype=np.float64)
     lane_bits = (1 << np.arange(NUM_LANES))
+    gap_fn = release_gap_fn(timing_points, k.ln_release_gap_ms, k.ln_release_gap_beats)
 
     prev = prev2 = 0
     last_start = np.full(NUM_LANES, -10 ** 9, dtype=np.int64)
@@ -299,7 +319,9 @@ def decode_outputs(
             logits = logits + k.chord_weight * out.chord_logprobs[f].astype(np.float64)[np.clip(pops - 1, 0, 3)]
         valid = (masks > 0) & (pops <= k.max_chord)
 
-        busy_mask = int(lane_bits[busy_until + k.ln_release_gap_ms > t].sum()) if k.ln_conflict == "avoid" else 0
+        # a note inside a predicted hold goes to a free lane; a note just after the release keeps its lane and the
+        # LN is shortened to leave the release gap (resolve_lane_conflicts), as mappers do
+        busy_mask = int(lane_bits[busy_until >= t].sum()) if k.ln_conflict == "avoid" else 0
         jack_mask = int(lane_bits[(t - last_start) < k.jack_min_ms].sum()) if k.jack_min_ms > 0 else 0
         candidates = None
         for forbidden in (busy_mask | jack_mask, busy_mask, 0):
@@ -343,7 +365,7 @@ def decode_outputs(
             busy_until[c] = s
         prev2, prev = prev, mask
 
-    return resolve_lane_conflicts(notes, k.ln_release_gap_ms, k.ln_min_ms)
+    return resolve_lane_conflicts(notes, k.ln_release_gap_ms, k.ln_min_ms, gap_fn)
 
 
 def oracle_outputs(track: ParamTrack, sharpness: float = 30.0) -> HeadOutputs:
