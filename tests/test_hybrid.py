@@ -125,12 +125,33 @@ class TestUniversalAlgorithm(unittest.TestCase):
 
     def test_oracle_decode_equals_exact_render(self):
         rng = random.Random(99)
-        knobs = DecodeKnobs(merge_ms=0, ln_conflict="truncate", ln_release_gap_ms=0, ln_min_ms=1)
+        knobs = DecodeKnobs(merge_ms=0, hedge_ms=0, jack_hedge_ms=0, ln_conflict="truncate", ln_release_gap_ms=0, ln_min_ms=1)
         for _ in range(60):
             clean = resolve_lane_conflicts(random_map(rng, 150).notes, release_gap_ms=0, ln_min_ms=1)
             track = solve_map(clean)
             expected = sorted(set(clean) - set(track.overflow))
             self.assertEqual(decode_outputs(oracle_outputs(track), knobs), expected)
+
+    def test_hedged_duplicates_are_suppressed(self):
+        # 1000 ms: one note the network is unsure about (two guesses 40 ms apart, 0.55 / 0.6) -> one event
+        # 2000 ms: two confident events 43 ms apart (a real 1/8) on different lanes -> both kept
+        # 3000 ms: two confident events 43 ms apart that repeat the same lanes -> duplicate jack, dropped
+        track = solve_map([Note(1000, 0, 1000, False), Note(2000, 1, 2000, False), Note(2043, 2, 2043, False),
+                           Note(3000, 3, 3000, False), Note(3043, 3, 3043, False)])
+        out = oracle_outputs(track)
+        tp = out.time_probs
+        tp[100] = 0.0
+        tp[100, 0], tp[100, 1] = 0.45, 0.55
+        tp[104] = 0.0
+        tp[104, 0], tp[104, 1] = 0.4, 0.6
+        out.lane_logits[104] = out.lane_logits[100]
+        notes = decode_outputs(out, DecodeKnobs())
+        self.assertEqual([n.start for n in notes if n.start < 1500], [1040])
+        self.assertIn(Note(2000, 1, 2000, False), notes)
+        self.assertIn(Note(2043, 2, 2043, False), notes)
+        self.assertEqual([n.start for n in notes if n.start >= 2500], [3000])
+        plain = decode_outputs(out, DecodeKnobs(hedge_ms=0, jack_hedge_ms=0))
+        self.assertEqual(len([n for n in plain if n.start < 1500]), 2)
 
     def test_decoder_respects_held_long_notes(self):
         track = solve_map([Note(0, 0, 2000, True), Note(500, 1, 500, False)])
