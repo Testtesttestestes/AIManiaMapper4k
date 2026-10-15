@@ -6,6 +6,7 @@ Generate osu!mania 4K maps with the hybrid mapper (network -> parameters -> univ
     python generate_hybrid.py --template "my_template.osz" --sr 2.5,3.5,4.5,5.5
     python generate_hybrid.py song.mp3 --sr 4 --bpm 174 --offset 120 --snap_ms 8
     python generate_hybrid.py song.mp3 --sr 4 --style ln_ratio=0.35 jack_ratio=0.02
+    python generate_hybrid.py song.mp3 --sr 4.8 --style_from "Grimes - We Appreciate Power.osz" --no_ln
 
 Works for tracks of any length (1 hour is fine): the network runs window by window and the
 algorithm renders the whole track in one pass. Density follows the requested star rating through the
@@ -76,6 +77,39 @@ def parse_sr_list(items: List[str]) -> List[float]:
     return out or [3.5]
 
 
+def reference_style(path: str, diff: str = ""):
+    """Style vector of an existing map (.osz/.osu): "map like this one". The star rating is left to --sr."""
+    import numpy as np
+
+    from osu_mapper.hybrid.beatmap import parse_osu_mania
+    from osu_mapper.hybrid.solver import STYLE_KEYS, compute_style, solve_map
+
+    p = Path(path)
+    texts: List[Tuple[str, str]] = []
+    if p.suffix.lower() == ".osz":
+        with zipfile.ZipFile(p) as z:
+            texts = [(n, z.read(n).decode("utf-8", errors="replace")) for n in z.namelist() if n.lower().endswith(".osu")]
+    else:
+        texts = [(p.name, p.read_text(encoding="utf-8", errors="replace"))]
+    maps = []
+    for name, text in texts:
+        try:
+            m = parse_osu_mania(text)
+        except Exception:
+            continue
+        if m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
+            maps.append((name, m))
+    if not maps:
+        raise SystemExit(f"--style_from: no 4K mania difficulty{' matching ' + repr(diff) if diff else ''} in {path}")
+    name, m = maps[0]
+    style, known = compute_style(solve_map(m), m.notes, None, m.overall_difficulty)
+    i = STYLE_KEYS.index("sr")
+    known[i] = 0.0
+    shown = ", ".join(f"{k}={style[j]:.3f}" for j, k in enumerate(STYLE_KEYS) if known[j])
+    print(f"[style] from {Path(path).name} [{m.metadata.get('Version', name)}]: {shown} (normalized)")
+    return np.asarray(style, np.float32), np.asarray(known, np.float32)
+
+
 def parse_style(items: List[str]) -> Dict[str, float]:
     res: Dict[str, float] = {}
     for item in items:
@@ -101,6 +135,9 @@ def main() -> None:
     ap.add_argument("--offset", type=float, default=None)
     ap.add_argument("--beat_features", default="auto", choices=["auto", "on", "off"], help="feed red-line phase to the network (auto: only for template/manual timing)")
     ap.add_argument("--style", nargs="*", default=[], help="style controls key=value: " + "sr nps ln_ratio chord_mean jack_ratio alt_ratio roll_ratio symmetric_ratio explicit_ratio offgrid_ratio od")
+    ap.add_argument("--style_from", default=None, help="copy the style of an existing map (.osz/.osu): pattern mix, LN share, density...; --style keys override it")
+    ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from .osz")
+    ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
     ap.add_argument("--threshold", type=float, default=None, help="event threshold (default: calibrated value stored in the checkpoint)")
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
     ap.add_argument("--jack_min_ms", type=int, default=0, help="forbid lane repeats faster than this many ms")
@@ -161,10 +198,17 @@ def main() -> None:
             inputs.beat = beat_features(timing, 0, inputs.num_frames, fcfg.frame_ms)
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, {inputs.num_frames} frames, features in {time.time() - t0:.1f}s")
 
-        style, smask = style_from_dict(parse_style(args.style))
+        user_style = parse_style(args.style)
+        if args.no_ln:
+            user_style.setdefault("ln_ratio", 0.0)
+        style, smask = style_from_dict(user_style)
+        if args.style_from:
+            ref_style, ref_mask = reference_style(args.style_from, args.style_diff)
+            take = (ref_mask > 0) & (smask == 0)
+            style[take], smask[take] = ref_style[take], 1.0
         knobs = DecodeKnobs(
             onset_threshold=args.threshold if args.threshold is not None else predictor.decode_threshold,
-            ln_threshold=args.ln_threshold if args.ln_threshold is not None else predictor.ln_threshold,
+            ln_threshold=2.0 if args.no_ln else (args.ln_threshold if args.ln_threshold is not None else predictor.ln_threshold),
             jack_min_ms=args.jack_min_ms,
             max_chord=args.max_chord,
             merge_ms=args.merge_ms,
