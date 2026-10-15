@@ -179,6 +179,15 @@ def _encodec(wave: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _mert(wave: np.ndarray, sr: int) -> np.ndarray:
+    import os
+
+    # MERT ships only pytorch_model.bin; transformers then starts a background thread that downloads a second,
+    # safetensors copy of the same weights (378 MB) "for next time" and keeps the process alive until it is done.
+    # The weights in use are already loaded, so that download is pure waste.
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     import torch
     from transformers import AutoModel, Wav2Vec2FeatureExtractor  # type: ignore
 
