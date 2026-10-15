@@ -145,6 +145,7 @@ class HybridCropDataset(Dataset):
         seed: int = 0,
         num_fixed_crops: int = 0,
         augment: bool = True,
+        sr_balance: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -162,6 +163,11 @@ class HybridCropDataset(Dataset):
             ev = tr.event_frames()
             self.spans.append((int(ev[0]), int(ev[-1])) if ev.size else (0, tr.num_frames - 1))
         span_len = np.array([max(1, b - a + self.crop) for a, b in self.spans], dtype=np.float64)
+        if sr_balance > 0:
+            # rare star ratings (1-star bins) are drawn more often: weight x (maps in the bin)^-sr_balance
+            bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in self.entries])
+            counts = np.bincount(bins, minlength=10).astype(np.float64)
+            span_len = span_len * counts[bins] ** (-float(sr_balance))
         self.weights = span_len / span_len.sum()
         self.samples_per_epoch = int(samples_per_epoch)
         self.fixed: Optional[List[Tuple[int, int]]] = None
