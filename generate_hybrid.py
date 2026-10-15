@@ -110,6 +110,25 @@ def reference_style(path: str, diff: str = ""):
     return np.asarray(style, np.float32), np.asarray(known, np.float32)
 
 
+def load_reference(path: str, diff: str = ""):
+    from osu_mapper.hybrid.beatmap import parse_osu_mania
+
+    p = Path(path)
+    if p.suffix.lower() == ".osz":
+        with zipfile.ZipFile(p) as z:
+            texts = [(n, z.read(n).decode("utf-8", errors="replace")) for n in z.namelist() if n.lower().endswith(".osu")]
+    else:
+        texts = [(p.name, p.read_text(encoding="utf-8", errors="replace"))]
+    for name, text in texts:
+        try:
+            m = parse_osu_mania(text)
+        except Exception:
+            continue
+        if m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
+            return m
+    raise SystemExit(f"--reference: no 4K mania difficulty{' matching ' + repr(diff) if diff else ''} in {path}")
+
+
 def parse_style(items: List[str]) -> Dict[str, float]:
     res: Dict[str, float] = {}
     for item in items:
@@ -138,7 +157,9 @@ def main() -> None:
     ap.add_argument("--style_from", default=None, help="copy the style of an existing map (.osz/.osu): pattern mix, LN share, density...; --style keys override it")
     ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from .osz")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
-    ap.add_argument("--threshold", type=float, default=None, help="event threshold (default: calibrated value stored in the checkpoint)")
+    ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
+    ap.add_argument("--reference", default=None, help="reference map (.osz/.osu) of the same audio: prints event F1 / density / missed notes of every generated difficulty against it")
+    ap.add_argument("--reference_diff", default="", help="difficulty name (substring) inside --reference")
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
     ap.add_argument("--jack_min_ms", type=int, default=0, help="forbid lane repeats faster than this many ms")
     ap.add_argument("--max_chord", type=int, default=4)
@@ -206,8 +227,14 @@ def main() -> None:
             ref_style, ref_mask = reference_style(args.style_from, args.style_diff)
             take = (ref_mask > 0) & (smask == 0)
             style[take], smask[take] = ref_style[take], 1.0
+        thresholds = [float(x) for x in str(args.threshold).replace(" ", "").split(",") if x] if args.threshold is not None else [predictor.decode_threshold]
+        ref_map = load_reference(args.reference, args.reference_diff) if args.reference else None
+        if ref_map is not None:
+            from osu_mapper.hybrid.inference import star_rating_of as _sr_of
+            print(f"[reference] {ref_map.metadata.get('Version', '')}: {len(ref_map.notes)} notes ({sum(n.ln for n in ref_map.notes)} LN), "
+                  f"star rating {_sr_of(ref_map.notes, ref_map.timing_points, ref_map.overall_difficulty):.2f}")
         knobs = DecodeKnobs(
-            onset_threshold=args.threshold if args.threshold is not None else predictor.decode_threshold,
+            onset_threshold=thresholds[0],
             ln_threshold=2.0 if args.no_ln else (args.ln_threshold if args.ln_threshold is not None else predictor.ln_threshold),
             jack_min_ms=args.jack_min_ms,
             max_chord=args.max_chord,
@@ -238,24 +265,32 @@ def main() -> None:
         diff_items = []
         from osu_mapper.pipeline.packager import BeatmapMetadata, BeatmapPackager
 
+        import dataclasses
+
         for target in parse_sr_list(args.sr):
             t1 = time.time()
             out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size)
-            notes = decode_outputs(out, knobs, timing)
-            sr_val, th = star_rating_of(notes, timing, args.od), knobs.onset_threshold
-            version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*"
-            m = ManiaMap(
-                notes=notes,
-                timing_points=timing,
-                overall_difficulty=args.od,
-                hp_drain=args.hp,
-                metadata={"Title": title, "Artist": artist, "Creator": args.creator, "Version": version, "AudioFilename": audio_name},
-            )
-            text = map_to_osu_text(m)
-            last = notes[-1].start / 1000.0 if notes else 0.0
-            print(f"[{version}] {len(notes)} notes ({sum(n.ln for n in notes)} LN), last note {last:.1f}s / {inputs.duration_ms / 1000:.1f}s, "
-                  f"threshold {th:.3f}, star rating {sr_val:.2f} (target {target:.2f}) in {time.time() - t1:.1f}s")
-            diff_items.append((BeatmapMetadata(title=title, artist=artist, creator=args.creator, version=version, audio_filename=audio_name), text))
+            for th in thresholds:
+                notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
+                sr_val = star_rating_of(notes, timing, args.od)
+                version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*" + (f" t{th:g}" if len(thresholds) > 1 else "")
+                m = ManiaMap(
+                    notes=notes,
+                    timing_points=timing,
+                    overall_difficulty=args.od,
+                    hp_drain=args.hp,
+                    metadata={"Title": title, "Artist": artist, "Creator": args.creator, "Version": version, "AudioFilename": audio_name},
+                )
+                text = map_to_osu_text(m)
+                last = notes[-1].start / 1000.0 if notes else 0.0
+                print(f"[{version}] {len(notes)} notes ({sum(n.ln for n in notes)} LN), last note {last:.1f}s / {inputs.duration_ms / 1000:.1f}s, "
+                      f"threshold {th:.3f}, star rating {sr_val:.2f} (target {target:.2f}) in {time.time() - t1:.1f}s")
+                if ref_map is not None:
+                    from osu_mapper.hybrid.metrics import per_ms_report
+                    r = per_ms_report(notes, ref_map.notes)
+                    print(f"    vs reference: event F1 @16ms {r['event_f1@16']:.3f} (precision {r['event_precision@16']:.3f}, recall {r['event_recall@16']:.3f}) | "
+                          f"density x{r['density_ratio']:.2f} | missed events {r['missed_events_pct']:.1f}% | LN F1 {r['ln_f1']:.3f}")
+                diff_items.append((BeatmapMetadata(title=title, artist=artist, creator=args.creator, version=version, audio_filename=audio_name), text))
 
         out_path = BeatmapPackager.package_multi_diff_osz(diff_items, str(audio_path), args.output)
         print(f"[done] {out_path}")
