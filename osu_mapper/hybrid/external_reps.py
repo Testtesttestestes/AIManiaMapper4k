@@ -57,6 +57,18 @@ def external_device():
     return torch.device(_DEVICE)
 
 
+def _fast_fp16(dev) -> bool:
+    """fp16 autocast only on GPUs with fast half precision (tensor cores, compute capability >= 7.0).
+
+    Pascal cards (GTX 10xx) run fp16 matmuls many times slower than fp32, so they stay in fp32.
+    """
+    import torch
+
+    if dev.type != "cuda":
+        return False
+    return torch.cuda.get_device_capability(dev)[0] >= 7
+
+
 def register_external(rep: ExternalRep) -> None:
     EXTERNAL_REGISTRY[rep.name] = rep
 
@@ -181,7 +193,7 @@ def _mert(wave: np.ndarray, sr: int) -> np.ndarray:
     model.to(dev)
     x = _resample(wave, sr, 24000)
     inputs = {k: v.to(dev) for k, v in proc(x, sampling_rate=24000, return_tensors="pt").items()}
-    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
+    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=_fast_fp16(dev)):
         out = model(**inputs, output_hidden_states=True)
     return torch.stack(out.hidden_states).float().mean(dim=0)[0].cpu().numpy()
 
