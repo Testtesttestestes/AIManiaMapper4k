@@ -42,7 +42,7 @@ from osu_mapper.hybrid.metrics import per_ms_report, summarize_reports
 from osu_mapper.hybrid.model import HybridModelConfig, HybridParamNet, PRESETS, build_config, count_parameters
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs, render_track
-from osu_mapper.hybrid.audio_features import beat_features
+from osu_mapper.hybrid.audio_features import FeatureConfig, beat_features
 
 
 def init_distributed(requested_device: str) -> Tuple[bool, int, int, torch.device]:
@@ -62,6 +62,23 @@ def init_distributed(requested_device: str) -> Tuple[bool, int, int, torch.devic
     backend = "nccl" if (use_cuda and dist.is_nccl_available() and sys.platform != "win32") else "gloo"
     dist.init_process_group(backend=backend)
     return True, rank, world, dev
+
+
+class Tee:
+    """Writes everything printed to the console into a log file as well (checkpoint_dir/train.log)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for st in self.streams:
+            st.write(data)
+            st.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for st in self.streams:
+            st.flush()
 
 
 def set_seed(seed: int) -> None:
@@ -209,7 +226,15 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--resume", nargs="?", const="auto", default=None, help="resume from hybrid_last.pt (or a given path)")
     ap.add_argument("--log_every", type=int, default=50)
+    ap.add_argument("--eval_only", nargs="?", const="best", default=None, metavar="CHECKPOINT",
+                    help="no training: run the full validation of a checkpoint (default hybrid_best.pt, or 'last', or a path)")
+    ap.add_argument("--update_checkpoint", action="store_true",
+                    help="with --eval_only: store the re-measured thresholds and calibration in the checkpoint")
     args = ap.parse_args()
+    if args.eval_only:
+        ck_dir = Path(args.checkpoint_dir)
+        args.resume = str(ck_dir / "hybrid_best.pt") if args.eval_only == "best" else (
+            str(ck_dir / "hybrid_last.pt") if args.eval_only == "last" else args.eval_only)
 
     distributed, rank, world, dev = init_distributed(args.device)
     is_main = rank == 0
@@ -229,6 +254,9 @@ def main() -> None:
     ckpt_dir = Path(args.checkpoint_dir)
     if is_main:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        log_name = "eval.log" if args.eval_only else "train.log"
+        sys.stdout = Tee(sys.stdout, open(ckpt_dir / log_name, "a", encoding="utf-8"))
+        print(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} | {' '.join(sys.argv)} =====")
     last_path, best_path = ckpt_dir / "hybrid_last.pt", ckpt_dir / "hybrid_best.pt"
 
     resume_ckpt: Optional[Dict[str, Any]] = None
@@ -241,8 +269,9 @@ def main() -> None:
             sys.exit(f"--resume: '{rp}' is not a hybrid checkpoint")
         if resume_ckpt.get("param_version") != PARAM_VERSION:
             sys.exit("--resume: parameter space version changed, the old checkpoint cannot be continued")
-        if resume_ckpt.get("feature_config") != fcfg.to_dict():
-            sys.exit("--resume: the dataset was prepared with a different feature config than the checkpoint")
+        if FeatureConfig.from_dict(resume_ckpt.get("feature_config", {})).to_dict() != fcfg.to_dict():
+            sys.exit("--resume/--eval_only: the dataset was prepared with a different feature config than the checkpoint "
+                     "(e.g. with/without --external); use the dataset the model was trained on")
         cfg = HybridModelConfig.from_dict(resume_ckpt["model_config"])
         crop_frames = int(resume_ckpt.get("crop_frames", crop_frames))
         print(f"[resume] {rp} (epoch {resume_ckpt.get('epoch')}, step {resume_ckpt.get('step')})")
@@ -323,6 +352,48 @@ def main() -> None:
             "args": vars(args),
         }
 
+    def evaluate(tag: str, epoch: int, train_sec: float) -> Tuple[Dict[str, Any], Dict[str, float]]:
+        nonlocal decode_threshold, ln_threshold, calib
+        eval_model = ema if ema is not None else model
+        record: Dict[str, Any] = {"epoch": epoch, "step": step, "train_sec": round(train_sec, 1)}
+        summary: Dict[str, float] = {}
+        if val_loader is not None:
+            vc = validate_crops(eval_model, val_loader, dev, weights, cfg.frame_ms, args.sigma_end)
+            record.update({f"val_{k}": v for k, v in vc.items()})
+            print(f"[{tag}] val crops: total {vc['total']:.4f} | time {vc['time']:.4f} | lane {vc['lane']:.3f} | frame F1 {vc.get('frame_f1', 0):.3f} "
+                  f"| offset exact {vc.get('offset_exact', 0):.3f} (+-1ms {vc.get('offset_within1ms', 0):.3f}) | lane acc {vc.get('lane_acc', 0):.3f} | chord acc {vc.get('chord_acc', 0):.3f}")
+        if val_full:
+            t1 = time.time()
+            summary, decode_threshold, ln_threshold = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known)
+            record.update({f"map_{k}": v for k, v in summary.items()})
+            record["decode_threshold"] = decode_threshold
+            record["ln_threshold"] = ln_threshold
+            calib = {"onset_shift_ms": int(summary.get("onset_shift_ms", 0)), "ln_length_scale": float(summary.get("ln_length_scale", 1.0))}
+            print(f"[{tag}] RENDERED MAPS vs reference ({len(val_full)} songs, thresholds event {decode_threshold} / LN {ln_threshold}, {time.time() - t1:.1f}s): "
+                  f"per-ms loss {summary.get('per_ms_loss', float('nan')):.4f} | event F1 @0ms {summary.get('event_f1@0', 0):.3f} @2ms {summary.get('event_f1@2', 0):.3f} "
+                  f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | timing MAE {summary.get('timing_mae_ms', float('nan')):.2f}ms "
+                  f"| chord acc {summary.get('chord_size_acc', 0):.3f} | LN F1 {summary.get('ln_f1_at_best_ln_threshold', 0):.3f} | density x{summary.get('density_ratio', float('nan')):.2f} "
+                  f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f}) "
+                  f"| start error median {summary.get('start_error_median_ms', float('nan')):+.1f}ms, LN length x{summary.get('ln_length_ratio_median', float('nan')):.2f} "
+                  f"-> calibration shift {calib['onset_shift_ms']:+d}ms, LN scale {calib['ln_length_scale']:.2f}")
+        return record, summary
+
+    if args.eval_only:
+        if not (val_loader or val_full):
+            sys.exit("no validation songs in this dataset (check --val_fraction)")
+        print(f"[eval] checkpoint {args.resume} (epoch {start_epoch}, step {step}), {len(val_full)} complete validation maps")
+        record, summary = evaluate("eval", start_epoch, 0.0)
+        out_json = ckpt_dir / f"eval_{Path(args.resume).stem}.json"
+        out_json.write_text(json.dumps(record, indent=1), encoding="utf-8")
+        print(f"[eval] metrics -> {out_json}")
+        if args.update_checkpoint:
+            ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+            ck.update({"decode_threshold": decode_threshold, "ln_threshold": ln_threshold,
+                       "onset_shift_ms": calib["onset_shift_ms"], "ln_length_scale": calib["ln_length_scale"], "val_summary": summary})
+            save_checkpoint(Path(args.resume), **ck)
+            print(f"[eval] thresholds and calibration written into {args.resume}")
+        return
+
     epoch = start_epoch
     try:
         for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
@@ -361,28 +432,7 @@ def main() -> None:
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait
                 dist.barrier()
                 continue
-            eval_model = ema if ema is not None else model
-            record: Dict[str, Any] = {"epoch": epoch, "step": step, "train_sec": round(time.time() - t0, 1)}
-            summary: Dict[str, float] = {}
-            if val_loader is not None:
-                vc = validate_crops(eval_model, val_loader, dev, weights, cfg.frame_ms, args.sigma_end)
-                record.update({f"val_{k}": v for k, v in vc.items()})
-                print(f"[epoch {epoch}] val crops: total {vc['total']:.4f} | time {vc['time']:.4f} | lane {vc['lane']:.3f} | frame F1 {vc.get('frame_f1', 0):.3f} "
-                      f"| offset exact {vc.get('offset_exact', 0):.3f} (+-1ms {vc.get('offset_within1ms', 0):.3f}) | lane acc {vc.get('lane_acc', 0):.3f} | chord acc {vc.get('chord_acc', 0):.3f}")
-            if val_full:
-                t1 = time.time()
-                summary, decode_threshold, ln_threshold = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known)
-                record.update({f"map_{k}": v for k, v in summary.items()})
-                record["decode_threshold"] = decode_threshold
-                record["ln_threshold"] = ln_threshold
-                calib = {"onset_shift_ms": int(summary.get("onset_shift_ms", 0)), "ln_length_scale": float(summary.get("ln_length_scale", 1.0))}
-                print(f"[epoch {epoch}] RENDERED MAPS vs reference ({len(val_full)} songs, thresholds event {decode_threshold} / LN {ln_threshold}, {time.time() - t1:.1f}s): "
-                      f"per-ms loss {summary.get('per_ms_loss', float('nan')):.4f} | event F1 @0ms {summary.get('event_f1@0', 0):.3f} @2ms {summary.get('event_f1@2', 0):.3f} "
-                      f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | timing MAE {summary.get('timing_mae_ms', float('nan')):.2f}ms "
-                      f"| chord acc {summary.get('chord_size_acc', 0):.3f} | LN F1 {summary.get('ln_f1_at_best_ln_threshold', 0):.3f} | density x{summary.get('density_ratio', float('nan')):.2f} "
-                      f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f}) "
-                      f"| start error median {summary.get('start_error_median_ms', float('nan')):+.1f}ms, LN length x{summary.get('ln_length_ratio_median', float('nan')):.2f} "
-                      f"-> calibration shift {calib['onset_shift_ms']:+d}ms, LN scale {calib['ln_length_scale']:.2f}")
+            record, summary = evaluate(f"epoch {epoch}", epoch, time.time() - t0)
             history.append(record)
             if summary:
                 score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
