@@ -217,6 +217,8 @@ def main() -> None:
     ap.add_argument("--sigma_end", type=float, default=1.0, help="ms spread of timing targets after warm-up")
     ap.add_argument("--event_weight", type=float, default=4.0)
     ap.add_argument("--val_fraction", type=float, default=0.1)
+    ap.add_argument("--sr_balance", type=float, default=0.0,
+                    help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
     ap.add_argument("--val_crops", type=int, default=256)
     ap.add_argument("--val_maps", type=int, default=24, help="complete validation maps rendered per epoch (per-ms metrics)")
     ap.add_argument("--val_style_known", action="store_true", help="give the reference style to the model during validation")
@@ -250,6 +252,9 @@ def main() -> None:
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
     print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps / val {len(val_idx)} maps (split by song)")
+    sr_hist = np.bincount([int(np.clip(float(index.maps[i].get("sr", 0.0)), 0, 9.99)) for i in train_idx], minlength=10)
+    print("[data] train maps per star rating: " + ", ".join(f"{b}-{b + 1}*: {int(c)}" for b, c in enumerate(sr_hist) if c)
+          + (f" | sr_balance {args.sr_balance:g}" if args.sr_balance > 0 else ""))
 
     ckpt_dir = Path(args.checkpoint_dir)
     if is_main:
@@ -320,7 +325,8 @@ def main() -> None:
           f"steps/epoch={args.steps_per_epoch}, total steps={total_steps}")
 
     # every rank draws its own random crops (different seed), so no sampler is needed
-    train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank)
+    train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank,
+                                 sr_balance=args.sr_balance)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
