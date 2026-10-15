@@ -267,7 +267,11 @@ def main() -> None:
 
         import dataclasses
 
+        sr_hi = float(predictor.sr_range[2]) if getattr(predictor, "sr_range", None) else 8.0
         for target in parse_sr_list(args.sr):
+            if target > sr_hi:
+                print(f"[warn] star rating {target:g} is outside what the model was trained on (up to ~{sr_hi:g}*): "
+                      f"the network extrapolates and the map gets WORSE, not harder (it saturates, then collapses)")
             t1 = time.time()
             out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size)
             for th in thresholds:
