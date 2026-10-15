@@ -397,6 +397,23 @@ def _ffmpeg_available() -> bool:
         return False
 
 
+@unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+class TestSampling(unittest.TestCase):
+    def test_sr_balance_equalizes_star_bins(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset
+
+        srs = [2.5] * 9 + [6.2]
+        track = solve_map([Note(1000 * i, i % 4, 1000 * i, False) for i in range(1, 30)], num_frames=4000)
+        index = SimpleNamespace(maps=[{"sr": v} for v in srs], track=lambda i: track, feature_config=FeatureConfig())
+        plain = HybridCropDataset(index, range(10), 512, 8)
+        balanced = HybridCropDataset(index, range(10), 512, 8, sr_balance=1.0)
+        self.assertAlmostEqual(float(plain.weights[9]), 0.1, places=6)
+        self.assertAlmostEqual(float(balanced.weights[9]), 0.5, places=6)
+
+
 @unittest.skipUnless(TORCH_AVAILABLE and _ffmpeg_available(), "needs PyTorch and FFmpeg")
 class TestEndToEndSmoke(unittest.TestCase):
     def test_prepare_train_generate(self):
