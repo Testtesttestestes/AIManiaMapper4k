@@ -335,6 +335,9 @@ def main() -> None:
     rng = random.Random(args.seed)
     val_full = sorted(rng.sample(val_idx, min(args.val_maps, len(val_idx)))) if val_idx else []
 
+    train_srs = [float(index.maps[i].get("sr", 0.0)) for i in train_idx if float(index.maps[i].get("sr", 0.0)) > 0]
+    sr_range = [round(min(train_srs), 2), round(float(np.percentile(train_srs, 99)), 2), round(max(train_srs), 2)] if train_srs else None
+
     def payload(epoch: int, summary: Dict[str, float]) -> Dict[str, Any]:
         return {
             "format": CHECKPOINT_FORMAT,
@@ -342,6 +345,7 @@ def main() -> None:
             "model_config": cfg.to_dict(),
             "feature_config": fcfg.to_dict(),
             "crop_frames": crop_frames,
+            "sr_range": sr_range,
             "model_state": model.state_dict(),
             "ema_state": ema.state_dict() if ema is not None else None,
             "optimizer_state": opt.state_dict(),
