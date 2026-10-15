@@ -401,8 +401,11 @@ def compute_stacked_features(
     cfg: Optional[FeatureConfig] = None,
     normalize: bool = True,
     device: str = "cpu",
+    skip_external: Sequence[str] = (),
 ) -> np.ndarray:
     """All configured representations concatenated into one [F, D] float32 array (columns: ``cfg.slices()``).
+
+    ``skip_external``: neural encoders not to run (their columns stay zero; the model is told they are missing).
 
     Filled block by block and normalized in place, so a 60-minute track needs ~0.5 GB for the result.
     ``device="cuda"`` runs the STFTs on the GPU (much faster for big datasets).
@@ -431,6 +434,8 @@ def compute_stacked_features(
         from .external_reps import compute_external, set_external_device
         set_external_device(str(dev))
         for name in cfg.external:
+            if name in skip_external:
+                continue
             a, b = slices[name]
             out[:, a:b] = compute_external(name, np.asarray(wave, dtype=np.float32), cfg.sample_rate, total, cfg.frame_ms)
     if normalize:
