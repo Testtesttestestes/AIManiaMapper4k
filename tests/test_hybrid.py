@@ -190,6 +190,17 @@ class TestPerMsMetrics(unittest.TestCase):
             best = sum(aug(i, [False] * len(b)) for i in range(len(a)))
             self.assertEqual(greedy, best)
 
+    def test_surplus_breakdown(self):
+        ref = [Note(1000, 0, 1000), Note(2000, 1, 2000), Note(3000, 2, 3000)]
+        pred = [Note(1000, 0, 1000), Note(1020, 1, 1020),          # duplicate 20 ms after a hit
+                Note(2000, 1, 2000), Note(2000, 3, 2000),          # extra chord note
+                Note(5000, 2, 5000)]                               # isolated extra; 3000 missed
+        rep = per_ms_report(pred, ref)
+        self.assertAlmostEqual(rep["surplus_duplicate_events_pct"], 100 / 3)
+        self.assertAlmostEqual(rep["surplus_chord_notes_pct"], 100 / 3)
+        self.assertAlmostEqual(rep["surplus_isolated_events_pct"], 100 / 3)
+        self.assertAlmostEqual(rep["missed_events_pct"], 100 / 3)
+
     def test_report(self):
         ref = [Note(1000, 0, 1000), Note(1500, 1, 1800, True), Note(2000, 2, 2000), Note(2000, 3, 2000)]
         rep = per_ms_report(ref, ref)

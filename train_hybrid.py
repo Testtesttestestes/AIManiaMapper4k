@@ -376,6 +376,9 @@ def main() -> None:
                   f"| SR error {summary.get('sr_mae', float('nan')):.2f}* (bias {summary.get('sr_bias', float('nan')):+.2f}) "
                   f"| start error median {summary.get('start_error_median_ms', float('nan')):+.1f}ms, LN length x{summary.get('ln_length_ratio_median', float('nan')):.2f} "
                   f"-> calibration shift {calib['onset_shift_ms']:+d}ms, LN scale {calib['ln_length_scale']:.2f}")
+            print(f"[{tag}] surplus vs reference notes: duplicate events (<=30 ms from a hit) {summary.get('surplus_duplicate_events_pct', float('nan')):.2f}% "
+                  f"| isolated extra events {summary.get('surplus_isolated_events_pct', float('nan')):.2f}% | extra chord notes {summary.get('surplus_chord_notes_pct', float('nan')):.2f}% "
+                  f"|| missing: events {summary.get('missed_events_pct', float('nan')):.2f}%, chord notes {summary.get('missing_chord_notes_pct', float('nan')):.2f}%")
         return record, summary
 
     if args.eval_only:

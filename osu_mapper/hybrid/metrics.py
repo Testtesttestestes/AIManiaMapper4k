@@ -111,6 +111,31 @@ def per_ms_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], toleran
 
     span_ref = (rt[-1] - rt[0]) / 1000.0 if len(rt) > 1 else 1.0
     rep["density_ratio"] = (len(pred) / max(1.0, span_ref)) / max(1e-6, len(ref) / max(1.0, span_ref)) if ref else float("nan")
+
+    # Where do surplus / missing notes come from? (events matched at 16 ms)
+    pairs16 = match_times(pt, rt, 16)
+    matched_p = {i for i, _ in pairs16}
+    matched_r_times = np.array(sorted(int(rt[j]) for _, j in pairs16), dtype=np.int64)
+    dup = iso = 0
+    for i in range(len(pt)):
+        if i in matched_p:
+            continue
+        # a false event right next to a reference event that is already covered = hedged duplicate
+        if matched_r_times.size and np.min(np.abs(matched_r_times - pt[i])) <= 30:
+            dup += 1
+        else:
+            iso += 1
+    extra_chord = missing_chord = 0
+    for i, j in pairs16:
+        d = len(pg[int(pt[i])]) - len(rg[int(rt[j])])
+        extra_chord += max(0, d)
+        missing_chord += max(0, -d)
+    n_ref = max(1, len(ref))
+    rep["surplus_duplicate_events_pct"] = 100.0 * dup / n_ref      # extra events within 30 ms of a covered reference event
+    rep["surplus_isolated_events_pct"] = 100.0 * iso / n_ref       # extra events far from any reference event
+    rep["surplus_chord_notes_pct"] = 100.0 * extra_chord / n_ref   # chords with more notes than the reference
+    rep["missing_chord_notes_pct"] = 100.0 * missing_chord / n_ref
+    rep["missed_events_pct"] = 100.0 * (len(rt) - len(pairs16)) / max(1, len(rt))
     rep["exact_match"] = float(pred == ref)
     return rep
 
