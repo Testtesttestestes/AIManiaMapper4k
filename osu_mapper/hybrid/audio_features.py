@@ -428,7 +428,8 @@ def compute_stacked_features(
             del block
     del x
     if cfg.external:
-        from .external_reps import compute_external
+        from .external_reps import compute_external, set_external_device
+        set_external_device(str(dev))
         for name in cfg.external:
             a, b = slices[name]
             out[:, a:b] = compute_external(name, np.asarray(wave, dtype=np.float32), cfg.sample_rate, total, cfg.frame_ms)

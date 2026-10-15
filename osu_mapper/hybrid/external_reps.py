@@ -40,6 +40,21 @@ class ExternalRep:
 
 EXTERNAL_REGISTRY: Dict[str, ExternalRep] = {}
 _MODEL_CACHE: Dict[str, object] = {}
+_DEVICE = "auto"
+
+
+def set_external_device(device: str) -> None:
+    """Device for the neural encoders: "auto" (CUDA if available), "cuda", "cuda:1", "cpu"."""
+    global _DEVICE
+    _DEVICE = str(device)
+
+
+def external_device():
+    import torch
+
+    if _DEVICE in ("auto", "", "None"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(_DEVICE)
 
 
 def register_external(rep: ExternalRep) -> None:
@@ -59,12 +74,15 @@ INSTALL_HINTS: Dict[str, str] = {
 }
 
 
-def preflight_external(names, sample_rate: int = 24000, log: Callable[[str], None] = print) -> None:
+def preflight_external(names, sample_rate: int = 24000, log: Callable[[str], None] = print, device: str = None) -> None:
     """Imports every requested encoder and runs it once on 1 s of silence BEFORE any real work.
 
     This is where the weights are downloaded on first use (Hugging Face / torch hub cache), so a missing
     package or a blocked download stops the run immediately with an explanation instead of failing per song.
     """
+    if device is not None:
+        set_external_device(device)
+    log(f"[external] encoders run on: {external_device()}")
     for name in names:
         if name not in EXTERNAL_REGISTRY:
             raise SystemExit(f"[external] unknown encoder '{name}'. Available: {', '.join(sorted(EXTERNAL_REGISTRY))}")
@@ -140,7 +158,9 @@ def _encodec(wave: np.ndarray, sr: int) -> np.ndarray:
         model = EncodecModel.encodec_model_24khz()
         model.eval()
         _MODEL_CACHE["encodec24"] = model
-    x = torch.from_numpy(_resample(wave, sr, 24000)).view(1, 1, -1)
+    dev = external_device()
+    model.to(dev)
+    x = torch.from_numpy(_resample(wave, sr, 24000)).view(1, 1, -1).to(dev)
     with torch.no_grad():
         z = model.encoder(x)  # [1, 128, T] @ 75 Hz
     return z[0].transpose(0, 1).cpu().numpy()
@@ -157,11 +177,13 @@ def _mert(wave: np.ndarray, sr: int) -> np.ndarray:
         pair = (model, proc)
         _MODEL_CACHE["mert95m"] = pair
     model, proc = pair  # type: ignore[misc]
+    dev = external_device()
+    model.to(dev)
     x = _resample(wave, sr, 24000)
-    inputs = proc(x, sampling_rate=24000, return_tensors="pt")
-    with torch.no_grad():
+    inputs = {k: v.to(dev) for k, v in proc(x, sampling_rate=24000, return_tensors="pt").items()}
+    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
         out = model(**inputs, output_hidden_states=True)
-    return torch.stack(out.hidden_states).mean(dim=0)[0].cpu().numpy()
+    return torch.stack(out.hidden_states).float().mean(dim=0)[0].cpu().numpy()
 
 
 def _demucs(wave: np.ndarray, sr: int) -> np.ndarray:
@@ -176,9 +198,11 @@ def _demucs(wave: np.ndarray, sr: int) -> np.ndarray:
         model = get_model("htdemucs")
         model.eval()
         _MODEL_CACHE["demucs"] = model
+    dev = external_device()
+    model.to(dev)
     x = torch.from_numpy(_resample(wave, sr, model.samplerate)).view(1, 1, -1).expand(1, 2, -1).contiguous()
     with torch.no_grad():
-        stems = apply_model(model, x, split=True, overlap=0.1)[0].mean(dim=1)  # [4, T]
+        stems = apply_model(model, x, split=True, overlap=0.1, device=dev)[0].mean(dim=1).cpu()  # [4, T]
     cfg = FeatureConfig()
     hop = cfg.hop
     feats = []
