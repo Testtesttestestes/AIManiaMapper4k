@@ -161,6 +161,10 @@ def main() -> None:
                          "(trained with 15%% modality dropout), disabled neural encoders are not even loaded")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
+    ap.add_argument("--sr_guidance", default="1",
+                    help="make the map follow --sr more strongly (classifier-free guidance): 1 = off, 2-3 = strong; "
+                         "a list (1,2,3) gives one difficulty per value")
+    ap.add_argument("--style_guidance", type=float, default=1.0, help="the same for --style / --style_from")
     ap.add_argument("--reference", default=None, help="reference map (.osz/.osu) of the same audio: prints event F1 / density / missed notes of every generated difficulty against it")
     ap.add_argument("--reference_diff", default="", help="difficulty name (substring) inside --reference")
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
@@ -233,7 +237,11 @@ def main() -> None:
             ref_style, ref_mask = reference_style(args.style_from, args.style_diff)
             take = (ref_mask > 0) & (smask == 0)
             style[take], smask[take] = ref_style[take], 1.0
-        thresholds = [float(x) for x in str(args.threshold).replace(" ", "").split(",") if x] if args.threshold is not None else [predictor.decode_threshold]
+        user_thresholds = [float(x) for x in str(args.threshold).replace(" ", "").split(",") if x] if args.threshold is not None else None
+        thresholds = user_thresholds or [predictor.decode_threshold]
+        if user_thresholds is None and predictor.threshold_by_sr:
+            print("[decode] event threshold by star rating (from validation): "
+                  + " ".join(f"{b}*={t:g}" for b, t in sorted(predictor.threshold_by_sr.items())))
         ref_map = load_reference(args.reference, args.reference_diff) if args.reference else None
         if ref_map is not None:
             from osu_mapper.hybrid.inference import star_rating_of as _sr_of
@@ -264,7 +272,9 @@ def main() -> None:
               f"note shift {knobs.onset_shift_ms:+d} ms, LN scale {knobs.ln_length_scale:.2f}, snap {knobs.snap_ms:g} ms "
               f"(LN release snap {knobs.ln_snap_ms if knobs.ln_snap_ms is not None else knobs.snap_ms:g} ms back), divisors {knobs.snap_divisors}, "
               f"hedge {knobs.hedge_ms} ms / sum {knobs.hedge_sum:g}, duplicate-jack {knobs.jack_hedge_ms} ms, "
-              f"LN release gap >= {knobs.ln_release_gap_ms} ms and {knobs.ln_release_gap_beats:g} beat")
+              f"LN release gap >= {knobs.ln_release_gap_ms} ms and {knobs.ln_release_gap_beats:g} beat"
+              + (f", SR guidance {args.sr_guidance}" if args.sr_guidance not in ("1", "1.0") else "")
+              + (f", style guidance {args.style_guidance:g}" if args.style_guidance != 1.0 else ""))
         title = args.title or meta.get("Title") or audio_path.stem
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         audio_name = audio_path.name
@@ -274,16 +284,18 @@ def main() -> None:
         import dataclasses
 
         sr_hi = float(predictor.sr_range[2]) if getattr(predictor, "sr_range", None) else 8.0
-        for target in parse_sr_list(args.sr):
+        guidances = [float(x) for x in str(args.sr_guidance).replace(" ", "").split(",") if x] or [1.0]
+        for target, guidance in [(t, g) for t in parse_sr_list(args.sr) for g in guidances]:
             if target > sr_hi:
                 print(f"[warn] star rating {target:g} is outside what the model was trained on (up to ~{sr_hi:g}*): "
                       f"the network extrapolates and the map gets WORSE, not harder (it saturates, then collapses)")
             t1 = time.time()
-            out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size)
-            for th in thresholds:
+            out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+                                    sr_guidance=guidance, style_guidance=args.style_guidance)
+            for th in (thresholds if user_thresholds is not None or not predictor.threshold_by_sr else [predictor.threshold_for(target)]):
                 notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
                 sr_val = star_rating_of(notes, timing, args.od)
-                version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*" + (f" t{th:g}" if len(thresholds) > 1 else "")
+                version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*" + (f" g{guidance:g}" if len(guidances) > 1 else "") + (f" t{th:g}" if len(thresholds) > 1 else "")
                 m = ManiaMap(
                     notes=notes,
                     timing_points=timing,

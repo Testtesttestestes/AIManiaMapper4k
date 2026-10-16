@@ -106,6 +106,11 @@ class HybridPredictor:
         self.ln_length_scale = float(ln_length_scale)
         self.sr_range = None
         self.disabled_reps: Tuple[str, ...] = ()  # representations replaced by the learned "missing" embedding
+        self.threshold_by_sr: Dict[int, float] = {}  # best event threshold per 1-star bin (validation), if calibrated
+
+    def threshold_for(self, star_rating: float) -> float:
+        """Event threshold for a requested star rating: interpolated between calibrated 1-star bins."""
+        return threshold_for_sr(self.threshold_by_sr, star_rating, self.decode_threshold)
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, device: str = "auto", use_ema: bool = True, disable_reps: Sequence[str] = ()) -> "HybridPredictor":
@@ -129,7 +134,8 @@ class HybridPredictor:
         pred = cls(model, fcfg, ckpt.get("crop_frames", 2048), resolve_device(device), ckpt.get("decode_threshold", 0.5), ckpt.get("ln_threshold", 0.5),
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
         pred.sr_range = ckpt.get("sr_range")
-        pred.disabled_reps = tuple(disable_reps)  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
+        pred.disabled_reps = tuple(disable_reps)
+        pred.threshold_by_sr = {int(k): float(v) for k, v in (ckpt.get("decode_threshold_by_sr") or {}).items()}  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
         return pred
 
     @torch.no_grad()
@@ -142,7 +148,16 @@ class HybridPredictor:
         hop_frames: Optional[int] = None,
         batch_size: int = 8,
         progress: Optional[Callable[[int, int], None]] = None,
+        sr_guidance: float = 1.0,
+        style_guidance: float = 1.0,
     ) -> HeadOutputs:
+        """Sliding-window inference over the whole track.
+
+        ``sr_guidance`` / ``style_guidance`` (classifier-free guidance): the network also runs with the star
+        rating / style hidden (it was trained with them randomly hidden) and the difference is amplified:
+        logits = uncond + w_sr * (with_sr - uncond) + w_style * (with_sr_and_style - with_sr).
+        1.0 = plain conditional output; 2-3 makes the map follow the request much more strongly.
+        """
         cfg = self.model.cfg
         F, W = inputs.num_frames, self.window
         H = cfg.frame_ms
@@ -183,15 +198,25 @@ class HybridPredictor:
             n = len(chunk)
             feats = torch.from_numpy(np.stack([window_slice(inputs.feats, s) for s in chunk])).to(dev)
             beat = torch.from_numpy(np.stack([window_slice(inputs.beat, s) for s in chunk])).to(dev)
-            out = self.model(
-                feats, beat,
-                torch.full((n, 1), float(star_rating), device=dev),
-                torch.from_numpy(st).to(dev).expand(n, -1),
-                torch.from_numpy(sm).to(dev).expand(n, -1),
-                coarse.expand(n, -1, -1),
-                None,
-                rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
-            )
+            def run(sr_value: float, use_style: bool) -> Dict[str, torch.Tensor]:
+                return self.model(
+                    feats, beat,
+                    torch.full((n, 1), float(sr_value), device=dev),
+                    torch.from_numpy(st).to(dev).expand(n, -1),
+                    torch.from_numpy(sm if use_style else np.zeros_like(sm)).to(dev).expand(n, -1),
+                    coarse.expand(n, -1, -1),
+                    None,
+                    rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
+                )
+
+            out = run(star_rating, True)
+            has_style = bool(sm.any())
+            if sr_guidance != 1.0 or (has_style and style_guidance != 1.0):
+                uncond = run(0.0, False)
+                with_sr = run(star_rating, False) if has_style else out
+                for key in GUIDED_HEADS:
+                    u, s_, f_ = uncond[key].float(), with_sr[key].float(), out[key].float()
+                    out[key] = u + sr_guidance * (s_ - u) + (style_guidance * (f_ - s_) if has_style else 0.0)
             tp = torch.softmax(out["time_logits"].float(), dim=-1).cpu().numpy()
             lg = out["lane_logits"].float().cpu().numpy()
             ch = torch.log_softmax(out["chord_logits"].float(), dim=-1).cpu().numpy()
@@ -230,6 +255,18 @@ class HybridPredictor:
             frame_ms=H,
             chord_logprobs=chord,
         )
+
+
+def threshold_for_sr(table: Dict[int, float], star_rating: float, default: float) -> float:
+    if not table:
+        return float(default)
+    bins = sorted(table)
+    centers = np.array([b + 0.5 for b in bins], dtype=np.float64)
+    values = np.array([table[b] for b in bins], dtype=np.float64)
+    return float(np.interp(float(star_rating), centers, values))
+
+
+GUIDED_HEADS = ("time_logits", "lane_logits", "chord_logits", "ln_logits")
 
 
 def star_rating_of(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], od: float = 8.0) -> float:

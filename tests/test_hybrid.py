@@ -389,6 +389,76 @@ class TestHybridNetwork(unittest.TestCase):
         np.testing.assert_allclose(p[middle], p[later], rtol=1e-4, atol=1e-5)  # same audio -> same output, anywhere
 
 
+class TestSRControl(unittest.TestCase):
+    def test_thinning_keeps_strong_notes_and_stays_exact(self):
+        from osu_mapper.hybrid.renderer import render_track as _render
+        from osu_mapper.hybrid.thinning import thin_map
+
+        tps = [RawTimingPoint(0.0, 400.0)]  # 150 BPM
+        notes = []
+        for i in range(400):  # 1/4-beat stream with chords on beats
+            t = i * 100
+            notes.append(Note(t, i % 4, t, False))
+            if i % 4 == 0:
+                notes.append(Note(t, (i + 2) % 4, t, False))
+        counts = []
+        for keep in (1.0, 0.75, 0.5, 0.3):
+            thin = thin_map(notes, tps, keep)
+            counts.append(len({n.start for n in thin}))
+            self.assertEqual(_render(solve_map(thin)), sorted(thin))         # always exactly expressible
+            if keep <= 0.5:
+                self.assertTrue(all(n.start % 200 == 0 for n in thin))       # off-beat 1/4s go first
+            if keep <= 0.3:
+                self.assertTrue(all(sum(1 for m in thin if m.start == n.start) == 1 for n in thin))  # chords capped
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        self.assertLess(counts[-1], counts[0] * 0.35)
+
+    def test_threshold_by_star_rating(self):
+        from osu_mapper.hybrid.inference import threshold_for_sr
+
+        self.assertAlmostEqual(threshold_for_sr({2: 0.5, 4: 0.4}, 3.5, 0.5), 0.45)
+        self.assertAlmostEqual(threshold_for_sr({2: 0.5, 4: 0.4}, 8.0, 0.5), 0.4)
+        self.assertAlmostEqual(threshold_for_sr({}, 3.0, 0.45), 0.45)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_guidance_and_density_pair_losses(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.inference import HybridPredictor, SongInputs
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny"))
+        with torch.no_grad():  # FiLM starts at zero (condition has no effect yet): give the condition some weight
+            for p_ in model.parameters():
+                p_.add_(torch.randn_like(p_) * 0.05)
+        W, D = 256, fcfg.total_dim()
+        rng = np.random.default_rng(0)
+        inputs = SongInputs(rng.standard_normal((2 * W, D)).astype(np.float32), rng.standard_normal((5, D)).astype(np.float32),
+                            np.zeros((2 * W, 13), np.float32), 0)
+        pred = HybridPredictor(model, fcfg, W, torch.device("cpu"))
+        plain = pred.predict(inputs, 4.0)
+        np.testing.assert_allclose(pred.predict(inputs, 4.0, sr_guidance=1.0).time_probs, plain.time_probs, atol=1e-6)
+        guided = pred.predict(inputs, 4.0, sr_guidance=3.0)
+        self.assertTrue(np.isfinite(guided.time_probs).all())
+        self.assertGreater(np.abs(guided.time_probs - plain.time_probs).max(), 1e-6)
+
+        B, T = 4, 256
+        track = solve_map(random_map(random.Random(1), 60))
+        crops = [track.crop_arrays(s, T) for s in (0, 0, 100, 100)]
+        batch = {k: torch.from_numpy(np.stack([c[k] for c in crops])) for k in crops[0]}
+        batch.update(valid=torch.ones(B, T), style=torch.rand(B, STYLE_DIM), style_mask=torch.ones(B, STYLE_DIM),
+                     pair_prev=torch.tensor([[0.0], [1.0], [0.0], [1.0]]))
+        out = model(torch.randn(B, T, D), torch.zeros(B, T, 13), torch.tensor([[3.0], [5.0], [3.0], [5.0]]),
+                    batch["style"], batch["style_mask"], torch.randn(B, 30, D), None)
+        loss, logs = compute_losses(out, batch, LossWeights(density=0.3, pair=0.3), 10)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(logs["pairs"], 2.0)
+        self.assertGreater(logs["density"], 0.0)
+        loss.backward()
+
+
 def _ffmpeg_available() -> bool:
     try:
         from osu_mapper.dataset.feature_extractor import find_ffmpeg
@@ -407,7 +477,7 @@ class TestSampling(unittest.TestCase):
 
         srs = [2.5] * 9 + [6.2]
         track = solve_map([Note(1000 * i, i % 4, 1000 * i, False) for i in range(1, 30)], num_frames=4000)
-        index = SimpleNamespace(maps=[{"sr": v} for v in srs], track=lambda i: track, feature_config=FeatureConfig())
+        index = SimpleNamespace(maps=[{"sr": v, "song_id": str(i)} for i, v in enumerate(srs)], track=lambda i: track, feature_config=FeatureConfig())
         plain = HybridCropDataset(index, range(10), 512, 8)
         balanced = HybridCropDataset(index, range(10), 512, 8, sr_balance=1.0)
         self.assertAlmostEqual(float(plain.weights[9]), 0.1, places=6)
