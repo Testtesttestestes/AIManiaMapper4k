@@ -165,12 +165,13 @@ class HybridCropDataset(Dataset):
             ev = tr.event_frames()
             self.spans.append((int(ev[0]), int(ev[-1])) if ev.size else (0, tr.num_frames - 1))
         span_len = np.array([max(1, b - a + self.crop) for a, b in self.spans], dtype=np.float64)
-        if sr_balance > 0:
-            # rare star ratings (1-star bins) are drawn more often: weight x (maps in the bin)^-sr_balance
-            bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in self.entries])
-            counts = np.bincount(bins, minlength=10).astype(np.float64)
-            span_len = span_len * counts[bins] ** (-float(sr_balance))
         derived = np.array([bool(e.get("derived")) for e in self.entries])
+        if sr_balance > 0:
+            # rare star ratings (1-star bins) are drawn more often: weight x (maps in the bin)^-sr_balance,
+            # counted separately for real and derived maps (derived maps must not dilute the real low bins)
+            bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in self.entries]) + 10 * derived
+            counts = np.bincount(bins, minlength=20).astype(np.float64)
+            span_len = span_len * counts[bins] ** (-float(sr_balance))
         if derived.any() and (~derived).any() and 0.0 <= derived_weight < 1.0:
             # derived (thinned) maps get a fixed share of the draws, whatever their number
             span_len = span_len.copy()
