@@ -217,6 +217,9 @@ def main() -> None:
     ap.add_argument("--sigma_end", type=float, default=1.0, help="ms spread of timing targets after warm-up")
     ap.add_argument("--event_weight", type=float, default=4.0)
     ap.add_argument("--val_fraction", type=float, default=0.1)
+    ap.add_argument("--rep_dropout", nargs="*", default=None, metavar="NAME=P",
+                    help="per-representation modality dropout during training, e.g. mert95m=0.5 demucs_stems=0.3 "
+                         "(default 0.15 for all); high values stop the model from recognising performers by voice")
     ap.add_argument("--sr_balance", type=float, default=0.0,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
     ap.add_argument("--val_crops", type=int, default=256)
@@ -283,6 +286,16 @@ def main() -> None:
     else:
         cfg = build_config(fcfg.dims(), fcfg.total_dim(), args.preset)
 
+    if args.rep_dropout is not None:  # training-only setting: may be changed when resuming
+        overrides = {}
+        for item in args.rep_dropout:
+            name, _, val = item.partition("=")
+            if name not in cfg.rep_dims or not val:
+                sys.exit(f"--rep_dropout: expected NAME=P with NAME in {list(cfg.rep_dims)}, got '{item}'")
+            overrides[name] = float(val)
+        cfg.rep_dropout_by_name = overrides
+    if cfg.rep_dropout_by_name:
+        print(f"[model] modality dropout: {cfg.rep_dropout:g} default, " + ", ".join(f"{k}={v:g}" for k, v in cfg.rep_dropout_by_name.items()))
     model = HybridParamNet(cfg).to(dev)
     ema = copy.deepcopy(model).eval() if (args.ema > 0 and is_main) else None
     if ema is not None:

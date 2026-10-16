@@ -17,7 +17,7 @@ like a 3-minute one (window by window, see inference.py).
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -45,6 +45,7 @@ class HybridModelConfig:
     out_conv_layers: int = 2
     dropout: float = 0.1
     rep_dropout: float = 0.15
+    rep_dropout_by_name: Dict[str, float] = field(default_factory=dict)  # per-representation override, e.g. {"mert95m": 0.5}
     style_dropout: float = 0.3
     style_key_dropout: float = 0.2
     sr_dropout: float = 0.1
@@ -270,7 +271,8 @@ class HybridParamNet(nn.Module):
             beat = beat * (torch.rand(B, 1, 1, device=dev) >= cfg.beat_dropout).float()
             use_global = (torch.rand(B, device=dev) >= cfg.global_dropout).float()
             if n_reps > 1:
-                keep = (torch.rand(B, n_reps, device=dev) >= cfg.rep_dropout).float() * present
+                p_drop = torch.tensor([float(cfg.rep_dropout_by_name.get(r, cfg.rep_dropout)) for r in self.rep_names], device=dev)
+                keep = (torch.rand(B, n_reps, device=dev) >= p_drop.view(1, -1)).float() * present
                 none_left = keep.sum(dim=1) == 0
                 keep[none_left] = present[none_left]
                 present = keep
