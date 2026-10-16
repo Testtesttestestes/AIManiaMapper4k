@@ -146,6 +146,8 @@ class HybridCropDataset(Dataset):
         num_fixed_crops: int = 0,
         augment: bool = True,
         sr_balance: float = 0.0,
+        derived_weight: float = 0.3,
+        pair_prob: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -168,7 +170,22 @@ class HybridCropDataset(Dataset):
             bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in self.entries])
             counts = np.bincount(bins, minlength=10).astype(np.float64)
             span_len = span_len * counts[bins] ** (-float(sr_balance))
+        derived = np.array([bool(e.get("derived")) for e in self.entries])
+        if derived.any() and (~derived).any() and 0.0 <= derived_weight < 1.0:
+            # derived (thinned) maps get a fixed share of the draws, whatever their number
+            span_len = span_len.copy()
+            span_len[derived] *= derived_weight / span_len[derived].sum()
+            span_len[~derived] *= (1.0 - derived_weight) / span_len[~derived].sum()
         self.weights = span_len / span_len.sum()
+        # pairs: the same window of the same song at another difficulty (teaches what changes with SR)
+        self.pair_prob = float(pair_prob) if train else 0.0
+        by_song: Dict[str, List[int]] = {}
+        for k, e in enumerate(self.entries):
+            by_song.setdefault(e["song_id"], []).append(k)
+        self.siblings: List[List[int]] = [
+            [j for j in by_song[e["song_id"]] if j != k and abs(float(self.entries[j].get("sr", 0)) - float(e.get("sr", 0))) >= 0.3]
+            for k, e in enumerate(self.entries)
+        ]
         self.samples_per_epoch = int(samples_per_epoch)
         self.fixed: Optional[List[Tuple[int, int]]] = None
         if not train:
@@ -183,6 +200,9 @@ class HybridCropDataset(Dataset):
     def __len__(self) -> int:
         return len(self.fixed) if self.fixed is not None else self.samples_per_epoch
 
+    def _item_seed(self, i: int) -> int:
+        return (self.seed * 1_000_003 + self.epoch * 7_919 + i) % (2 ** 63)
+
     def _draw(self, rng: np.random.Generator) -> Tuple[int, int]:
         k = int(rng.choice(len(self.tracks), p=self.weights))
         a, b = self.spans[k]
@@ -190,12 +210,19 @@ class HybridCropDataset(Dataset):
         return k, int(rng.integers(lo, hi))
 
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
+        pair_prev = 0.0
         if self.fixed is not None:
             k, start = self.fixed[i]
             rng = np.random.default_rng(self.seed + i)
         else:
-            rng = np.random.default_rng((self.seed * 1_000_003 + self.epoch * 7_919 + i) % (2 ** 63))
+            rng = np.random.default_rng(self._item_seed(i))
             k, start = self._draw(rng)
+            if self.pair_prob > 0 and i % 2 == 1:
+                # odd items may become the partner of the previous item (same window, sibling difficulty);
+                # with an even batch size both land in the same batch
+                k_prev, start_prev = self._draw(np.random.default_rng(self._item_seed(i - 1)))
+                if self.siblings[k_prev] and rng.random() < self.pair_prob:
+                    k, start, pair_prev = int(rng.choice(self.siblings[k_prev])), start_prev, 1.0
         entry, track = self.entries[k], self.tracks[k]
         song_id = entry["song_id"]
         variant = 0
@@ -227,6 +254,7 @@ class HybridCropDataset(Dataset):
             "style": torch.tensor(entry["style"], dtype=torch.float32),
             "style_mask": torch.tensor(entry["style_mask"], dtype=torch.float32),
             "coarse": torch.from_numpy(coarse),
+            "pair_prev": torch.tensor([pair_prev], dtype=torch.float32),
         }
         for key, arr in tgt.items():
             item[key] = torch.from_numpy(arr)
