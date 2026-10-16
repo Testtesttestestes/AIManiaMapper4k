@@ -35,6 +35,8 @@ class LossWeights:
     ln_flag: float = 0.5
     ln_len: float = 0.25
     style: float = 0.05
+    density: float = 0.3   # expected events / notes per window vs the reference (do not under-/over-fill)
+    pair: float = 0.3      # same window at two difficulties: the density RATIO must match the references
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -132,6 +134,37 @@ def compute_losses(
     logs["stagger"] = float(loss_stagger.detach())
     logs["ln_flag"] = float(loss_lnf.detach())
     logs["ln_len"] = float(loss_lnl.detach())
+
+    # --- density and pairs -------------------------------------------------------------------------
+    # expected number of events / notes in every window from the probabilities vs the reference counts:
+    # under-filling a dense map (or over-filling an easy one) now costs something, not only timing errors
+    probs = torch.softmax(out["time_logits"].float(), dim=-1)
+    p_ev = (1.0 - probs[..., 0]) * valid
+    sizes = torch.arange(1, MAX_MEMBERS + 1, device=tc.device, dtype=torch.float32)
+    exp_chord = (torch.softmax(out["chord_logits"].float(), dim=-1) * sizes).sum(dim=-1)
+    e_events = p_ev.sum(dim=1)
+    e_notes = (p_ev * exp_chord).sum(dim=1)
+    ev_f = ev.float()
+    bits_all = ((batch["event_mask"].unsqueeze(-1) >> torch.arange(4, device=tc.device)) & 1).sum(dim=-1).float()
+    n_events = ev_f.sum(dim=1)
+    n_notes = (bits_all * ev_f).sum(dim=1)
+    has = valid.sum(dim=1) > 0
+    log_e = torch.stack([torch.log1p(e_events), torch.log1p(e_notes)], dim=-1)
+    log_n = torch.stack([torch.log1p(n_events), torch.log1p(n_notes)], dim=-1)
+    if weights.density > 0 and has.any():
+        loss_density = F.smooth_l1_loss(log_e[has], log_n[has], beta=0.1)
+    else:
+        loss_density = zero("time_logits", "chord_logits")
+    pair = batch.get("pair_prev")
+    pidx = torch.nonzero((pair.view(-1) > 0) & (torch.arange(B, device=tc.device) >= 1)).view(-1) if pair is not None else None
+    if weights.pair > 0 and pidx is not None and pidx.numel() > 0:
+        loss_pair = F.smooth_l1_loss(log_e[pidx] - log_e[pidx - 1], log_n[pidx] - log_n[pidx - 1], beta=0.1)
+    else:
+        loss_pair = zero("time_logits", "chord_logits")
+    total = total + weights.density * loss_density + weights.pair * loss_pair
+    logs["density"] = float(loss_density.detach())
+    logs["pair"] = float(loss_pair.detach())
+    logs["pairs"] = float(pidx.numel()) if pidx is not None else 0.0
 
     # --- auto-style ----------------------------------------------------------------------------
     sm = batch["style_mask"].float()

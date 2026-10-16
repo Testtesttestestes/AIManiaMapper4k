@@ -42,6 +42,7 @@ from osu_mapper.hybrid.metrics import per_ms_report, summarize_reports
 from osu_mapper.hybrid.model import HybridModelConfig, HybridParamNet, PRESETS, build_config, count_parameters
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs, render_track
+from osu_mapper.hybrid.sr_response import format_response, sr_response
 from osu_mapper.hybrid.audio_features import FeatureConfig, beat_features
 
 
@@ -141,13 +142,15 @@ def validate_full_maps(
     map_indices: List[int],
     crop_frames: int,
     dev: torch.device,
-    thresholds: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.7),
+    thresholds: Tuple[float, ...] = (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7),
     ln_thresholds: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6),
     style_known: bool = False,
-) -> Tuple[Dict[str, float], float, float]:
+    min_maps_per_bin: int = 2,
+) -> Tuple[Dict[str, float], float, float, Dict[int, float]]:
     """Renders complete validation maps and compares them with the references per millisecond.
 
-    Returns (metrics at the best event threshold, best event threshold, best LN threshold).
+    Returns (metrics at the best event threshold, best event threshold, best LN threshold,
+    best event threshold per 1-star bin of the reference maps - dense maps need lower thresholds).
     """
     model.eval()
     predictor = HybridPredictor(model, index.feature_config, crop_frames, dev)
@@ -174,6 +177,14 @@ def validate_full_maps(
         score = summ.get("event_f1@16", 0.0)
         if score > best_score:
             best_th, best_score, best_summary = th, score, summ
+    by_bin: Dict[int, List[int]] = {}
+    for j, (_o, _r, _t, target) in enumerate(cache):
+        if target > 0:
+            by_bin.setdefault(int(min(target, 9.99)), []).append(j)
+    threshold_by_sr: Dict[int, float] = {}
+    for b, js in sorted(by_bin.items()):
+        if len(js) >= min_maps_per_bin:
+            threshold_by_sr[b] = max(thresholds, key=lambda th: float(np.mean([per_threshold[th][j]["event_f1@16"] for j in js])))
     best_ln, best_ln_f1 = 0.5, -1.0
     for lt in ln_thresholds:
         f1 = float(np.mean([per_ms_report(decode_outputs(o, DecodeKnobs(onset_threshold=best_th, ln_threshold=lt), tps), r)["ln_f1"] for o, r, tps, _ in cache]))
@@ -190,7 +201,28 @@ def validate_full_maps(
     if sr_err:
         best_summary["sr_mae"] = float(np.mean(np.abs(sr_err)))
         best_summary["sr_bias"] = float(np.mean(sr_err))
-    return best_summary, best_th, best_ln
+    return best_summary, best_th, best_ln, threshold_by_sr
+
+
+@torch.no_grad()
+def measure_sr_response(model, index: HybridIndex, map_indices: List[int], crop_frames: int, dev: torch.device, n_maps: int,
+                        threshold: float, ln_threshold: float, threshold_by_sr: Dict[int, float]) -> Dict[str, float]:
+    """SR obedience on a few validation maps spread over the star-rating range (see sr_response.py)."""
+    cand = sorted((i for i in map_indices if float(index.maps[i].get("sr", 0.0)) > 0), key=lambda i: float(index.maps[i]["sr"]))
+    if not cand:
+        return {}
+    pick = [cand[p] for p in sorted(set(np.linspace(0, len(cand) - 1, min(n_maps, len(cand))).round().astype(int).tolist()))]
+    model.eval()
+    predictor = HybridPredictor(model, index.feature_config, crop_frames, dev, threshold, ln_threshold)
+    predictor.threshold_by_sr = dict(threshold_by_sr)
+    items = []
+    for mi in pick:
+        entry, track = index.maps[mi], index.track(mi)
+        feats = np.asarray(index.features(entry["song_id"], 0), dtype=np.float32)
+        F = feats.shape[0]
+        inputs = SongInputs(feats=feats, coarse=index.coarse(entry["song_id"]), beat=beat_features(track.timing_points, 0, F, track.frame_ms), duration_ms=F * track.frame_ms)
+        items.append((inputs, render_track(track), list(track.timing_points), float(entry["sr"])))
+    return sr_response(predictor, items)
 
 
 def save_checkpoint(path: Path, **payload: Any) -> None:
@@ -220,10 +252,18 @@ def main() -> None:
     ap.add_argument("--rep_dropout", nargs="*", default=None, metavar="NAME=P",
                     help="per-representation modality dropout during training, e.g. mert95m=0.5 demucs_stems=0.3 "
                          "(default 0.15 for all); high values stop the model from recognising performers by voice")
+    ap.add_argument("--density_weight", type=float, default=0.3, help="loss: expected events/notes per window vs the reference")
+    ap.add_argument("--pair_weight", type=float, default=0.3, help="loss: density ratio of the same window at two difficulties")
+    ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
+    ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
     ap.add_argument("--sr_balance", type=float, default=0.0,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
     ap.add_argument("--val_crops", type=int, default=256)
     ap.add_argument("--val_maps", type=int, default=24, help="complete validation maps rendered per epoch (per-ms metrics)")
+    ap.add_argument("--val_sr_response", type=int, default=8,
+                    help="validation maps generated at -1/0/+1 star around their SR to measure whether the model obeys the request (0 = off)")
+    ap.add_argument("--response_weight", type=float, default=0.0,
+                    help="best checkpoint score = F1@16 + this x SR-response slope (clipped to 0..1.5); e.g. 0.1")
     ap.add_argument("--val_style_known", action="store_true", help="give the reference style to the model during validation")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--amp", default="auto", choices=["auto", "off", "bf16", "fp16"])
@@ -254,7 +294,11 @@ def main() -> None:
     train_idx, val_idx = index.split_by_song(args.val_fraction, args.seed)
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
-    print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps / val {len(val_idx)} maps (split by song)")
+    val_idx = [i for i in val_idx if not index.maps[i].get("derived")]  # validation = real maps only
+    n_derived = sum(1 for i in train_idx if index.maps[i].get("derived"))
+    print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps"
+          + (f" ({n_derived} derived, {100 * args.derived_weight:.0f}% of draws)" if n_derived else "")
+          + f" / val {len(val_idx)} maps (split by song)")
     sr_hist = np.bincount([int(np.clip(float(index.maps[i].get("sr", 0.0)), 0, 9.99)) for i in train_idx], minlength=10)
     print("[data] train maps per star rating: " + ", ".join(f"{b}-{b + 1}*: {int(c)}" for b, c in enumerate(sr_hist) if c)
           + (f" | sr_balance {args.sr_balance:g}" if args.sr_balance > 0 else ""))
@@ -314,6 +358,7 @@ def main() -> None:
     decode_threshold = 0.5
     ln_threshold = 0.5
     calib = {"onset_shift_ms": 0, "ln_length_scale": 1.0}
+    threshold_by_sr: Dict[int, float] = {}
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"])
         if ema is not None and resume_ckpt.get("ema_state"):
@@ -327,11 +372,15 @@ def main() -> None:
         decode_threshold = float(resume_ckpt.get("decode_threshold", 0.5))
         ln_threshold = float(resume_ckpt.get("ln_threshold", 0.5))
         calib = {"onset_shift_ms": int(resume_ckpt.get("onset_shift_ms", 0)), "ln_length_scale": float(resume_ckpt.get("ln_length_scale", 1.0))}
+        threshold_by_sr = {int(k): float(v) for k, v in (resume_ckpt.get("decode_threshold_by_sr") or {}).items()}
 
     # wrap after loading the checkpoint; all ranks start from identical weights (DDP broadcasts rank 0)
     train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
 
-    weights = LossWeights()
+    weights = LossWeights(density=args.density_weight, pair=args.pair_weight)
+    if args.pair_prob > 0 and args.batch_size % 2:
+        print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
+        args.pair_prob = 0.0
     total_steps = (start_epoch + args.epochs) * args.steps_per_epoch if resume_ckpt is None else max(int(resume_ckpt.get("total_steps", 0)), (start_epoch + args.epochs) * args.steps_per_epoch)
     print(f"[model] preset={args.preset if resume_ckpt is None else 'from checkpoint'} params={count_parameters(model):,} device={dev} amp={'on ' + str(amp_dtype) if use_amp else 'off'}")
     print(f"[train] window={crop_frames} frames ({crop_frames * fcfg.frame_ms / 1000:.2f} s), batch={args.batch_size} x {world} GPU(s) = {args.batch_size * world}, "
@@ -339,7 +388,7 @@ def main() -> None:
 
     # every rank draws its own random crops (different seed), so no sampler is needed
     train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank,
-                                 sr_balance=args.sr_balance)
+                                 sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -367,6 +416,7 @@ def main() -> None:
             "total_steps": total_steps,
             "best_score": best_score,
             "decode_threshold": decode_threshold,
+            "decode_threshold_by_sr": threshold_by_sr,
             "ln_threshold": ln_threshold,
             "onset_shift_ms": calib["onset_shift_ms"],
             "ln_length_scale": calib["ln_length_scale"],
@@ -376,7 +426,7 @@ def main() -> None:
         }
 
     def evaluate(tag: str, epoch: int, train_sec: float) -> Tuple[Dict[str, Any], Dict[str, float]]:
-        nonlocal decode_threshold, ln_threshold, calib
+        nonlocal decode_threshold, ln_threshold, calib, threshold_by_sr
         eval_model = ema if ema is not None else model
         record: Dict[str, Any] = {"epoch": epoch, "step": step, "train_sec": round(train_sec, 1)}
         summary: Dict[str, float] = {}
@@ -387,7 +437,7 @@ def main() -> None:
                   f"| offset exact {vc.get('offset_exact', 0):.3f} (+-1ms {vc.get('offset_within1ms', 0):.3f}) | lane acc {vc.get('lane_acc', 0):.3f} | chord acc {vc.get('chord_acc', 0):.3f}")
         if val_full:
             t1 = time.time()
-            summary, decode_threshold, ln_threshold = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known)
+            summary, decode_threshold, ln_threshold, threshold_by_sr = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known)
             record.update({f"map_{k}": v for k, v in summary.items()})
             record["decode_threshold"] = decode_threshold
             record["ln_threshold"] = ln_threshold
@@ -402,6 +452,15 @@ def main() -> None:
             print(f"[{tag}] surplus vs reference notes: duplicate events (<=30 ms from a hit) {summary.get('surplus_duplicate_events_pct', float('nan')):.2f}% "
                   f"| isolated extra events {summary.get('surplus_isolated_events_pct', float('nan')):.2f}% | extra chord notes {summary.get('surplus_chord_notes_pct', float('nan')):.2f}% "
                   f"|| missing: events {summary.get('missed_events_pct', float('nan')):.2f}%, chord notes {summary.get('missing_chord_notes_pct', float('nan')):.2f}%")
+            if threshold_by_sr:
+                print(f"[{tag}] event threshold by star rating: " + " ".join(f"{b}*={t:g}" for b, t in sorted(threshold_by_sr.items())))
+            if args.val_sr_response > 0:
+                t2 = time.time()
+                resp = measure_sr_response(eval_model, index, val_full, crop_frames, dev, args.val_sr_response, decode_threshold, ln_threshold, threshold_by_sr)
+                if resp:
+                    summary.update({f"resp_{k}": v for k, v in resp.items()})
+                    record.update({f"resp_{k}": v for k, v in resp.items()})
+                    print(f"[{tag}] SR response ({time.time() - t2:.0f}s): {format_response(resp)}")
         return record, summary
 
     if args.eval_only:
@@ -414,7 +473,7 @@ def main() -> None:
         print(f"[eval] metrics -> {out_json}")
         if args.update_checkpoint:
             ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-            ck.update({"decode_threshold": decode_threshold, "ln_threshold": ln_threshold,
+            ck.update({"decode_threshold": decode_threshold, "decode_threshold_by_sr": threshold_by_sr, "ln_threshold": ln_threshold,
                        "onset_shift_ms": calib["onset_shift_ms"], "ln_length_scale": calib["ln_length_scale"], "val_summary": summary})
             save_checkpoint(Path(args.resume), **ck)
             print(f"[eval] thresholds and calibration written into {args.resume}")
@@ -452,7 +511,8 @@ def main() -> None:
                 if step % args.log_every == 0:
                     avg = {k: v / n_run for k, v in run.items()}
                     print(f"  step {step:>7} | lr {lr:.2e} | sigma {sigma:.2f}ms | total {avg['total']:.4f} | time {avg['time']:.4f} lane {avg['lane']:.3f} chord {avg['chord']:.3f} "
-                          f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f}", flush=True)
+                          f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f} "
+                          f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)", flush=True)
                     run, n_run = {}, 0
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait
@@ -462,6 +522,8 @@ def main() -> None:
             history.append(record)
             if summary:
                 score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
+                if args.response_weight > 0 and "resp_slope" in summary:
+                    score += args.response_weight * float(np.clip(summary["resp_slope"], 0.0, 1.5))
             elif "val_total" in record:
                 score = -float(record["val_total"])
             else:
