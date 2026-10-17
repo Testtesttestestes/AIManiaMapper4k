@@ -228,6 +228,20 @@ python hybrid_long_track_test.py --synthetic_minutes 60 --sr 4
 
 ## 3. Порядок запуска (Windows PowerShell)
 
+**Перед подготовкой датасета — убрать дубликаты карт** (сравнивается только содержимое .osu: имена архивов,
+аудио и картинки не важны; дубль = тот же текст, или те же ноты и тайминг, или те же ноты при других
+зелёных линиях — перезаливы с другой громкостью/kiai):
+
+```powershell
+python find_duplicate_maps.py --dir "sample beatmaps"            # только отчёт
+python find_duplicate_maps.py --dir "sample beatmaps" --delete   # удалить архивы, где ВСЕ сложности — дубли
+```
+
+`[partial]` в отчёте — дубль отдельной сложности внутри архива, который остаётся (архив не удаляется).
+Такие сложности `prepare_hybrid_dataset.py` сам пропускает (`[duplicate] ... skipped`), так что в датасет
+одинаковые карты не попадут даже без удаления (`--keep_duplicates` отключает). `--strict_timing` — считать
+карты с одинаковыми нотами, но разными тайминг-поинтами разными.
+
 ```powershell
 pip install -r requirements.txt            # torch, numpy, scipy, rosu-pp-py; ffmpeg.exe в папке ffmpeg\
 
