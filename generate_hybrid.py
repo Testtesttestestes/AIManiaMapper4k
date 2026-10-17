@@ -159,6 +159,9 @@ def main() -> None:
     ap.add_argument("--disable_reps", nargs="*", default=[], metavar="NAME",
                     help="switch off audio representations, e.g. mert95m or demucs_stems: the model uses its learned 'missing' input "
                          "(trained with 15%% modality dropout), disabled neural encoders are not even loaded")
+    ap.add_argument("--ergonomics", type=float, default=0.0,
+                    help="algorithmic lane polishing 0..1 (times, chord sizes and LNs stay; lanes are re-assigned against jacks, "
+                         "one-hand passages, anchors): 0 = network's lanes, 0.5 = repair bad places, 1 = ergonomics only")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--sr_guidance", default="1",
@@ -294,6 +297,12 @@ def main() -> None:
                                     sr_guidance=guidance, style_guidance=args.style_guidance)
             for th in (thresholds if user_thresholds is not None or not predictor.threshold_by_sr else [predictor.threshold_for(target)]):
                 notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
+                if args.ergonomics > 0:
+                    from osu_mapper.hybrid.ergonomics import ergonomics_report, format_report, improve_ergonomics
+                    before = ergonomics_report(notes)
+                    notes = improve_ergonomics(notes, timing, args.ergonomics, release_gap_ms=knobs.ln_release_gap_ms,
+                                               release_gap_beats=knobs.ln_release_gap_beats)
+                    print(f"    ergonomics {args.ergonomics:g}: {format_report(before)}  ->  {format_report(ergonomics_report(notes))}")
                 sr_val = star_rating_of(notes, timing, args.od)
                 version = f"{args.version + ' ' if args.version else ''}Hybrid {target:.2f}*" + (f" g{guidance:g}" if len(guidances) > 1 else "") + (f" t{th:g}" if len(thresholds) > 1 else "")
                 m = ManiaMap(

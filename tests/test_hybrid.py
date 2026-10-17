@@ -459,6 +459,36 @@ class TestSRControl(unittest.TestCase):
         loss.backward()
 
 
+class TestErgonomics(unittest.TestCase):
+    def test_polishing_keeps_rhythm_and_fixes_lanes(self):
+        from collections import Counter
+
+        from osu_mapper.hybrid.ergonomics import ergonomics_report, improve_ergonomics
+
+        rng = random.Random(3)
+        notes, t = [], 0
+        for _ in range(600):  # one-handed, jack-heavy "network" lanes
+            t += rng.choice([86, 86, 172])
+            c = rng.choice([2, 3, 3, 2, 0])
+            if rng.random() < 0.08:
+                notes.append(Note(t, c, t + 250, True))
+                t += 300
+            else:
+                notes.append(Note(t, c, t, False))
+            if rng.random() < 0.15:
+                notes.append(Note(t, 1 if c != 1 else 0, t, False))
+        tps = [RawTimingPoint(0.0, 344.8)]
+        self.assertEqual(improve_ergonomics(notes, tps, 0.0), sorted(notes))
+        out = improve_ergonomics(notes, tps, 0.7)
+        self.assertEqual(Counter(n.start for n in out), Counter(n.start for n in notes))           # times + chord sizes
+        self.assertEqual(sorted((n.start, n.end - n.start) for n in out if n.ln), sorted((n.start, n.end - n.start) for n in notes if n.ln))
+        self.assertEqual(render_track(solve_map(out)), sorted(out))                                 # valid map
+        before, after = ergonomics_report(notes), ergonomics_report(out)
+        self.assertLess(after["fast_jack_pct"], before["fast_jack_pct"] / 4)
+        self.assertLess(after["max_one_hand_run"], before["max_one_hand_run"])
+        self.assertLess(after["hand_imbalance"], before["hand_imbalance"])
+
+
 def _ffmpeg_available() -> bool:
     try:
         from osu_mapper.dataset.feature_extractor import find_ffmpeg
