@@ -333,6 +333,14 @@ python -m unittest tests.test_hybrid -v
 | 3 | **потеря пар**: отношение плотностей двух сложностей = как у эталонов | `--pair_weight 0.3` |
 | 4 | **метрика послушания**: генерация на SR−1/SR/SR+1, наклон (1.0 = каждая звезда запроса = звезда результата) | каждую эпоху в логе `SR response`, отдельно `hybrid_sr_response.py` |
 
+Статистика карт по звёздам (сколько карт в каждом диапазоне 1★, доля LN, ноты в секунду):
+
+```powershell
+python beatmap_stats.py --input_dir "sample beatmaps"                 # папка с .osz (SR считается через rosu-pp)
+python beatmap_stats.py --input_dir "новые карты" --list --min_sr 6   # + список карт от самой сложной
+python beatmap_stats.py --data dataset_hybrid                         # готовый датасет: мгновенно, реальные / производные / валидация отдельно
+```
+
 Порядок работы:
 
 ```powershell
