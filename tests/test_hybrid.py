@@ -459,6 +459,21 @@ class TestSRControl(unittest.TestCase):
         loss.backward()
 
 
+class TestRateVersions(unittest.TestCase):
+    def test_rate_versions_share_the_split_group(self):
+        from osu_mapper.hybrid.dataset import piece_name, split_key
+
+        base = piece_name("Camellia - Exit This Earth's Atomosphere")
+        for t in ("Camellia - Exit This Earth's Atomosphere (x1.25)", "Camellia - Exit This Earth's Atomosphere [1.1x]",
+                  "Camellia - Exit This Earth's Atomosphere (Nightcore)"):
+            self.assertEqual(piece_name(t), base)
+        self.assertNotEqual(piece_name("Camellia - Ghost"), base)
+        a = split_key({"osu_file": "Camellia - Exit (x1.25) (mapper) [Insane x1.25].osu", "song_id": "a"})
+        b = split_key({"osu_file": "Camellia - Exit (mapper) [Insane].osu", "song_id": "b"})
+        self.assertEqual(a, b)
+        self.assertEqual(split_key({"piece": "p", "song_id": "c"}), "p")
+
+
 class TestErgonomics(unittest.TestCase):
     def test_polishing_keeps_rhythm_and_fixes_lanes(self):
         from collections import Counter
