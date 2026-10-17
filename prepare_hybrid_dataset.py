@@ -28,7 +28,7 @@ from typing import Any, Dict, List
 import numpy as np
 
 from osu_mapper.hybrid.audio_features import QUALITY_VARIANTS, FeatureConfig, coarse_features, compute_stacked_features, degrade_audio, load_audio
-from osu_mapper.hybrid.dataset import INDEX_VERSION
+from osu_mapper.hybrid.dataset import INDEX_VERSION, piece_name
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.hybrid.solver import STYLE_KEYS, SolveStats, compute_style, solve_map
@@ -161,6 +161,7 @@ def main() -> None:
             style, known = compute_style(track, m.notes, sr, m.overall_difficulty)
             track.save_npz(out / "maps" / f"{mid}.npz")
             maps.append({
+                "piece": piece_name(f"{m.metadata.get('Artist', '')} - {m.metadata.get('Title', '')}") or sid,
                 "map_id": mid,
                 "song_id": sid,
                 "track": f"maps/{mid}.npz",

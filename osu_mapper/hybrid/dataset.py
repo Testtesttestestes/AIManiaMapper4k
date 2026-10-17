@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -58,6 +59,24 @@ class HybridIndex:
         return state
 
     def split_by_song(self, val_fraction: float = 0.1, seed: int = 42) -> Tuple[List[int], List[int]]:
+        """Train/val split by song. Rate versions of a song (x1.1, x1.25 ... with their own sped-up audio file)
+        and other audio files of the same piece stay on the same side (see :func:`split_key`)."""
+        keys = {m["song_id"]: split_key(m) for m in self.maps}
+        groups = sorted(set(keys.values()))
+        rng = random.Random(seed)
+        rng.shuffle(groups)
+        n_val = max(1, int(round(len(groups) * val_fraction))) if len(groups) > 1 else 0
+        val_groups = set(groups[:n_val])
+        train = [i for i, m in enumerate(self.maps) if keys[m["song_id"]] not in val_groups]
+        val = [i for i, m in enumerate(self.maps) if keys[m["song_id"]] in val_groups]
+        return train, val
+
+    def split(self, val_fraction: float = 0.1, seed: int = 42, mode: str = "piece") -> Tuple[List[int], List[int]]:
+        """mode "piece" (default for new trainings) or "audio" (one group per audio file: checkpoints before it)."""
+        return self.split_by_audio_file(val_fraction, seed) if mode == "audio" else self.split_by_song(val_fraction, seed)
+
+    def split_by_audio_file(self, val_fraction: float = 0.1, seed: int = 42) -> Tuple[List[int], List[int]]:
+        """The original split (one group per audio file): used for checkpoints trained before the piece split."""
         songs = sorted({m["song_id"] for m in self.maps})
         rng = random.Random(seed)
         rng.shuffle(songs)
@@ -84,6 +103,30 @@ class HybridIndex:
 
     def track(self, map_idx: int) -> ParamTrack:
         return ParamTrack.load_npz(self.root / self.maps[map_idx]["track"])
+
+
+_RATE_RE = re.compile(r"[\(\[]?\s*(?:x\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*x|rate\s*\d+(?:[.,]\d+)?|nightcore|\bnc\b|daycore)\s*[\)\]]?", re.I)
+
+
+def piece_name(text: str) -> str:
+    """'Artist - Title (x1.25)' -> 'artist - title': rate / nightcore tags removed, case and spacing normalized."""
+    t = _RATE_RE.sub(" ", text or "")
+    t = re.sub(r"[^\w]+", " ", t.lower(), flags=re.UNICODE)
+    return " ".join(t.split())
+
+
+def split_key(entry: Dict[str, Any]) -> str:
+    """Group used for the train/val split: the piece of music, not the audio file.
+
+    Prefers the 'piece' stored by prepare_hybrid_dataset.py (artist + title without rate tags); for older
+    indices it is derived from the .osu file name 'Artist - Title (Creator) [Version].osu'.
+    """
+    if entry.get("piece"):
+        return str(entry["piece"])
+    name = Path(str(entry.get("osu_file", ""))).name
+    m = re.match(r"^(.*?)\s*\([^()]*\)\s*\[[^\]]*\]\.osu$", name)
+    base = piece_name(m.group(1) if m else "")
+    return base if base else str(entry.get("song_id"))
 
 
 class SparseTrack:
