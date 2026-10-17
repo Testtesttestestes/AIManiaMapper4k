@@ -249,6 +249,9 @@ def main() -> None:
     ap.add_argument("--sigma_end", type=float, default=1.0, help="ms spread of timing targets after warm-up")
     ap.add_argument("--event_weight", type=float, default=4.0)
     ap.add_argument("--val_fraction", type=float, default=0.1)
+    ap.add_argument("--split", default=None, choices=["piece", "audio"],
+                    help="train/val split groups: 'piece' = all audio files / rate versions (x1.1, x1.25) of one song together "
+                         "(default for new trainings), 'audio' = one group per audio file (older checkpoints; kept automatically on --resume/--eval_only)")
     ap.add_argument("--rep_dropout", nargs="*", default=None, metavar="NAME=P",
                     help="per-representation modality dropout during training, e.g. mert95m=0.5 demucs_stems=0.3 "
                          "(default 0.15 for all); high values stop the model from recognising performers by voice")
@@ -291,14 +294,20 @@ def main() -> None:
     fcfg = index.feature_config
     crop_frames = int(round(args.crop_sec * 1000.0 / fcfg.frame_ms))
     crop_frames -= crop_frames % 4
-    train_idx, val_idx = index.split_by_song(args.val_fraction, args.seed)
+    if args.split is None:  # a resumed / evaluated checkpoint keeps the split it was trained with
+        args.split = "piece"
+        if args.resume:
+            peek_path = (Path(args.checkpoint_dir) / "hybrid_last.pt") if args.resume == "auto" else Path(args.resume)
+            if peek_path.exists():
+                args.split = torch.load(peek_path, map_location="cpu", weights_only=False).get("args", {}).get("split") or "audio"
+    train_idx, val_idx = index.split(args.val_fraction, args.seed, args.split)
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
     val_idx = [i for i in val_idx if not index.maps[i].get("derived")]  # validation = real maps only
     n_derived = sum(1 for i in train_idx if index.maps[i].get("derived"))
     print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps"
           + (f" ({n_derived} derived, {100 * args.derived_weight:.0f}% of draws)" if n_derived else "")
-          + f" / val {len(val_idx)} maps (split by song)")
+          + f" / val {len(val_idx)} maps (split by {args.split})")
     sr_hist = np.bincount([int(np.clip(float(index.maps[i].get("sr", 0.0)), 0, 9.99)) for i in train_idx], minlength=10)
     print("[data] train maps per star rating: " + ", ".join(f"{b}-{b + 1}*: {int(c)}" for b, c in enumerate(sr_hist) if c)
           + (f" | sr_balance {args.sr_balance:g}" if args.sr_balance > 0 else ""))

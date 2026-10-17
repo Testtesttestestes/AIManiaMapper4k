@@ -39,7 +39,7 @@ def main() -> None:
     targs = ck.get("args", {})
     predictor = HybridPredictor.from_checkpoint(args.checkpoint, device=args.device)
     index = HybridIndex(args.data)
-    _, val_idx = index.split_by_song(float(targs.get("val_fraction", 0.1)), int(targs.get("seed", 42)))
+    _, val_idx = index.split(float(targs.get("val_fraction", 0.1)), int(targs.get("seed", 42)), targs.get("split") or "audio")
     if not val_idx:
         raise SystemExit("no validation songs in this dataset")
     chosen = sorted(random.Random(0).sample(val_idx, min(args.maps, len(val_idx))))
