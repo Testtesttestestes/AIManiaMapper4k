@@ -18,6 +18,7 @@ Re-running is incremental: songs whose features already exist are not decoded ag
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -49,6 +50,7 @@ def main() -> None:
     ap.add_argument("--output_dir", "-o", default="dataset_hybrid")
     ap.add_argument("--ffmpeg", default=None, help="path to ffmpeg(.exe)")
     ap.add_argument("--quality_variants", nargs="*", default=[], choices=sorted(QUALITY_VARIANTS), help="extra degraded-audio feature copies")
+    ap.add_argument("--keep_duplicates", action="store_true", help="keep difficulties whose notes are identical to an already added one")
     ap.add_argument("--max_songs", type=int, default=0, help="stop after N songs (0 = all)")
     ap.add_argument("--overwrite", action="store_true", help="recompute features even if they exist")
     ap.add_argument("--device", default="auto", help="device for STFT features and neural encoders: auto (GPU if available) / cpu / cuda / cuda:1")
@@ -82,6 +84,7 @@ def main() -> None:
     maps: List[Dict[str, Any]] = []
     totals = {"songs": 0, "maps": 0, "roundtrip_fail": 0, "overflow_notes": 0, "notes": 0, "audio_hours": 0.0}
     t_start = time.time()
+    seen_charts: Dict[str, str] = {}  # notes hash -> first map with these notes (duplicate re-uploads are skipped)
 
     def write_index() -> None:
         data = {
@@ -144,6 +147,12 @@ def main() -> None:
         totals["audio_hours"] += duration_ms / 3.6e6
 
         for osu_name, osu_text, m in group.maps:
+            chart = hashlib.sha1(repr(m.canonical_notes()).encode("utf-8")).hexdigest()
+            if not args.keep_duplicates and len(m.notes) >= 20 and chart in seen_charts:
+                print(f"  [duplicate] {osu_name}: same notes as {seen_charts[chart]} - skipped")
+                totals["duplicates_skipped"] = totals.get("duplicates_skipped", 0) + 1
+                continue
+            seen_charts.setdefault(chart, f"{Path(group.source).name} :: {osu_name}")
             mid = stable_id(group.source, osu_name)
             stats = SolveStats()
             track = solve_map(m, num_frames=num_frames, stats=stats)
@@ -184,6 +193,8 @@ def main() -> None:
     write_index()
     print("\n" + "=" * 70)
     print(f"songs {totals['songs']} | maps {totals['maps']} | audio {totals['audio_hours']:.2f} h | notes {totals['notes']:,}")
+    if totals.get("duplicates_skipped"):
+        print(f"duplicate difficulties skipped (same notes as an earlier map): {totals['duplicates_skipped']}")
     print(f"exact roundtrip failures: {totals['roundtrip_fail']} | notes in overflow (not expressible densely): {totals['overflow_notes']}")
     print(f"index: {index_path} ({time.time() - t_start:.0f}s)")
     if totals["maps"] == 0:
