@@ -162,6 +162,12 @@ def main() -> None:
     ap.add_argument("--ergonomics", type=float, default=0.0,
                     help="algorithmic lane polishing 0..1 (times, chord sizes and LNs stay; lanes are re-assigned against jacks, "
                          "one-hand passages, anchors): 0 = network's lanes, 0.5 = repair bad places, 1 = ergonomics only")
+    ap.add_argument("--hitsounds", action="store_true",
+                    help="automatic hitsounds from the audio: per-note volume (follows loudness), sample set per section "
+                         "(normal/soft/drum) and clap/whistle/finish additions")
+    ap.add_argument("--hitsound_volume", default="40,90", help="volume range in %% for quiet..loud parts")
+    ap.add_argument("--hitsound_set", default="auto", choices=["auto", "normal", "soft", "drum"])
+    ap.add_argument("--no_additions", action="store_true", help="hitsounds: volume and sample set only, no clap/whistle/finish")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--sr_guidance", default="1",
@@ -313,6 +319,13 @@ def main() -> None:
                     metadata={"Title": title, "Artist": artist, "Creator": args.creator, "Version": version, "AudioFilename": audio_name},
                 )
                 text = map_to_osu_text(m)
+                if args.hitsounds:
+                    from osu_mapper.hybrid.hitsounds import apply_hitsounds_to_text, compute_hitsounds, hitsound_summary
+                    vr = tuple(int(v) for v in args.hitsound_volume.split(","))
+                    hs = compute_hitsounds(notes, inputs.feats, fcfg.slices(), timing, fcfg.frame_ms, vr,
+                                           additions=not args.no_additions, sample_set=args.hitsound_set)
+                    text = apply_hitsounds_to_text(text, hs)
+                    print(f"    hitsounds: {hitsound_summary(hs)}")
                 last = notes[-1].start / 1000.0 if notes else 0.0
                 print(f"[{version}] {len(notes)} notes ({sum(n.ln for n in notes)} LN), last note {last:.1f}s / {inputs.duration_ms / 1000:.1f}s, "
                       f"threshold {th:.3f}, star rating {sr_val:.2f} (target {target:.2f}) in {time.time() - t1:.1f}s")

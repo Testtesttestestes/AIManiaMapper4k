@@ -489,6 +489,37 @@ class TestErgonomics(unittest.TestCase):
         self.assertLess(after["hand_imbalance"], before["hand_imbalance"])
 
 
+class TestHitsounds(unittest.TestCase):
+    def test_volume_follows_loudness_and_text_roundtrip(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.hitsounds import CLAP, FINISH, WHISTLE, apply_hitsounds_to_text, compute_hitsounds
+
+        cfg = FeatureConfig()
+        slices = cfg.slices()
+        F = 6000
+        feats = np.zeros((F, cfg.total_dim()), np.float32)
+        s0, _ = slices["spectral"]
+        feats[3000:, s0] = 2.0                      # second half much louder
+        o0, _ = slices["onset"]
+        feats[::40, o0 + 2: o0 + 5] = 3.0           # snare-like attacks every 400 ms (on the beats)
+        notes = [Note(t, (t // 100) % 4, t, False) for t in range(400, 59000, 200)] + [Note(20000, 3, 20000, False)]
+        notes = sorted(set(notes))
+        tps = [RawTimingPoint(0.0, 400.0)]
+        hs = compute_hitsounds(notes, feats, slices, tps)
+        self.assertEqual(len(hs), len(notes))
+        quiet = np.mean([h.volume for (t, _), h in hs.items() if t < 29000])
+        loud = np.mean([h.volume for (t, _), h in hs.items() if t > 31000])
+        self.assertGreater(loud, quiet + 20)
+        self.assertTrue(any(h.hit_sound & CLAP for h in hs.values()))
+        chord = [hs[(20000, c)] for c in (0, 3) if (20000, c) in hs]
+        self.assertLessEqual(sum(1 for h in chord if h.hit_sound & (CLAP | WHISTLE | FINISH)), 1)  # no stacking
+        m = ManiaMap(notes=notes + [Note(59500, 1, 59900, True)], timing_points=tps)
+        hs[(59500, 1)] = compute_hitsounds([Note(59500, 1, 59900, True)], feats, slices, tps)[(59500, 1)]
+        text = apply_hitsounds_to_text(map_to_osu_text(m), hs)
+        back = parse_osu_mania(text)
+        self.assertEqual(sorted(back.notes), sorted(m.notes))   # hitsounds never change the notes
+
+
 def _ffmpeg_available() -> bool:
     try:
         from osu_mapper.dataset.feature_extractor import find_ffmpeg
