@@ -29,6 +29,7 @@ import numpy as np
 
 from osu_mapper.hybrid.audio_features import FeatureConfig
 from osu_mapper.hybrid.beatmap import ManiaMap, map_to_osu_text
+from osu_mapper.hybrid.dataset import split_key
 from osu_mapper.hybrid.params import ParamTrack
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.hybrid.solver import STYLE_DIM, SolveStats, compute_style, solve_map
@@ -111,7 +112,7 @@ def main() -> None:
                 "style": [round(float(x), 5) for x in style], "style_mask": [0.0] * STYLE_DIM,
                 "notes": len(thin), "events": stats.events, "overflow": stats.overflow, "overflow_reasons": stats.overflow_reasons,
                 "overlaps_in_ln": stats.overlaps_in_ln, "roundtrip_exact": True,
-                "derived": True, "parent": par["map_id"], "keep": keep,
+                "derived": True, "parent": par["map_id"], "keep": keep, "piece": split_key(par),
             })
             others.append(sr)
             song_srs[sid] = others

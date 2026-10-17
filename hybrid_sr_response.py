@@ -45,7 +45,7 @@ def main() -> None:
     targs = ck.get("args", {})
     predictor = HybridPredictor.from_checkpoint(args.checkpoint, device=args.device, disable_reps=args.disable_reps)
     index = HybridIndex(args.data)
-    _, val_idx = index.split_by_song(float(targs.get("val_fraction", 0.1)), int(targs.get("seed", 42)))
+    _, val_idx = index.split(float(targs.get("val_fraction", 0.1)), int(targs.get("seed", 42)), targs.get("split") or "audio")
     val_idx = [i for i in val_idx if not index.maps[i].get("derived") and float(index.maps[i].get("sr", 0.0)) > 0]
     if not val_idx:
         raise SystemExit("no validation maps with a star rating in this dataset")

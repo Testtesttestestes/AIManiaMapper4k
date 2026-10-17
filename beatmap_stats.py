@@ -55,6 +55,8 @@ def from_folder(input_dir: str) -> List[Dict]:
 
 
 def from_dataset(data: str) -> List[Dict]:
+    from osu_mapper.hybrid.dataset import split_key
+
     idx = json.loads((Path(data) / "index.json").read_text(encoding="utf-8"))
     rows = []
     for m in idx["maps"]:
@@ -64,7 +66,7 @@ def from_dataset(data: str) -> List[Dict]:
         ln = float(style[2]) if len(style) > 2 and (len(mask) < 3 or mask[2] or m.get("derived")) else None
         nps = float(np.expm1(style[1] * np.log1p(30.0))) if len(style) > 1 else None
         rows.append({"sr": float(m["sr"]), "ln": ln, "nps": nps, "name": f"{Path(m.get('source', '')).name} [{m.get('version', '')}]",
-                     "derived": bool(m.get("derived")), "song": m["song_id"]})
+                     "derived": bool(m.get("derived")), "song": split_key(m)})
     return rows
 
 
@@ -90,7 +92,7 @@ def main() -> None:
         songs = sorted({r["song"] for r in rows})
         random.Random(args.seed).shuffle(songs)
         val = set(songs[:max(1, int(round(len(songs) * args.val_fraction)))])
-        table([r for r in real if r["song"] in val], f"validation split (val_fraction {args.val_fraction:g})")
+        table([r for r in real if r["song"] in val], f"validation split for new trainings (val_fraction {args.val_fraction:g}, rate versions grouped)")
     else:
         rows = from_folder(args.input_dir or "sample beatmaps")
         table(rows, f"maps in '{args.input_dir or 'sample beatmaps'}'")
