@@ -324,6 +324,23 @@ def main(argv=None) -> None:
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
+                    if not fit.reached and fit.star_rating < target and guidance == 1.0:
+                        # the network hears too few notes for this rating: SR guidance makes it hear more (measured: Artificial
+                        # Horizon 5.35 -> 5.53 for 5.57*, The Last Petal 5.39 -> 5.78 for 7.14*); only as a fallback, since
+                        # where the rating is reachable without it guidance only blurs the network (F1 0.70 -> 0.70, 3: 0.70)
+                        for g2 in (2.0, 3.0):
+                            out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+                                                     sr_guidance=g2, style_guidance=args.style_guidance)
+                            fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
+                                                   min_threshold=args.min_threshold, jack_target=jt)
+                            if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
+                                print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
+                                fit, out = fit2, out2
+                                notes, th = fit.notes, fit.threshold
+                                fit_info = (f" | fitted with SR guidance {g2:g}: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, "
+                                            f"lanes re-assigned {fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
+                            if fit.reached:
+                                break
                     if not fit.reached:
                         print(f"    [!] {target:.2f}* is not reachable without notes the network does not hear: the closest is "
                               f"{fit.star_rating:.2f}* (try --min_threshold lower, the composer, or another difficulty)"
