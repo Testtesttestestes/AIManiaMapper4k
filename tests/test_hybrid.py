@@ -560,6 +560,53 @@ class TestSampling(unittest.TestCase):
         self.assertAlmostEqual(float(balanced.weights[9]), 0.5, places=6)
 
 
+class TestJackLoss(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_jack_probability_from_lane_codes(self):
+        from osu_mapper.hybrid.losses import jack_loss
+        from osu_mapper.hybrid.params import LANE_OPS, N_LANE_CODES, code_for_mask
+
+        T = 40
+        tc = torch.zeros(1, T, dtype=torch.long)
+        em = torch.zeros(1, T, dtype=torch.long)
+        for f, m in ((0, 0b0001), (10, 0b0010), (20, 0b0010), (30, 0b0100)):   # 100 ms apart; frame 20 is a jack
+            tc[0, f], em[0, f] = 1, m
+        logits = torch.full((1, T, N_LANE_CODES), -20.0)
+        logits[0, :, LANE_OPS.index("SAME")] = 20.0       # always "repeat the previous chord"
+        loss_same, n = jack_loss(logits, tc, em, torch.ones(1, T), 10)
+        self.assertEqual(n, 2)
+        logits2 = torch.full((1, T, N_LANE_CODES), -20.0)
+        logits2[0, :, code_for_mask(0b1000)] = 20.0        # never touches lanes 1-2: no jack
+        loss_far, _ = jack_loss(logits2, tc, em, torch.ones(1, T), 10)
+        # one jack and one non-jack: either constant answer is half wrong, by the same amount
+        self.assertAlmostEqual(float(loss_same), float(loss_far), delta=0.05)
+        logits3 = logits2.clone()
+        logits3[0, 20] = logits[0, 20]                     # right at both
+        loss_right, _ = jack_loss(logits3.requires_grad_(), tc, em, torch.ones(1, T), 10)
+        self.assertLess(float(loss_right), 1e-3)
+        tc_slow = tc.clone()
+        tc_slow[0, 20], tc_slow[0, 30], tc_slow[0, 10] = 0, 0, 0
+        self.assertEqual(jack_loss(logits, tc_slow, em, torch.ones(1, T), 10)[1], 0)
+
+
+class TestSoundConsistency(unittest.TestCase):
+    def test_same_sound_same_chord_has_lift(self):
+        from osu_mapper.hybrid.metrics import sound_consistency
+
+        rng = np.random.default_rng(0)
+        T = 6000
+        feats = rng.standard_normal((T, 20)).astype(np.float32) * 0.1
+        kinds = rng.integers(0, 2, size=200)
+        notes = []
+        for i, kd in enumerate(kinds):
+            t = 200 + 250 * i
+            feats[t // 10, :10] += 3.0 if kd else -3.0                 # two kinds of hit
+            notes += [Note(t, c, t, False) for c in ((0, 3) if kd else (1,))]
+        res = sound_consistency(notes, feats, {"onset": (0, 10), "spectral": (10, 20)})
+        self.assertGreater(res["chord_size_lift"], 0.3)
+        self.assertAlmostEqual(res["chord_size_similar"], 1.0, places=6)
+
+
 class TestDifficultyLadder(unittest.TestCase):
     """Importance head: a moment is mapped at star rating s when importance > theta(s), theta falls with s."""
 

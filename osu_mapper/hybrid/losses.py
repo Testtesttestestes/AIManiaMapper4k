@@ -17,6 +17,8 @@ style    smooth-L1 of the auto-style head (lets inference pick a style when the 
 from __future__ import annotations
 
 import math
+
+import numpy as np
 from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
 
@@ -37,6 +39,7 @@ class LossWeights:
     style: float = 0.05
     density: float = 0.3   # expected events / notes per window vs the reference (do not under-/over-fill)
     pair: float = 0.3      # same window at two difficulties: the density RATIO must match the references
+    jack: float = 0.0      # fast transitions (< 160 ms): P(the chosen lane code hits a lane of the previous chord) vs the map
     ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
 
     def to_dict(self) -> Dict[str, float]:
@@ -167,6 +170,17 @@ def compute_losses(
     logs["pair"] = float(loss_pair.detach())
     logs["pairs"] = float(pidx.numel()) if pidx is not None else 0.0
 
+    # --- fast jacks ----------------------------------------------------------------------------
+    # the network does not see the lanes it decoded before: an explicit mask hits the previous chord by chance, and on maps
+    # it never saw its P(jack) at fast transitions was 0.27 against 0.09 in the human maps. With the reference's previous
+    # two chords, every lane code has a known outcome; P(outcome shares a lane with the previous chord) is trained against
+    # whether the map does. Any code giving a non-jack is right where the map has none (cross-entropy wants only one).
+    if weights.jack > 0:
+        loss_jack, n_pairs = jack_loss(out["lane_logits"], tc, batch["event_mask"], valid, frame_ms)
+        total = total + weights.jack * loss_jack
+        logs["jack"] = float(loss_jack.detach())
+        logs["jack_pairs"] = float(n_pairs)
+
     # --- difficulty ladder ---------------------------------------------------------------------
     # every moment that any map of the song has (+-1 frame): mapped at star rating s_k or not, for each of the song's maps
     # -> sigma(importance - theta(s_k)); strong hits end up important at every difficulty, fills only at the hard ones
@@ -220,3 +234,45 @@ def crop_metrics(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], t
         bits = (batch["event_mask"].unsqueeze(-1) >> torch.arange(4, device=tc.device)) & 1
         res["chord_acc"] = (out["chord_logits"].argmax(dim=-1)[true_ev] == (bits.sum(-1)[true_ev] - 1)).float().mean().item()
     return res
+
+
+_LANE_TABLE_T: Dict[str, torch.Tensor] = {}
+
+
+def jack_loss(lane_logits: torch.Tensor, tc: torch.Tensor, event_mask: torch.Tensor, valid: torch.Tensor, frame_ms: int,
+              jack_ms: float = 160.0):
+    """BCE of P(lane code -> chord sharing a lane with the previous chord) on events less than ``jack_ms`` after the
+    previous one, given the reference's previous two chords (see compute_losses)."""
+    from .params import LANE_TABLE
+
+    key = str(lane_logits.device)
+    if key not in _LANE_TABLE_T:
+        _LANE_TABLE_T[key] = torch.from_numpy(LANE_TABLE.astype(np.int64)).to(lane_logits.device)
+    table = _LANE_TABLE_T[key]                                            # [16, 16, C]
+    rows, cur, prev, prev2 = [], [], [], []
+    tc_c, em_c, va_c = tc.cpu().numpy(), event_mask.cpu().numpy(), valid.cpu().numpy()
+    for b in range(tc_c.shape[0]):
+        fr = np.flatnonzero(tc_c[b] > 0)
+        if fr.size < 3:
+            continue
+        ms = fr * frame_ms + tc_c[b, fr] - 1
+        i = np.arange(2, fr.size)
+        keep = (ms[i] - ms[i - 1] < jack_ms) & (va_c[b, fr[i]] > 0) & (em_c[b, fr[i - 1]] > 0) & (em_c[b, fr[i]] > 0)
+        i = i[keep]
+        rows += [(b, int(f)) for f in fr[i]]
+        cur += list(em_c[b, fr[i]])
+        prev += list(em_c[b, fr[i - 1]])
+        prev2 += list(em_c[b, fr[i - 2]])
+    if not rows:
+        return lane_logits.float().sum() * 0.0, 0
+    dev = lane_logits.device
+    bi = torch.tensor([r[0] for r in rows], device=dev)
+    fi = torch.tensor([r[1] for r in rows], device=dev)
+    p = torch.tensor(prev, device=dev, dtype=torch.int64) & 15
+    p2 = torch.tensor(prev2, device=dev, dtype=torch.int64) & 15
+    y = ((torch.tensor(cur, device=dev, dtype=torch.int64) & p) > 0).float()
+    res = table[p, p2]                                                    # [N, C] resulting masks (0 = invalid code)
+    prob = torch.softmax(lane_logits[bi, fi].float(), dim=-1) * (res > 0).float()
+    prob = prob / prob.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    q = (prob * ((res & p.unsqueeze(-1)) > 0).float()).sum(dim=-1).clamp(1e-6, 1 - 1e-6)
+    return F.binary_cross_entropy(q, y), len(rows)
