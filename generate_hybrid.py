@@ -178,6 +178,9 @@ def main(argv=None) -> None:
                     help="with --fit_sr: a phrase that repeats earlier music gets the original's rhythm and chord sizes, lanes "
                          "alternating as in the original / mirrored (as mappers do; the network alone does not keep repeats)")
     ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
+    ap.add_argument("--refine_steps", type=int, default=4,
+                    help="with --fit_sr and a model trained with the map canvas (--canvas_prob): passes of masked diffusion - "
+                         "each fixes the most confident notes, the next sees them on both sides; 1 = one pass")
     ap.add_argument("--ladder_mix", type=float, default=0.5,
                     help="with --fit_sr and a model trained with the difficulty ladder: share of 'is this moment mapped at "
                          "this star rating' (learnt from songs with several difficulties) in the event probability; 0 = off")
@@ -334,9 +337,21 @@ def main(argv=None) -> None:
                     jt = pattern_model.fast_repeat_share(target) if pattern_model is not None else None
                     lp = pattern_model.lane_prior(target) if pattern_model is not None else None
                     hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
-                    fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                          min_threshold=args.min_threshold, jack_target=jt, log=print, lane_prior=lp,
-                                          hand_run_continue=hr, repeats=song_repeats, ladder_mix=args.ladder_mix)
+                    k_th = dataclasses.replace(knobs, onset_threshold=th)
+                    fit_kw = dict(min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp, hand_run_continue=hr,
+                                  repeats=song_repeats, ladder_mix=args.ladder_mix)
+                    if args.refine_steps > 1 and getattr(predictor.model.cfg, "canvas", False):
+                        # masked diffusion: later passes see the most confident notes of the earlier ones on both sides
+                        from osu_mapper.hybrid.canvas import refine
+                        g_ = guidance
+                        out, fit = refine(
+                            lambda cv: predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv),
+                            lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
+                            out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
+                            steps=args.refine_steps, log=print, first=out)
+                    else:
+                        fit = fit_network_map(out, k_th, timing, target, args.od, log=print, **fit_kw)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
