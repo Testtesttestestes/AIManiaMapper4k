@@ -291,6 +291,22 @@ class TestLongNotes(unittest.TestCase):
                     self.assertGreater(b.start, a.end if a.ln else a.start)
 
 
+class TestConsole(unittest.TestCase):
+    def test_parse_stars(self):
+        from mapper_console import parse_stars
+        self.assertEqual(parse_stars("4"), [4.0])
+        self.assertEqual(parse_stars("2 4 6"), [2.0, 4.0, 6.0])
+        self.assertEqual(parse_stars("2,5 4"), [2.5, 4.0])      # Russian decimal comma
+        self.assertEqual(parse_stars("2,4,6"), [2.0, 4.0, 6.0])  # several commas = a list
+        self.assertEqual(parse_stars("2-5"), [2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(parse_stars("5 3 3"), [3.0, 5.0])
+
+    def test_clean_dragged_path(self):
+        from mapper_console import clean_path
+        self.assertEqual(clean_path('"C:\\osu\\Songs\\a b.osz"'), "C:\\osu\\Songs\\a b.osz")
+        self.assertEqual(clean_path("& 'C:\\a b.osz'"), "C:\\a b.osz")  # PowerShell drag and drop
+
+
 class TestPitchShift(unittest.TestCase):
     def test_chroma_rotates(self):
         from osu_mapper.hybrid.dataset import pitch_shift_features
