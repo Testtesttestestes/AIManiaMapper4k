@@ -35,7 +35,7 @@ from osu_mapper.hybrid.composer import FAMILIES, ComposerConfig, NetHints, analy
 from osu_mapper.hybrid.patterns import density_correlation, density_graph, load_default
 
 
-def main() -> None:
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("audio", nargs="?", default=None, help="audio file or template .osz/.osu")
     ap.add_argument("--template", default=None, help="template .osz / .osu / folder: its audio and timing points are used")
@@ -74,7 +74,7 @@ def main() -> None:
     ap.add_argument("--hp", type=float, default=8.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     work = Path(tempfile.mkdtemp(prefix="composer_"))
     try:

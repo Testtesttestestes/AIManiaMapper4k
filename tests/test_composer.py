@@ -153,6 +153,25 @@ class TestPatternModel(unittest.TestCase):
         self.assertAlmostEqual(float(lp[0b0010]), float(lp_m[0b0100]), places=6)  # mirrored roll is as likely
         self.assertGreater(lp[0b0010], lp[0b0100])                               # and the roll continues
 
+    def test_thin_bins_borrow_from_neighbours(self):
+        model = PatternModel.empty()
+        model.maps[:] = 0
+        model.maps[[3, 4, 9]] = [200, 150, 2]  # 9-10*: two maps only
+        w = dict(model._sr_weights(9.5))
+        self.assertAlmostEqual(sum(w.values()), 1.0)
+        self.assertAlmostEqual(w[9], 0.2)       # 2 maps of the 10 needed to trust a bin
+        self.assertAlmostEqual(w[4], 0.8)       # the rest from the nearest well-filled bin
+        self.assertEqual(model._sr_weights(3.5), [(3, 1.0)])
+
+    def test_stagger_is_not_rhythm(self):
+        model = PatternModel.empty()
+        notes = []
+        for i in range(64):  # 1/4 at 150 BPM (100 ms) with every chord split 5 ms apart
+            t = 1000 + 100 * i
+            notes += [Note(t, 0, t), Note(t + 5, 2, t + 5)]
+        model.add_map(notes, [RawTimingPoint(1000.0, 400.0)], 4.5)
+        self.assertGreaterEqual(model.event_gap_floor(4.5), 90.0)
+
     def test_save_load(self):
         model = pattern_model_from_synthetic()
         with tempfile.TemporaryDirectory() as d:
@@ -270,6 +289,22 @@ class TestLongNotes(unittest.TestCase):
                 lane.sort()
                 for a, b in zip(lane[:-1], lane[1:]):
                     self.assertGreater(b.start, a.end if a.ln else a.start)
+
+
+class TestConsole(unittest.TestCase):
+    def test_parse_stars(self):
+        from mapper_console import parse_stars
+        self.assertEqual(parse_stars("4"), [4.0])
+        self.assertEqual(parse_stars("2 4 6"), [2.0, 4.0, 6.0])
+        self.assertEqual(parse_stars("2,5 4"), [2.5, 4.0])      # Russian decimal comma
+        self.assertEqual(parse_stars("2,4,6"), [2.0, 4.0, 6.0])  # several commas = a list
+        self.assertEqual(parse_stars("2-5"), [2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(parse_stars("5 3 3"), [3.0, 5.0])
+
+    def test_clean_dragged_path(self):
+        from mapper_console import clean_path
+        self.assertEqual(clean_path('"C:\\osu\\Songs\\a b.osz"'), "C:\\osu\\Songs\\a b.osz")
+        self.assertEqual(clean_path("& 'C:\\a b.osz'"), "C:\\a b.osz")  # PowerShell drag and drop
 
 
 class TestPitchShift(unittest.TestCase):
