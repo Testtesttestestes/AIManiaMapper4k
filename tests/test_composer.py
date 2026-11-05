@@ -373,6 +373,29 @@ class TestNetworkFit(unittest.TestCase):
         out.time_probs[ev, 0] = 1.0 - p
         return out, reds, notes
 
+    def test_hedge_relaxed_only_when_rating_unreachable(self):
+        from osu_mapper.hybrid.network_fit import fit_network_map
+        from osu_mapper.hybrid.renderer import DecodeKnobs, HeadOutputs, decode_outputs
+        F = 3000
+        tp = np.zeros((F, 11), np.float32)
+        tp[:, 0] = 1.0
+        for i in range(120):                      # pairs of weak notes 50 ms apart: the hedge merges each pair
+            for f in (200 + 20 * i, 205 + 20 * i):
+                tp[f, 0], tp[f, 1] = 0.45, 0.55
+        lanes = np.zeros((F, 25), np.float32)
+        out = HeadOutputs(tp, lanes, np.zeros((F, 4), np.int64), np.full((F, 4), -9.0, np.float32), np.zeros((F, 4), np.int64),
+                          np.zeros((F, 4), np.float32))
+        reds = [RawTimingPoint(0.0, 400.0)]
+        merged = decode_outputs(out, DecodeKnobs(onset_threshold=0.15), reds)
+        kept = decode_outputs(out, DecodeKnobs(onset_threshold=0.15, hedge_ms=40, hedge_sum=1.0), reds)
+        self.assertLess(len(merged), len(kept))
+        sr_m, sr_k = star_rating(merged, reds), star_rating(kept, reds)
+        easy = fit_network_map(out, DecodeKnobs(), reds, sr_m, min_threshold=0.15, fix_lag=False)
+        self.assertEqual(len(easy.notes), len(merged))          # reachable: hedge untouched
+        hard = fit_network_map(out, DecodeKnobs(), reds, sr_k, min_threshold=0.15, fix_lag=False)
+        self.assertGreater(len(hard.notes), len(merged))        # unreachable with the hedge: pairs kept apart
+        self.assertLess(abs(hard.star_rating - sr_k), abs(sr_m - sr_k))
+
     def test_fit_reaches_rating_without_new_notes(self):
         from osu_mapper.hybrid.network_fit import fit_network_map
         from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs
