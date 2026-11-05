@@ -42,6 +42,7 @@ N_DIV = len(DIV_CLASSES)
 DIV_TICKS_PER_BEAT = np.array([1, 1, 2, 4, 4, 12, 1], dtype=np.float64)  # ticks of each class per beat
 POP = np.array([bin(m).count("1") for m in range(16)])
 MIN_BIN_MAPS = 10        # a star-rating bin with fewer maps is mixed with its nearest well-filled neighbour
+FAST_REPEAT_MS = 160.0   # "fast jack" limit: a gap-bin edge, so model statistics and measured maps use the same cut
 STAGGER_MS = 30          # chord-to-chord gaps below this are one chord with offset notes (or a grace note), not rhythm
 REPEAT_BIN_MS = 5
 REPEAT_BINS = 400                                          # 0..2 s
@@ -154,6 +155,9 @@ class PatternModel:
         times, masks, lns = chord_events(notes)
         if times.size < 8:
             return
+        if not hasattr(self, "_ln_shares"):
+            self._ln_shares = []
+        self._ln_shares.append((float(star_rating), float(np.mean([n.ln for n in notes])) if notes else 0.0))
         s = sr_bin(star_rating)
         self.maps[s] += 1
         reds = sorted((tp for tp in timing_points if tp.uninherited and tp.beat_len > 0), key=lambda r: r.time)
@@ -337,8 +341,37 @@ class PatternModel:
                 continue
             a = getattr(self, k, None)
             setattr(self, k, b.copy() if a is None else a + b)
-        for cache in ("_m_uni", "_m_gap", "_m_prev"):
+        for cache in ("_m_uni", "_m_gap", "_m_prev", "_overlap"):
             self.__dict__.pop(cache, None)
+
+    def with_style(self, style: "PatternModel", strength: float = 20.0) -> "PatternModel":
+        """Dataset model + the patterns of a few chosen maps ("map like this mapper").
+
+        For every star-rating bin the style counts (taken from the nearest bin the style maps cover) are scaled to
+        ``strength`` x the dataset's own count in that bin and added: the chosen maps decide what is typical (jacks,
+        chords, divisors, long notes...), the dataset still fills contexts the few style maps never show.
+        """
+        out = PatternModel.empty()
+        out.merge(self)
+        have = np.flatnonzero(style.maps > 0)
+        if have.size == 0:
+            return out
+        for k in ("lane", "chord", "rhythm_hits", "rhythm_beats", "ln") + OPTIONAL_ARRAYS:
+            src, dst = getattr(style, k, None), getattr(out, k, None)
+            if src is None or dst is None or src.shape[0] != SR_BINS:
+                continue
+            dst = dst.astype(np.float64)
+            for b in range(SR_BINS):
+                sb = int(have[np.argmin(np.abs(have - b))])
+                s_tot, d_tot = float(src[sb].sum()), float(dst[b].sum())
+                if s_tot <= 0:
+                    continue
+                scale = strength * d_tot / s_tot if d_tot > 0 else 1.0
+                dst[b] = dst[b] + scale * src[sb]
+            setattr(out, k, dst.astype(getattr(self, k).dtype if getattr(self, k, None) is not None else np.float64))
+        out.maps = self.maps + np.array([style.maps[int(have[np.argmin(np.abs(have - b))])] for b in range(SR_BINS)])
+        out.style_ln_share = getattr(style, "style_ln_share", None)
+        return out
 
     # ------------------------------------------------------------------------------------------
     def _sr_weights(self, sr: float) -> List[Tuple[int, float]]:
@@ -463,6 +496,26 @@ class PatternModel:
         if h is None:
             return None
         return float(np.searchsorted(np.cumsum(h) / h.sum(), quantile) * REPEAT_BIN_MS)
+
+    def fast_repeat_share(self, sr: float, max_gap_ms: float = FAST_REPEAT_MS) -> Optional[float]:
+        """Share of chords that repeat a lane of the previous chord less than ``max_gap_ms`` after it (fast jacks,
+        chordjacks), in real maps of this star rating: ~2-6 % in most maps, 40-65 % in chordjack maps."""
+        if not hasattr(self, "_overlap"):
+            self._overlap = ((np.arange(16)[:, None] & np.arange(16)[None, :]) > 0).astype(np.float64)  # [prev, mask]
+        num = den = 0.0
+        for b, wt in self._sr_weights(sr):
+            L = self.lane[b].astype(np.float64)              # [gap, prev, prev2, mask]
+            per_gap = L.sum(axis=2)                          # [gap, prev, mask]
+            tot = per_gap.sum()
+            if tot <= 0:
+                continue
+            lo_edges = np.concatenate([[0.0], GAP_EDGES_MS])
+            hi_edges = np.concatenate([GAP_EDGES_MS, [1e9]])
+            frac = (hi_edges <= max_gap_ms + 1e-6).astype(np.float64)  # whole gap bins (the limit is a bin edge)
+            fast = float((per_gap * self._overlap[None]).sum(axis=(1, 2)) @ frac)
+            num += wt * fast / tot
+            den += wt
+        return num / den if den > 0 else None
 
     def repeat_cdf(self, sr: float) -> Optional[np.ndarray]:
         """[REPEAT_BINS] share of lane repeats in real maps of this difficulty that are faster than each 5 ms bin."""
@@ -726,3 +779,20 @@ def format_ln_quality(q: Dict[str, np.ndarray]) -> str:
             f"| release on a press {100 * r[0]:.0f}%, free tick {100 * r[1]:.0f}%, off grid {100 * r[2]:.0f}% "
             f"| holds over 0/1/2/3/4-7/8+ chords {'/'.join(f'{100 * x:.0f}' for x in s)}% "
             f"| presses during a hold: same hand {q['hand'][0]:.1f}, other hand {q['hand'][1]:.1f}")
+
+
+def style_model_from_maps(maps: Sequence[Tuple[Sequence[Note], Sequence[RawTimingPoint], float]]) -> PatternModel:
+    """A pattern model counted over a few chosen maps (notes, timing points, star rating), see with_style."""
+    m = PatternModel.empty()
+    for notes, tps, sr in maps:
+        m.add_map(notes, tps, sr)
+    m.style_ln_share = list(getattr(m, "_ln_shares", []))
+    return m
+
+
+def style_ln_share_at(model: PatternModel, sr: float) -> Optional[float]:
+    """LN share of the style map closest to this star rating (None when no style maps were given)."""
+    shares = getattr(model, "style_ln_share", None)
+    if not shares:
+        return None
+    return float(min(shares, key=lambda x: abs(x[0] - sr))[1])

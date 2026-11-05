@@ -57,11 +57,13 @@ POP = np.array([bin(m).count("1") for m in range(16)])
 CENTROID = np.array([np.mean(LANES_OF[m]) if m else 1.5 for m in range(16)])
 
 # divisor -> metric weight of a tick (same scale as thinning.DIVISOR_STRENGTH)
-TICK_DIVISORS: Tuple[Tuple[int, float], ...] = ((1, 3.0), (2, 2.0), (4, 1.2), (3, 1.0), (6, 0.7), (8, 0.5))
-TRIPLET = {3, 6}
+TICK_DIVISORS: Tuple[Tuple[int, float], ...] = ((1, 3.0), (2, 2.0), (4, 1.2), (3, 1.0), (6, 0.7), (8, 0.5), (12, 0.4), (16, 0.25))
+TRIPLET = {3, 6, 12}
+BINARY_FINE = [4, 8, 16]
+OFF_GRID = 0             # "divisor" of a candidate that sits on an audio attack between grid ticks
 # tick divisor -> PatternModel divisor class (1/1, 1/2, 1/4, 1/3-1/6, 1/8, 1/12-1/16, off-grid)
 DIV_TO_CLASS = np.full(17, 6, dtype=np.int64)
-DIV_TO_CLASS[[1, 2, 4, 3, 6, 8, 12, 16]] = [0, 1, 2, 3, 3, 4, 5, 6]
+DIV_TO_CLASS[[1, 2, 4, 3, 6, 8, 12, 16]] = [0, 1, 2, 3, 3, 4, 5, 5]   # index 0 (OFF_GRID) stays 6
 
 FAMILIES: Tuple[str, ...] = ("stream", "stairs", "jumpstream", "handstream", "chordjack", "jack", "trill", "melodic", "ln")
 # density multiplier, chord multiplier, LN share bonus, lowest level that suits the family
@@ -94,6 +96,8 @@ class ComposerConfig:
     max_iterations: int = 16
     families: Optional[Sequence[str]] = None   # allowed pattern families (None = all)
     net_weight: float = 1.0          # weight of the network's event probability / lane prior (if given)
+    net_rhythm: float = 3.0          # how strongly the network's note probability ranks the candidates (x net_weight)
+    net_shape: float = 1.0           # 0..1: section densities from the audio intensity (0) or the network (1)
     repeat_memory: bool = True       # repeated sections reuse the earlier mapping
     mirror_repeats: Optional[bool] = None      # None = decided per repeat by the seed
     seed: int = 0
@@ -135,7 +139,8 @@ class ComposeResult:
     def plan_text(self) -> str:
         rows = []
         for i, s in enumerate(self.sections):
-            rep = (f" = repeat of {s.repeat_src_ms / 1000:.1f}s (#{s.repeat_of}, similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
+            src = f"#{s.repeat_of}, " if s.repeat_of is not None else ""
+            rep = (f" = repeat of {s.repeat_src_ms / 1000:.1f}s ({src}similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
                    if s.repeat_src_ms is not None else "")
             n = sum(1 for x in self.notes if s.start_ms <= x.start < s.end_ms)
             ramp = " build-up" if s.ramp > 0.25 else (" fade" if s.ramp < -0.25 else "")
@@ -186,6 +191,9 @@ class SongAnalysis:
     timing_points: List[RawTimingPoint]
     repeats: List[Tuple[int, int, int, float]] = field(default_factory=list)  # (start, end, source start, similarity)
     tick_audible: Optional[np.ndarray] = None  # [T] attack above median + 2 MAD of the whole track
+    tick_attack_raw: Optional[np.ndarray] = None  # [T] attack strength at every tick (raw)
+    onset_peaks: Optional[np.ndarray] = None   # ms of sharp attacks (local maxima), shifted by peak_lag
+    peak_lag: int = 0                          # how much later than the mapper's grid an attack peak comes (ms)
     flux: Optional[np.ndarray] = None          # [F] superflux onset strength (z, per song)
 
     def source_time(self, t: np.ndarray) -> np.ndarray:
@@ -330,7 +338,40 @@ def analyze_song(
     med = float(np.median(attack))
     mad = float(np.median(np.abs(attack - med))) + 1e-9
     an.tick_audible = raw > med + 2.0 * mad   # an attack clearly above the track's own noise floor
+    an.tick_attack_raw = raw
+    find_onset_peaks(an)
     return an
+
+
+def find_onset_peaks(an: SongAnalysis, window_ms: int = 10, mad_k: float = 2.0) -> None:
+    """Sharp attacks of the track at 1 ms resolution, and the lag between the grid and the attack peaks.
+
+    The peak of the energy derivative comes a few ms after the moment a mapper puts the note on, and how many ms
+    depends on the song and on the mapper (measured: -2..+8 ms). The red lines of a template were placed by the
+    mapper, so the lag is read off the strong beats: the median offset from beat/half-beat ticks with a clear attack
+    to the nearest peak. Off-grid candidates use the peaks minus that lag, consistent with the mapper's grid.
+    """
+    from scipy.ndimage import maximum_filter1d
+
+    env = an.attack_ms
+    if env.size < 100:
+        an.onset_peaks = np.zeros(0, dtype=np.int64)
+        return
+    med = float(np.median(env))
+    mad = float(np.median(np.abs(env - med))) + 1e-9
+    mx = maximum_filter1d(env, 2 * window_ms + 1)
+    peaks = np.flatnonzero((env >= mx) & (env > med + mad_k * mad)).astype(np.int64)
+    lag = 0
+    strong = an.ticks[np.isin(an.tick_div, [1, 2]) & (an.tick_audible if an.tick_audible is not None else True)]
+    if peaks.size > 1 and strong.size >= 30:
+        j = np.clip(np.searchsorted(peaks, strong), 1, peaks.size - 1)
+        a, b = peaks[j] - strong, peaks[j - 1] - strong
+        d = np.where(np.abs(a) < np.abs(b), a, b)
+        d = d[np.abs(d) <= 15]
+        if d.size >= 30:
+            lag = int(round(float(np.median(d))))
+    an.peak_lag = lag
+    an.onset_peaks = peaks - lag
 
 
 # ----------------------------------------------------------------------------------------------
@@ -418,7 +459,7 @@ def _describe_sections(an: SongAnalysis, sections: List[Section], V: np.ndarray)
         p = an.pitch[f0:f1:5]
         s.pitch_motion = float(np.mean(np.abs(np.diff(p)) > 0.5)) if p.size > 2 else 0.0
         trip = sel & np.isin(an.tick_div, list(TRIPLET))
-        binary = sel & np.isin(an.tick_div, [4, 8])
+        binary = sel & np.isin(an.tick_div, BINARY_FINE)
         a_t = an.tick_attack[trip].mean() if trip.any() else 0.0
         a_b = an.tick_attack[binary].mean() if binary.any() else 0.0
         s.triplet = bool(a_t > a_b + 0.06)
@@ -501,6 +542,7 @@ class NetHints:
     chord_logprobs: Optional[np.ndarray]
     ln_prob: Optional[np.ndarray]    # [F] max member LN probability
     ln_len_ms: Optional[np.ndarray] = None  # [F] LN length the network predicts (it hears how long a sound lasts)
+    lag_ms: int = 0                          # how much later than the mapper's grid the network's milliseconds come
 
     @classmethod
     def from_outputs(cls, out) -> "NetHints":
@@ -512,13 +554,38 @@ class NetHints:
             ln_len = ln_bucket_to_length(out.ln_bucket[:, 0], out.ln_resid[:, 0]).astype(np.int64)
         return cls(1.0 - tp[:, 0], np.argmax(tp[:, 1:], axis=1), out.lane_logits, out.chord_logprobs, ln, ln_len)
 
-    def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15) -> np.ndarray:
+    def calibrate_lag(self, ticks: np.ndarray, tick_div: np.ndarray, frame_ms: int) -> None:
+        """Per-song offset of the network's predicted milliseconds against the template's grid: median distance from
+        confident network events to the nearest beat / half-beat tick. Measured: 0 on most songs, but on some audio the
+        network's milliseconds are shifted (Exit This Earth's Atomosphere: 61 % of the old decoder's notes off-grid), and
+        a candidate weighting by the distance to the predicted ms then prefers the wrong neighbouring tick."""
+        pe = self.p_event
+        fr = np.flatnonzero((pe >= 0.5) & (pe >= np.roll(pe, 1)) & (pe >= np.roll(pe, -1)))
+        strong = np.sort(ticks[np.isin(tick_div, [1, 2])])
+        if fr.size < 30 or strong.size < 30:
+            return
+        ms = fr * frame_ms + self.offset_ms[fr]
+        j = np.clip(np.searchsorted(strong, ms), 1, strong.size - 1)
+        a, b = ms - strong[j], ms - strong[j - 1]
+        d = np.where(np.abs(a) < np.abs(b), a, b)
+        d = d[np.abs(d) <= 20]
+        if d.size >= 30:
+            self.lag_ms = int(round(float(np.median(d))))
+
+    def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15, sigma_ms: float = 4.0) -> np.ndarray:
+        """Network note probability AT a candidate time: the probability of each nearby frame, weighted by how far the
+        candidate is from the millisecond the network predicts inside that frame. Neighbouring 1/16 ticks are 30 ms
+        apart at 125 BPM - a plain max over +-15 ms gave both the same probability and lost the network's timing."""
         F = self.p_event.size
-        f = np.asarray(t, dtype=np.int64) // frame_ms
-        r = max(1, radius_ms // frame_ms)
-        out = np.zeros(f.shape)
+        t = np.asarray(t, dtype=np.int64)
+        f = t // frame_ms
+        r = max(1, int(math.ceil(radius_ms / frame_ms)))
+        out = np.zeros(t.shape)
         for d in range(-r, r + 1):
-            out = np.maximum(out, self.p_event[np.clip(f + d, 0, F - 1)])
+            ff = np.clip(f + d, 0, F - 1)
+            ms = ff * frame_ms + self.offset_ms[ff] - self.lag_ms
+            w = np.exp(-0.5 * ((t - ms) / sigma_ms) ** 2)
+            out = np.maximum(out, self.p_event[ff] * w)
         return out
 
 
@@ -536,6 +603,42 @@ def _level_params(L: float) -> Tuple[float, float, float]:
     gap = 420.0 * (38.0 / 420.0) ** min(1.0, L)
     chord = min(0.92, 0.02 + 0.55 * L ** 1.4)
     return eps, gap, chord
+
+
+def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, gaps: np.ndarray) -> List[int]:
+    """Lazy greedy selection of ``budget`` candidates by score. A candidate close to already chosen notes is not
+    forbidden, its score just drops the closer it gets (``gaps`` = comfortable gap per candidate); the budget alone sets
+    the density, so the star rating changes smoothly with the level instead of jumping when the gap crosses the song's
+    1/4 spacing. Two notes closer than 20 ms are one note."""
+    import heapq
+
+    heap = [(-float(sc[q]), q) for q in range(idx.size)]
+    heapq.heapify(heap)
+    taken: List[int] = []
+    taken_t = np.empty(0, dtype=np.int64)
+
+    def penalty(tk: int, g: float) -> float:
+        if not taken_t.size:
+            return 0.0
+        p = int(np.searchsorted(taken_t, tk))
+        d = min(taken_t[p] - tk if p < taken_t.size else 10 ** 9, tk - taken_t[p - 1] if p > 0 else 10 ** 9)
+        if d < 20:
+            return 1e9
+        return 12.0 * max(0.0, 1.0 - d / g) ** 1.5
+
+    while heap and len(taken) < budget:
+        _, q = heapq.heappop(heap)
+        tk = int(t[idx[q]])
+        cur = float(sc[q]) - penalty(tk, float(gaps[q]))
+        if heap and cur < -heap[0][0] - 1e-9:
+            if cur > -1e8:
+                heapq.heappush(heap, (-cur, q))
+            continue
+        if cur <= -1e8:
+            continue
+        taken_t = np.insert(taken_t, int(np.searchsorted(taken_t, tk)), tk)
+        taken.append(int(idx[q]))
+    return taken
 
 
 def _jack_min(L: float) -> float:
@@ -568,6 +671,7 @@ class Composer:
         self.an, self.sections, self.cfg, self.hints, self.log = an, sections, cfg, hints, log
         self.patterns = patterns          # learned PatternModel (patterns.py) or None
         self.chord_boost = 1.0            # > 1 when the density alone cannot reach the requested star rating
+        self.repeat_scale = 1.0           # strength of the lane-repeat (jack / anchor) penalties, calibrated to the data
         self.target_sr = float(target_sr)
         self._candidates()
 
@@ -589,11 +693,12 @@ class Composer:
         div = an.tick_div.copy()
         net = np.zeros(t.size)
         if self.hints is not None:
+            self.hints.calibrate_lag(an.ticks, an.tick_div, H)
             net = self.hints.p_at(t, H)
             # confident network events far from every tick (off-grid notes, wrong tempo estimate)
             pe = self.hints.p_event
             peaks = np.flatnonzero((pe >= 0.5) & (pe >= np.roll(pe, 1)) & (pe >= np.roll(pe, -1)))
-            et = peaks * H + self.hints.offset_ms[peaks]
+            et = peaks * H + self.hints.offset_ms[peaks] - self.hints.lag_ms
             if t.size:
                 pos = np.clip(np.searchsorted(t, et), 1, t.size - 1)
                 dist = np.minimum(np.abs(t[pos] - et), np.abs(t[pos - 1] - et))
@@ -602,8 +707,26 @@ class Composer:
                 t = np.concatenate([t, et])
                 metric = np.concatenate([metric, np.full(et.size, 0.3)])
                 attack = np.concatenate([attack, _rank01(an.attack_at(et))])
-                div = np.concatenate([div, np.full(et.size, 16)])
+                div = np.concatenate([div, np.full(et.size, OFF_GRID)])
                 net = np.concatenate([net, pe[et // H]])
+                o = np.argsort(t, kind="stable")
+                t, metric, attack, div, net = t[o], metric[o], attack[o], div[o], net[o]
+        # sharp audio attacks between grid ticks (glitch, fills, humanized playing): candidates at the attack's own
+        # millisecond, shifted by the song's grid-vs-attack lag (how the mapper's red line sits on the attacks)
+        if an.onset_peaks is not None and an.onset_peaks.size and t.size:
+            pk = an.onset_peaks
+            pos = np.clip(np.searchsorted(t, pk), 1, t.size - 1)
+            dist = np.minimum(np.abs(t[pos] - pk), np.abs(t[pos - 1] - pk))
+            pk = pk[dist > 6]
+            if pk.size:
+                raw_ticks = np.sort(an.tick_attack_raw) if an.tick_attack_raw is not None else None
+                raw = an.attack_at(pk + an.peak_lag)
+                att = np.searchsorted(raw_ticks, raw) / max(1, raw_ticks.size) if raw_ticks is not None else _rank01(raw)
+                t = np.concatenate([t, pk])
+                metric = np.concatenate([metric, np.full(pk.size, 0.2)])
+                attack = np.concatenate([attack, att])
+                div = np.concatenate([div, np.full(pk.size, OFF_GRID)])
+                net = np.concatenate([net, self.hints.p_at(pk, H) if self.hints is not None else np.zeros(pk.size)])
                 o = np.argsort(t, kind="stable")
                 t, metric, attack, div, net = t[o], metric[o], attack[o], div[o], net[o]
         self.t, self.metric, self.attack, self.div, self.net = t, metric, attack, div, net
@@ -706,7 +829,19 @@ class Composer:
                     lo = e
                 else:
                     hi = e
-        self._shape = shape_for(e * self.cfg.contrast)
+        shape = shape_for(e * self.cfg.contrast)
+        w = float(np.clip(self.cfg.net_shape * self.cfg.net_weight, 0.0, 1.0)) if self.hints is not None else 0.0
+        if w > 0:
+            # the network's expected number of notes per section: on real songs its density graph follows the mapper's
+            # far better than the audio intensity does (Poisoned Bathwater: 0.94 vs 0.75)
+            H = self.an.frame_ms
+            pe = self.hints.p_event
+            dens = np.array([float(pe[s.start_ms // H: max(s.start_ms // H + 1, s.end_ms // H)].mean()) for s in self.sections])
+            net_shape = np.maximum(dens, 1e-4) ** self.cfg.contrast
+            net_shape = net_shape / max(1e-6, (net_shape * dur).sum() / dur.sum())
+            shape = np.where(shape > 0, shape, 1e-3) ** (1.0 - w) * net_shape ** w
+            shape = shape / max(1e-6, (shape * dur).sum() / dur.sum())
+        self._shape = shape
         return self._shape
 
     # --- rhythm (which candidates become events) ---------------------------------------------------
@@ -717,7 +852,11 @@ class Composer:
         w_net = cfg.net_weight if self.hints is not None else 0.0
         # simple rhythms first on easy levels, audio decides on hard ones
         w_metric = 0.55 * (1.2 - min(1.0, L))
-        base = 1.6 * self.attack + w_metric * self.metric / 4.0 + 1.4 * w_net * self.net
+        base = 1.6 * self.attack + w_metric * self.metric / 4.0
+        if self.hints is not None:
+            # the network knows which sounds mappers map: its note probability ranks the candidates first
+            q = np.clip(self.net, 0.02, 0.98)
+            base = base + cfg.net_rhythm * w_net * np.log(q / (1.0 - q))
         if self.patterns is not None:
             # how often real maps of this difficulty put a note on a tick of this divisor
             use = self.patterns.tick_usage(self.target_sr)
@@ -728,6 +867,8 @@ class Composer:
         chosen = np.zeros(t.size, dtype=bool)
         sec_of = self.sec_of
         chosen_t: List[np.ndarray] = []  # times chosen so far (sections are processed in order)
+        groups = []
+        global_pick = self.hints is not None and cfg.net_shape * cfg.net_weight >= 0.5
         for si, s in enumerate(self.sections):
             idx = np.flatnonzero(sec_of == si)
             if idx.size == 0 or shape[si] <= 0:
@@ -743,10 +884,11 @@ class Composer:
             sc = base[idx].copy()
             sc = sc + 0.8 * s.ramp * self.pos[idx] + 0.5 * self.energy[idx]
             div = self.div[idx]
-            if s.triplet:
-                sc[np.isin(div, [4, 8])] -= 0.8
-            else:
-                sc[np.isin(div, list(TRIPLET))] -= 0.8
+            # binary vs triplet feel of the section; where the network is sure about a note of the other kind (a 1/12
+            # fill in a straight section), it wins
+            other = np.isin(div, BINARY_FINE) if s.triplet else np.isin(div, list(TRIPLET))
+            sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
+            sc = sc - 0.8 * other * (1.0 - sure)
             if cfg.repeat_memory and chosen_t and self.an.repeats:
                 # remember the rhythm of the earlier occurrence of a repeated phrase
                 src = np.sort(np.concatenate(chosen_t))
@@ -755,43 +897,24 @@ class Composer:
                     pos = np.clip(np.searchsorted(src, rel), 1, max(1, src.size - 1))
                     d = np.minimum(np.abs(src[np.minimum(pos, src.size - 1)] - rel), np.abs(src[pos - 1] - rel))
                     sc = sc + 1.2 * ((d <= 6) & (rel >= 0))
-            g = gap
-            if s.family in ("chordjack", "jack"):
-                g = gap * 1.25
-            # lazy greedy: a candidate close to already chosen notes is not forbidden, its score just drops the
-            # closer it gets (g = comfortable gap of this level); the budget alone sets the density, so the star
-            # rating changes smoothly with the level instead of jumping when g crosses the song's 1/4 spacing
-            import heapq
-            heap = [(-float(sc[q]), int(k)) for q, k in enumerate(idx)]
-            heapq.heapify(heap)
-            score_of = {int(k): float(sc[q]) for q, k in enumerate(idx)}
-            taken: List[int] = []
-            taken_t = np.empty(0, dtype=np.int64)
-
-            def penalty(tk: int) -> float:
-                if not taken_t.size:
-                    return 0.0
-                p = int(np.searchsorted(taken_t, tk))
-                d = min(taken_t[p] - tk if p < taken_t.size else 10 ** 9, tk - taken_t[p - 1] if p > 0 else 10 ** 9)
-                if d < 20:
-                    return 1e9  # two notes this close are one note
-                return 3.0 * max(0.0, 1.0 - d / g) ** 1.5 * 4.0
-
-            while heap and len(taken) < budget:
-                neg, k = heapq.heappop(heap)
-                tk = int(t[k])
-                cur = score_of[k] - penalty(tk)
-                if heap and cur < -heap[0][0] - 1e-9:
-                    if cur > -1e8:
-                        heapq.heappush(heap, (-cur, k))
-                    continue
-                if cur <= -1e8:
-                    continue
-                p = int(np.searchsorted(taken_t, tk))
-                taken_t = np.insert(taken_t, p, tk)
-                taken.append(int(k))
+            g = gap * (1.25 if s.family in ("chordjack", "jack") else 1.0)
+            gv = np.full(idx.size, g)
+            if self.hints is not None:
+                # a note the network is sure about may sit closer to its neighbours (real 1/8 and 1/16 runs)
+                gv = gv * (1.0 - 0.8 * np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net))
+            groups.append((idx, sc, budget, gv))
+            if not global_pick:
+                taken = _greedy_pick(t, idx, sc, budget, gv)
+                chosen[taken] = True
+                chosen_t.append(t[taken])
+        if global_pick and groups:
+            # with a network the whole song is one pool: the network decides WHERE the notes go (its density shape
+            # is already in the section budgets), per-section quotas would move notes away from where it wants them
+            idx = np.concatenate([g_[0] for g_ in groups])
+            sc = np.concatenate([g_[1] for g_ in groups])
+            gv = np.concatenate([g_[3] for g_ in groups])
+            taken = _greedy_pick(t, idx, sc, int(sum(g_[2] for g_ in groups)), gv)
             chosen[taken] = True
-            chosen_t.append(t[taken])
         ev = np.flatnonzero(chosen)
         # two notes closer than 20 ms across a section border are one note
         keep = np.ones(ev.size, dtype=bool)
@@ -868,6 +991,8 @@ class Composer:
                 ok = np.abs(t[pos] - mids) <= 4
                 strong = (self.attack[pos] >= 0.72 - 0.15 * max(0.0, s.ramp) - 0.05 * self.cfg.creativity) & self.audible[pos]
                 want = ok & strong
+                if self.hints is not None:
+                    want = want & (self.net[pos] >= 0.35)  # with a network: only where it hears a note too
                 # take the longest stretch of consecutive wanted fills, at most 2 beats
                 best_a = best_b = cur = 0
                 for q in range(want.size):
@@ -1049,15 +1174,15 @@ class Composer:
                         # repeats rarer in real maps of this SR than the 5% fastest cost more the rarer they are
                         q = float(rep_cdf[min(rep_cdf.size - 1, int(since) // 5)])
                         if q < 0.05:
-                            v -= 3.0 * (0.05 - q) / 0.05
+                            v -= self.repeat_scale * 3.0 * (0.05 - q) / 0.05
                     if since < jack_min:
                         allowed_jack = (fam == "jack" and same_sound) or (fam == "chordjack" and since >= 0.7 * jack_min)
-                        v -= 1.0 if allowed_jack else (6.0 * (1.0 - since / jack_min) + 2.0) * (1.0 - 0.5 * cfg.creativity)
+                        v -= self.repeat_scale * (1.0 if allowed_jack else (6.0 * (1.0 - since / jack_min) + 2.0) * (1.0 - 0.5 * cfg.creativity))
                 lh = sum(1 for c in lanes if c < 2)
                 rh = len(lanes) - lh
                 v -= 0.6 * max(0.0, (load[0] + lh) - (load[1] + rh)) ** 2 / 8.0 + 0.6 * max(0.0, (load[1] + rh) - (load[0] + lh)) ** 2 / 8.0
                 if len(hist) >= 3 and sum(1 for h in hist[-3:] if h & m) >= 3:
-                    v -= 1.5  # anchor
+                    v -= 1.5 * self.repeat_scale  # anchor
                 if k == 2 and m in (0b0011, 0b1100) and fam not in ("chordjack", "handstream"):
                     v -= 0.3
                 v_before_family = v
@@ -1375,7 +1500,16 @@ def pattern_entropy(notes: Sequence[Note]) -> float:
     return float(-(p * np.log2(p)).sum())
 
 
-def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis) -> Tuple[float, Dict[str, float]]:
+def fast_jack_share(notes: Sequence[Note], jack_ms: float = 160.0) -> float:
+    """Share of chords that repeat a lane of the previous chord less than ``jack_ms`` after it."""
+    from .ergonomics import ergonomics_report
+    return float(ergonomics_report(notes, jack_ms=jack_ms).get("fast_jack_pct", 0.0)) / 100.0
+
+
+def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis,
+           jack_target: Optional[float] = None) -> Tuple[float, Dict[str, float]]:
+    """Score of a composed variant. Jacks are judged against what real maps (or the chosen style) do at this star
+    rating: a chordjack style wants jacks, a stream style does not; without data, fewer jacks are better."""
     from .ergonomics import ergonomics_report
 
     if not notes:
@@ -1384,7 +1518,12 @@ def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis) ->
     ent = pattern_entropy(notes)
     starts = np.array([n.start for n in notes])
     on_attack = float(np.mean(an.attack_at(starts) > np.percentile(an.attack_ms, 75)))
-    score = (-20.0 * max(0.0, abs(sr - target) - 0.02) - 0.04 * er.get("fast_jack_pct", 0.0) - 0.25 * max(0.0, er.get("max_one_hand_run", 0.0) - 6)
+    jack_pct = er.get("fast_jack_pct", 0.0)
+    if jack_target is not None:
+        jack_term = 8.0 * abs(fast_jack_share(notes) - jack_target)  # same 160 ms cut as the model statistics
+    else:
+        jack_term = 0.04 * jack_pct
+    score = (-20.0 * max(0.0, abs(sr - target) - 0.02) - jack_term - 0.25 * max(0.0, er.get("max_one_hand_run", 0.0) - 6)
              - 1.5 * er.get("hand_imbalance", 0.0) + 0.35 * min(ent, 7.0) + 1.0 * on_attack)
     return float(score), {"pattern_entropy": ent, "on_attack": on_attack, **er}
 
@@ -1402,12 +1541,15 @@ def compose(
     cfg = cfg or ComposerConfig()
     secs = sections if sections is not None else segment_sections(an)
     comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr)
+    # how often real maps (or the chosen style) repeat a lane within 150 ms at this star rating
+    jack_target = patterns.fast_repeat_share(target_sr) if (patterns is not None and hasattr(patterns, "fast_repeat_share")) else None
     best: Optional[ComposeResult] = None
     best_score = -float("inf")
     for v in range(max(1, cfg.variants)):
         seed = cfg.seed * 1000 + v
         lo, hi = 0.0, LEVEL_MAX
         comp.chord_boost = 1.0
+        comp.repeat_scale = 1.0
         cache: Dict[float, Tuple[float, List[Note]]] = {}
 
         plan_level = float(np.clip(0.15 * target_sr + 0.17, 0.0, 1.6))  # typical level of this SR (measured on real songs)
@@ -1458,15 +1600,63 @@ def compose(
                 else:
                     b_hi = b
             _, comp.chord_boost, sr, notes = best_b
+        if jack_target is not None:
+            L, sr, notes = _calibrate_repeats(comp, an, cfg, L, sr, notes, seed, plan_level, target_sr, jack_target)
         comp.plan_families(plan_level, np.random.default_rng(seed + 7))
-        score, rep = critic(notes, sr, target_sr, an)
-        rep.update({"level": L, "variant": v, "critic": score, "chord_boost": comp.chord_boost})
+        score, rep = critic(notes, sr, target_sr, an, jack_target)
+        rep.update({"level": L, "variant": v, "critic": score, "chord_boost": comp.chord_boost,
+                    "repeat_scale": comp.repeat_scale, "jack_target": jack_target})
         log(f"    variant {v + 1}/{cfg.variants}: level {L:.3f} -> {len(notes)} notes, SR {sr:.2f} | "
             f"patterns {rep.get('pattern_entropy', 0):.2f} bits | on attacks {100 * rep.get('on_attack', 0):.0f}% | "
-            f"fast jacks {rep.get('fast_jack_pct', 0):.1f}% | critic {score:.2f}")
+            f"fast jacks {rep.get('fast_jack_pct', 0):.1f}%"
+            + (f" (real maps {100 * jack_target:.1f}%)" if jack_target is not None else "") + f" | critic {score:.2f}")
         if score > best_score:
             best_score = score
             import copy as _copy
             best = ComposeResult(notes=notes, star_rating=sr, level=L, sections=_copy.deepcopy(comp.sections), report=rep)
     assert best is not None
     return best
+
+
+def _calibrate_repeats(comp: "Composer", an: SongAnalysis, cfg: ComposerConfig, L: float, sr: float, notes: List[Note],
+                       seed: int, plan_level: float, target_sr: float, jack_target: float):
+    """Sets the strength of the jack / anchor penalties so that the share of fast lane repeats matches the data (the
+    dataset at this star rating, or the chosen style: a chordjack mapper's 60 % as well as a stream mapper's 2 %).
+    The level is re-searched after every change, since jacks change the star rating."""
+    rate = fast_jack_share(notes)
+    if abs(rate - jack_target) <= 0.02:
+        return L, sr, notes
+
+    def search(L0: float):
+        lo, hi = max(0.0, L0 - 0.25), min(LEVEL_MAX, L0 + 0.25)
+        best = None
+        Lc = L0
+        for _ in range(7):
+            n_ = comp.render(Lc, seed, plan_level)
+            s_ = star_rating(n_, an.timing_points, cfg.od)
+            if best is None or abs(s_ - target_sr) < abs(best[1] - target_sr):
+                best = (Lc, s_, n_)
+            if abs(s_ - target_sr) <= cfg.sr_tolerance:
+                break
+            lo, hi = (Lc, hi) if s_ < target_sr else (lo, Lc)
+            Lc = 0.5 * (lo + hi)
+        return best
+
+    best = (abs(rate - jack_target) + 2.0 * max(0.0, abs(sr - target_sr) - cfg.sr_tolerance), 1.0, L, sr, notes)
+    lo, hi = math.log(0.02), math.log(6.0)   # more penalty = fewer jacks
+    for _ in range(6):
+        mid = 0.5 * (lo + hi)
+        comp.repeat_scale = math.exp(mid)
+        Lm, srm, nm = search(L)
+        r = fast_jack_share(nm)
+        err = abs(r - jack_target) + 2.0 * max(0.0, abs(srm - target_sr) - cfg.sr_tolerance)
+        if err < best[0]:
+            best = (err, comp.repeat_scale, Lm, srm, nm)
+        if abs(r - jack_target) <= 0.02:
+            break
+        if r > jack_target:
+            lo = mid
+        else:
+            hi = mid
+    _, comp.repeat_scale, L, sr, notes = best
+    return L, sr, notes

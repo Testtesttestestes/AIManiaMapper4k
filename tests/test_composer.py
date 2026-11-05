@@ -172,6 +172,24 @@ class TestPatternModel(unittest.TestCase):
         model.add_map(notes, [RawTimingPoint(1000.0, 400.0)], 4.5)
         self.assertGreaterEqual(model.event_gap_floor(4.5), 90.0)
 
+    def test_style_model_dominates(self):
+        base = pattern_model_from_synthetic()
+        style = PatternModel.empty()
+        jacks = []
+        for i in range(200):  # a chordjack map: the same [12] chord again and again
+            t = 1000 + 150 * i
+            jacks += [Note(t, 0, t), Note(t, 1, t)]
+        from osu_mapper.hybrid.patterns import style_ln_share_at, style_model_from_maps
+        style = style_model_from_maps([(jacks, [RawTimingPoint(1000.0, 600.0)], 3.5)])
+        mixed = base.with_style(style, 20.0)
+        self.assertGreater(mixed.fast_repeat_share(3.5), 0.8)            # the style's jack rate becomes the target
+        lp_base = base.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
+        lp_mix = mixed.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
+        self.assertGreater(lp_mix[0b0011], lp_base[0b0011])          # the chord jack became typical
+        self.assertEqual(int(np.argmax(lp_mix)), 0b0011)
+        self.assertEqual(style_ln_share_at(mixed, 3.5), 0.0)
+        self.assertAlmostEqual(float(mixed.chord_marginal(3.5)[1]), 1.0, delta=0.25)
+
     def test_save_load(self):
         model = pattern_model_from_synthetic()
         with tempfile.TemporaryDirectory() as d:
@@ -221,6 +239,19 @@ class TestComposer(unittest.TestCase):
         res = compose(an, 3.0, ComposerConfig(variants=1, sr_tolerance=0.1), log=lambda *_: None)
         self.assertLessEqual(abs(res.star_rating - 3.0), 0.15)
         self._check_playable(res.notes)
+
+    def test_every_sound_has_a_candidate(self):
+        # grid ticks down to 1/16 plus attack peaks between ticks: a note can be put on any audible event,
+        # including the humanized (+-3 ms off-grid) leads of the synthetic songs
+        feats, slices, reds, dur, events = song(21)
+        an = analyze_song(feats, slices, reds, dur)
+        self.assertLessEqual(abs(an.peak_lag), 12)
+        comp = Composer(an, segment_sections(an), ComposerConfig(), None, lambda *_: None, target_sr=3.0)
+        heard = np.array(sorted({e.time_ms for e in events}))
+        cand = np.sort(comp.t)
+        j = np.clip(np.searchsorted(cand, heard), 1, cand.size - 1)
+        d = np.minimum(np.abs(cand[j] - heard), np.abs(cand[j - 1] - heard))
+        self.assertGreater(float((d <= 5).mean()), 0.95)
 
     def test_notes_land_on_attacks(self):
         feats, slices, reds, dur, events = song(21)
