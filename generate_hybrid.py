@@ -174,6 +174,9 @@ def main(argv=None) -> None:
                          "red lines, only as many lanes are re-assigned as needed for the share of fast jacks real maps of this "
                          "SR have, then the event threshold is moved until the star rating matches (never below --min_threshold, "
                          "so no notes on silence). off: one threshold, the star rating is whatever comes out")
+    ap.add_argument("--repeat_memory", default="on", choices=["on", "off"],
+                    help="with --fit_sr: a phrase that repeats earlier music gets the original's rhythm and chord sizes, lanes "
+                         "alternating as in the original / mirrored (as mappers do; the network alone does not keep repeats)")
     ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
     ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
@@ -307,6 +310,13 @@ def main(argv=None) -> None:
 
         sr_hi = float(predictor.sr_range[2]) if getattr(predictor, "sr_range", None) else 8.0
         guidances = [float(x) for x in str(args.sr_guidance).replace(" ", "").split(",") if x] or [1.0]
+        song_repeats = None
+        if args.fit_sr == "on" and args.repeat_memory == "on":
+            from osu_mapper.hybrid.composer import analyze_song, segment_sections
+            an = analyze_song(inputs.feats, fcfg.slices(), timing, inputs.duration_ms, fcfg.frame_ms)
+            segment_sections(an)  # finds the repeated phrases
+            song_repeats = [r for r in an.repeats if r[3] >= 0.9]
+            print(f"[repeats] {len(song_repeats)} repeated phrases (4 bars, similarity >= 0.9) mapped like their originals")
         for target, guidance in [(t, g) for t in parse_sr_list(args.sr) for g in guidances]:
             if target > sr_hi:
                 print(f"[warn] star rating {target:g} is outside what the model was trained on (up to ~{sr_hi:g}*): "
@@ -323,7 +333,7 @@ def main(argv=None) -> None:
                     hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
                     fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                           min_threshold=args.min_threshold, jack_target=jt, log=print, lane_prior=lp,
-                                          hand_run_continue=hr)
+                                          hand_run_continue=hr, repeats=song_repeats)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
@@ -336,7 +346,7 @@ def main(argv=None) -> None:
                                                      sr_guidance=g2, style_guidance=args.style_guidance)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                                    min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp,
-                                                   hand_run_continue=hr)
+                                                   hand_run_continue=hr, repeats=song_repeats)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
                                 print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
                                 fit, out = fit2, out2
