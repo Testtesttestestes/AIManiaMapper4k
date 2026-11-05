@@ -191,6 +191,7 @@ class HybridCropDataset(Dataset):
         sr_balance: float = 0.0,
         derived_weight: float = 0.3,
         pair_prob: float = 0.0,
+        pitch_shift_prob: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -200,6 +201,7 @@ class HybridCropDataset(Dataset):
         self.train = train
         self.seed = seed
         self.augment = augment and train
+        self.pitch_shift_prob = float(pitch_shift_prob) if self.augment else 0.0
         self.epoch = 0
         self.tracks = [SparseTrack(index.track(i)) for i in self.map_indices]
         self.entries = [index.maps[i] for i in self.map_indices]
@@ -305,6 +307,8 @@ class HybridCropDataset(Dataset):
         return item
 
     def _augment(self, feats: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        if self.pitch_shift_prob > 0 and rng.random() < self.pitch_shift_prob:
+            feats = pitch_shift_features(feats, self.slices, int(rng.choice([-2, -1, 1, 2])))
         for name, (s0, s1) in self.slices.items():
             if rng.random() < 0.5:
                 feats[:, s0:s1] = feats[:, s0:s1] * rng.uniform(0.85, 1.15) + rng.uniform(-0.25, 0.25)
@@ -315,6 +319,44 @@ class HybridCropDataset(Dataset):
         if rng.random() < 0.5:
             feats += rng.normal(0.0, 0.05, size=feats.shape).astype(np.float32)
         return feats
+
+
+def pitch_shift_features(feats: np.ndarray, slices: Dict[str, Tuple[int, int]], semitones: int) -> np.ndarray:
+    """Transposes the pitch-aware representations by a few semitones (the map stays the same).
+
+    A transposed song needs the same rhythm and the same patterns, but it no longer matches the memorized
+    spectrum of a training song: this is the cheapest way to stop the network from recognizing songs (the
+    reason validation peaks after one or two epochs and then overfits). ``pitch`` (semitone bins) is shifted
+    exactly, ``chroma`` is rotated, the mel bands are shifted by the nearest number of bands.
+    """
+    if semitones == 0:
+        return feats
+    out = feats.copy()
+
+    def shift(a: int, b: int, k: int) -> None:
+        if k == 0 or b - a <= abs(k):
+            return
+        block = feats[:, a:b]
+        res = np.empty_like(block)
+        if k > 0:
+            res[:, k:] = block[:, :-k]
+            res[:, :k] = block[:, :1]
+        else:
+            res[:, :k] = block[:, -k:]
+            res[:, k:] = block[:, -1:]
+        out[:, a:b] = res
+
+    if "pitch" in slices:
+        a, b = slices["pitch"]
+        shift(a, b, semitones)
+    if "chroma" in slices:
+        a, b = slices["chroma"]
+        out[:, a:b] = np.roll(feats[:, a:b], semitones, axis=1)
+    for name, per_semitone in (("mel_fine", 0.35), ("mel_mid", 0.5)):  # mel bands are ~2-3 semitones wide
+        if name in slices:
+            a, b = slices[name]
+            shift(a, b, int(round(semitones * per_semitone)))
+    return out
 
 
 def collate_hybrid(items: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
