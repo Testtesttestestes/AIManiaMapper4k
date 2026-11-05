@@ -605,6 +605,25 @@ def _level_params(L: float) -> Tuple[float, float, float]:
     return eps, gap, chord
 
 
+def _nested_sizes(u: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Chord sizes from ranks: a 2nd note where u[:, 0] < r[:, 0], a 3rd only on those that have a 2nd and pass the 3-note
+    rank, a 4th only on 3-note chords. Independent checks gave twice the triples the data asks for (13.5 % vs 6.6 %)."""
+    two = u[:, 0] < r[:, 0]
+    # among the chords that got a 2nd note, the 3rd goes to the best of them by the 3-note rank, as many as r3 asks
+    out = 1 + two.astype(int)
+    if two.any():
+        idx = np.flatnonzero(two)
+        n3 = int(round(float(np.mean(r[:, 1])) * u.shape[0]))
+        if n3 > 0:
+            best3 = idx[np.argsort(u[idx, 1], kind="stable")[:n3]]
+            out[best3] = 3
+            n4 = int(round(float(np.mean(r[:, 2])) * u.shape[0]))
+            if n4 > 0:
+                best4 = best3[np.argsort(u[best3, 2], kind="stable")[:n4]]
+                out[best4] = 4
+    return out
+
+
 def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, gaps: np.ndarray) -> List[int]:
     """Lazy greedy selection of ``budget`` candidates by score. A candidate close to already chosen notes is not
     forbidden, its score just drops the closer it gets (``gaps`` = comfortable gap per candidate); the budget alone sets
@@ -1017,13 +1036,17 @@ class Composer:
         sizes = np.ones(ev.size, dtype=np.int64)
         # largest chord: what real maps of this star rating use (pattern model), else a level-based default
         cap = min(self.cfg.max_chord, 2 if L < 0.35 else (3 if L < 0.7 else 4))
-        accent = self.attack[ev] + 0.25 * (self.metric[ev] >= 3.0) + 0.15 * self.cfg.creativity * rng.random(ev.size)
+        accent = self.attack[ev] + 0.25 * (self.metric[ev] >= 3.0) + 0.05 * self.cfg.creativity * rng.random(ev.size)
         ramp = np.array([s.ramp for s in self.sections])[self.sec_of[ev]]
         accent = accent + 1.0 * ramp * self.pos[ev] + 0.4 * self.energy[ev]   # chords grow along a build-up
+        net_tail = None
         if self.hints is not None and self.hints.chord_logprobs is not None:
+            # the network hears which hits are chords (exact chord size on 92 % of the chords of Poisoned Bathwater):
+            # P(>= 2), P(>= 3), P(4) rank the moments for each chord size; the composer only sets how many
             f = np.clip(self.t[ev] // self.an.frame_ms, 0, self.an.num_frames - 1)
             p = np.exp(self.hints.chord_logprobs[f])
-            accent = accent + 0.6 * self.cfg.net_weight * (p[:, 1:].sum(axis=1))
+            net_tail = np.stack([p[:, 1:].sum(axis=1), p[:, 2:].sum(axis=1), p[:, 3]], axis=1)
+            accent = accent + 0.6 * self.cfg.net_weight * net_tail[:, 0]
         sec = self.sec_of[ev]
         t = self.t[ev]
         gap_prev = np.diff(t, prepend=t[0] - 10 ** 6) if t.size else t
@@ -1047,12 +1070,17 @@ class Composer:
                 continue
             mult = mults[si]
             u = 1.0 - _rank01(accent[m])           # strongest accents first
+            if net_tail is not None and self.cfg.net_weight > 0:
+                w = min(1.0, self.cfg.net_weight)
+                u = np.stack([1.0 - _rank01(w * net_tail[m, j] + (1.0 - w) * accent[m] / 3.0 + 0.1 * accent[m] / 3.0) for j in range(3)], axis=1)
+            else:
+                u = np.stack([u, u, u], axis=1)
             if self.patterns is not None:
                 r = np.minimum(0.97, tails[m] * mult * self.chord_boost)
-                sz = 1 + (u < r[:, 0]).astype(int) + (u < r[:, 1]).astype(int) + (u < r[:, 2]).astype(int)
+                sz = _nested_sizes(u, r)
             else:
                 rr = min(0.97, rate * mult * self.chord_boost)
-                sz = 1 + (u < rr).astype(int) + (u < rr * rr * 0.55).astype(int) + (u < rr ** 3 * 0.25).astype(int)
+                sz = _nested_sizes(u, np.tile([rr, rr * rr * 0.55, rr ** 3 * 0.25], (m.size, 1)))
             sizes[m] = np.minimum(sz, cap)
         # two chords closer than a playable jack must fit into 4 lanes together
         jack_min = self.jack_min(L)
@@ -1169,7 +1197,9 @@ class Composer:
                     v -= 8.0 * held
                 # ergonomics
                 for c in lanes:
-                    since = t - last_start[c]
+                    # from the last press - or from the RELEASE of a long note: a tap right after a released hold on the
+                    # same lane is the same awkward repeat as a jack (it used to be measured from the hold's start)
+                    since = t - max(int(last_start[c]), min(int(busy_until[c]), t))
                     if rep_cdf is not None and since < 2000:
                         # repeats rarer in real maps of this SR than the 5% fastest cost more the rarer they are
                         q = float(rep_cdf[min(rep_cdf.size - 1, int(since) // 5)])
@@ -1340,11 +1370,11 @@ class Composer:
         p = np.clip(p, 1e-4, 1 - 1e-4)
         score = np.log(p / (1 - p))
         fam_bonus = np.array([0.8 if self.sections[int(si)].family == "ln" else 0.0 for si in self.sec_of[ev]])
-        score = score + fam_bonus + _gumbel(rng, n) * 0.4 * self.cfg.creativity
+        score = score + fam_bonus + (_gumbel(rng, n) * 0.4 * self.cfg.creativity if self.hints is None else 0.0)
         if self.hints is not None and self.hints.ln_prob is not None:
             f = np.clip(t // self.an.frame_ms, 0, self.an.num_frames - 1)
             q = np.clip(self.hints.ln_prob[f], 1e-4, 1 - 1e-4)
-            score = score + 0.5 * self.cfg.net_weight * np.log(q / (1 - q))
+            score = score + 2.0 * self.cfg.net_weight * np.log(q / (1 - q))  # the network hears which sounds are held
         target = share * float(sizes.sum())
         have = 0.0
         r_on_chord = pm.ln_release_on_chord(self.target_sr, style)
@@ -1352,7 +1382,9 @@ class Composer:
             if have >= target:
                 break
             dist = pm.ln_member_count(self.target_sr, style, int(sizes[i]))
-            k = int(rng.choice(dist.size, p=dist)) + 1
+            # how many chord notes are held: the most common count in real maps of this style (not a dice roll);
+            # creative maps draw it from the distribution
+            k = int(rng.choice(dist.size, p=dist)) + 1 if self.cfg.creativity > 0.6 else int(np.argmax(dist)) + 1
             # length: drawn from the real distribution (in beats) for this gap, not its mode - taking the most likely
             # length every time would average the map again. How often a release lands on a later press is matched
             # to real maps of this style. The network (if any) adds its own length: it hears how long a sound lasts.
@@ -1361,7 +1393,8 @@ class Composer:
             if self.hints is not None and self.hints.ln_len_ms is not None:
                 f = int(min(self.an.num_frames - 1, t[i] // self.an.frame_ms))
                 ends = np.append(ends, t[i] + int(self.hints.ln_len_ms[f] * 1.0))
-                pl = np.append(pl * (1.0 - 0.4 * self.cfg.net_weight), 0.4 * self.cfg.net_weight)
+                w_len = min(0.8, 0.8 * self.cfg.net_weight)  # the network's length (it hears how long the sound lasts) first
+                pl = np.append(pl * (1.0 - w_len), w_len)
             j = np.clip(np.searchsorted(t, ends), 0, n - 1)
             jm = np.clip(j - 1, 0, n - 1)
             near = np.minimum(np.abs(t[j] - ends), np.abs(t[jm] - ends))
