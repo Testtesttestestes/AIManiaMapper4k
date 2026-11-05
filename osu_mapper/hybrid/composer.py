@@ -57,11 +57,13 @@ POP = np.array([bin(m).count("1") for m in range(16)])
 CENTROID = np.array([np.mean(LANES_OF[m]) if m else 1.5 for m in range(16)])
 
 # divisor -> metric weight of a tick (same scale as thinning.DIVISOR_STRENGTH)
-TICK_DIVISORS: Tuple[Tuple[int, float], ...] = ((1, 3.0), (2, 2.0), (4, 1.2), (3, 1.0), (6, 0.7), (8, 0.5))
-TRIPLET = {3, 6}
+TICK_DIVISORS: Tuple[Tuple[int, float], ...] = ((1, 3.0), (2, 2.0), (4, 1.2), (3, 1.0), (6, 0.7), (8, 0.5), (12, 0.4), (16, 0.25))
+TRIPLET = {3, 6, 12}
+BINARY_FINE = [4, 8, 16]
+OFF_GRID = 0             # "divisor" of a candidate that sits on an audio attack between grid ticks
 # tick divisor -> PatternModel divisor class (1/1, 1/2, 1/4, 1/3-1/6, 1/8, 1/12-1/16, off-grid)
 DIV_TO_CLASS = np.full(17, 6, dtype=np.int64)
-DIV_TO_CLASS[[1, 2, 4, 3, 6, 8, 12, 16]] = [0, 1, 2, 3, 3, 4, 5, 6]
+DIV_TO_CLASS[[1, 2, 4, 3, 6, 8, 12, 16]] = [0, 1, 2, 3, 3, 4, 5, 5]   # index 0 (OFF_GRID) stays 6
 
 FAMILIES: Tuple[str, ...] = ("stream", "stairs", "jumpstream", "handstream", "chordjack", "jack", "trill", "melodic", "ln")
 # density multiplier, chord multiplier, LN share bonus, lowest level that suits the family
@@ -187,6 +189,9 @@ class SongAnalysis:
     timing_points: List[RawTimingPoint]
     repeats: List[Tuple[int, int, int, float]] = field(default_factory=list)  # (start, end, source start, similarity)
     tick_audible: Optional[np.ndarray] = None  # [T] attack above median + 2 MAD of the whole track
+    tick_attack_raw: Optional[np.ndarray] = None  # [T] attack strength at every tick (raw)
+    onset_peaks: Optional[np.ndarray] = None   # ms of sharp attacks (local maxima), shifted by peak_lag
+    peak_lag: int = 0                          # how much later than the mapper's grid an attack peak comes (ms)
     flux: Optional[np.ndarray] = None          # [F] superflux onset strength (z, per song)
 
     def source_time(self, t: np.ndarray) -> np.ndarray:
@@ -331,7 +336,40 @@ def analyze_song(
     med = float(np.median(attack))
     mad = float(np.median(np.abs(attack - med))) + 1e-9
     an.tick_audible = raw > med + 2.0 * mad   # an attack clearly above the track's own noise floor
+    an.tick_attack_raw = raw
+    find_onset_peaks(an)
     return an
+
+
+def find_onset_peaks(an: SongAnalysis, window_ms: int = 10, mad_k: float = 2.0) -> None:
+    """Sharp attacks of the track at 1 ms resolution, and the lag between the grid and the attack peaks.
+
+    The peak of the energy derivative comes a few ms after the moment a mapper puts the note on, and how many ms
+    depends on the song and on the mapper (measured: -2..+8 ms). The red lines of a template were placed by the
+    mapper, so the lag is read off the strong beats: the median offset from beat/half-beat ticks with a clear attack
+    to the nearest peak. Off-grid candidates use the peaks minus that lag, consistent with the mapper's grid.
+    """
+    from scipy.ndimage import maximum_filter1d
+
+    env = an.attack_ms
+    if env.size < 100:
+        an.onset_peaks = np.zeros(0, dtype=np.int64)
+        return
+    med = float(np.median(env))
+    mad = float(np.median(np.abs(env - med))) + 1e-9
+    mx = maximum_filter1d(env, 2 * window_ms + 1)
+    peaks = np.flatnonzero((env >= mx) & (env > med + mad_k * mad)).astype(np.int64)
+    lag = 0
+    strong = an.ticks[np.isin(an.tick_div, [1, 2]) & (an.tick_audible if an.tick_audible is not None else True)]
+    if peaks.size > 1 and strong.size >= 30:
+        j = np.clip(np.searchsorted(peaks, strong), 1, peaks.size - 1)
+        a, b = peaks[j] - strong, peaks[j - 1] - strong
+        d = np.where(np.abs(a) < np.abs(b), a, b)
+        d = d[np.abs(d) <= 15]
+        if d.size >= 30:
+            lag = int(round(float(np.median(d))))
+    an.peak_lag = lag
+    an.onset_peaks = peaks - lag
 
 
 # ----------------------------------------------------------------------------------------------
@@ -419,7 +457,7 @@ def _describe_sections(an: SongAnalysis, sections: List[Section], V: np.ndarray)
         p = an.pitch[f0:f1:5]
         s.pitch_motion = float(np.mean(np.abs(np.diff(p)) > 0.5)) if p.size > 2 else 0.0
         trip = sel & np.isin(an.tick_div, list(TRIPLET))
-        binary = sel & np.isin(an.tick_div, [4, 8])
+        binary = sel & np.isin(an.tick_div, BINARY_FINE)
         a_t = an.tick_attack[trip].mean() if trip.any() else 0.0
         a_b = an.tick_attack[binary].mean() if binary.any() else 0.0
         s.triplet = bool(a_t > a_b + 0.06)
@@ -604,8 +642,26 @@ class Composer:
                 t = np.concatenate([t, et])
                 metric = np.concatenate([metric, np.full(et.size, 0.3)])
                 attack = np.concatenate([attack, _rank01(an.attack_at(et))])
-                div = np.concatenate([div, np.full(et.size, 16)])
+                div = np.concatenate([div, np.full(et.size, OFF_GRID)])
                 net = np.concatenate([net, pe[et // H]])
+                o = np.argsort(t, kind="stable")
+                t, metric, attack, div, net = t[o], metric[o], attack[o], div[o], net[o]
+        # sharp audio attacks between grid ticks (glitch, fills, humanized playing): candidates at the attack's own
+        # millisecond, shifted by the song's grid-vs-attack lag (how the mapper's red line sits on the attacks)
+        if an.onset_peaks is not None and an.onset_peaks.size and t.size:
+            pk = an.onset_peaks
+            pos = np.clip(np.searchsorted(t, pk), 1, t.size - 1)
+            dist = np.minimum(np.abs(t[pos] - pk), np.abs(t[pos - 1] - pk))
+            pk = pk[dist > 6]
+            if pk.size:
+                raw_ticks = np.sort(an.tick_attack_raw) if an.tick_attack_raw is not None else None
+                raw = an.attack_at(pk + an.peak_lag)
+                att = np.searchsorted(raw_ticks, raw) / max(1, raw_ticks.size) if raw_ticks is not None else _rank01(raw)
+                t = np.concatenate([t, pk])
+                metric = np.concatenate([metric, np.full(pk.size, 0.2)])
+                attack = np.concatenate([attack, att])
+                div = np.concatenate([div, np.full(pk.size, OFF_GRID)])
+                net = np.concatenate([net, self.hints.p_at(pk, H) if self.hints is not None else np.zeros(pk.size)])
                 o = np.argsort(t, kind="stable")
                 t, metric, attack, div, net = t[o], metric[o], attack[o], div[o], net[o]
         self.t, self.metric, self.attack, self.div, self.net = t, metric, attack, div, net
@@ -746,7 +802,7 @@ class Composer:
             sc = sc + 0.8 * s.ramp * self.pos[idx] + 0.5 * self.energy[idx]
             div = self.div[idx]
             if s.triplet:
-                sc[np.isin(div, [4, 8])] -= 0.8
+                sc[np.isin(div, BINARY_FINE)] -= 0.8
             else:
                 sc[np.isin(div, list(TRIPLET))] -= 0.8
             if cfg.repeat_memory and chosen_t and self.an.repeats:
