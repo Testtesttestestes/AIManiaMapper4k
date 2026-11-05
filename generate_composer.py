@@ -35,6 +35,28 @@ from osu_mapper.hybrid.composer import FAMILIES, ComposerConfig, NetHints, analy
 from osu_mapper.hybrid.patterns import density_correlation, density_graph, load_default
 
 
+def load_all_maps(path: str, diff: str = "") -> List[ManiaMap]:
+    """Every 4K difficulty of an .osz / .osu (optionally only names containing ``diff``)."""
+    import zipfile
+
+    from osu_mapper.hybrid.beatmap import parse_osu_mania
+
+    p = Path(path)
+    if p.suffix.lower() == ".osz":
+        with zipfile.ZipFile(p) as z:
+            texts = [(n, z.read(n).decode("utf-8", errors="replace")) for n in z.namelist() if n.lower().endswith(".osu")]
+    else:
+        texts = [(p.name, p.read_text(encoding="utf-8", errors="replace"))]
+    out = []
+    for name, text in texts:
+        m = parse_osu_mania(text)
+        if m is not None and len(m.notes) >= 20 and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
+            out.append(m)
+    if not out:
+        raise SystemExit(f"--style_from: no 4K mania difficulty{' matching ' + repr(diff) if diff else ''} in {path}")
+    return out
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("audio", nargs="?", default=None, help="audio file or template .osz/.osu")
@@ -56,6 +78,10 @@ def main(argv=None) -> None:
     ap.add_argument("--variants", type=int, default=4, help="maps composed per difficulty; the critic keeps the best")
     ap.add_argument("--sr_tolerance", type=float, default=0.05)
     ap.add_argument("--families", nargs="*", default=None, choices=list(FAMILIES), help="allowed pattern families (default: all)")
+    ap.add_argument("--style_from", default=None,
+                    help="map in the style of this .osz/.osu (its difficulties set the jacks, chords, divisors, long notes...)")
+    ap.add_argument("--style_diff", default="", help="only difficulties whose name contains this text (with --style_from)")
+    ap.add_argument("--style_strength", type=float, default=4.0, help="weight of --style_from against the dataset (default 4)")
     ap.add_argument("--ln_ratio", type=float, default=None, help="exact share of long notes, e.g. 0.44 (overrides --ln_style)")
     ap.add_argument("--ln_style", default=None, choices=["rice", "light", "hybrid", "ln", "full"],
                     help="LN style: rice ~2%%, light ~10%%, hybrid ~22%%, ln ~38%%, full ~55%% long notes; where they go, how many "
@@ -107,6 +133,17 @@ def main(argv=None) -> None:
         if patterns is None:
             print("[patterns] no pattern model (python learn_patterns.py --data dataset_hybrid): built-in defaults are used, "
                   "chords / jacks / density will not be calibrated to real maps")
+        style_maps = None
+        if args.style_from:
+            from osu_mapper.hybrid.composer import star_rating as _sr
+            from osu_mapper.hybrid.patterns import PatternModel, format_ln_quality, ln_quality, style_model_from_maps
+            refs = load_all_maps(args.style_from, args.style_diff)
+            style_maps = [(m.notes, m.timing_points, _sr(m.notes, m.timing_points, m.overall_difficulty)) for m in refs]
+            style = style_model_from_maps(style_maps)
+            base = patterns if patterns is not None else PatternModel.empty()
+            patterns = base.with_style(style, args.style_strength)
+            print(f"[style] {Path(args.style_from).name}: " + ", ".join(f"{m.metadata.get('Version', '?')} {sr:.2f}*" for m, (_, _, sr) in zip(refs, style_maps))
+                  + f" (strength {args.style_strength:g})")
         fcfg = predictor.feature_cfg if predictor is not None else FeatureConfig()
 
         t0 = time.time()
@@ -147,6 +184,10 @@ def main(argv=None) -> None:
         diff_items = []
         for target in parse_sr_list(args.sr):
             t1 = time.time()
+            if style_maps is not None and args.ln_ratio is None and args.ln_style is None and not args.no_ln:
+                from osu_mapper.hybrid.patterns import style_ln_share_at
+                share = style_ln_share_at(patterns, target)
+                cfg = dataclasses.replace(cfg, ln_ratio=share)  # as many long notes as the style map of this SR has
             hints = None
             if predictor is not None:
                 from osu_mapper.hybrid.inference import style_from_dict

@@ -135,7 +135,8 @@ class ComposeResult:
     def plan_text(self) -> str:
         rows = []
         for i, s in enumerate(self.sections):
-            rep = (f" = repeat of {s.repeat_src_ms / 1000:.1f}s (#{s.repeat_of}, similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
+            src = f"#{s.repeat_of}, " if s.repeat_of is not None else ""
+            rep = (f" = repeat of {s.repeat_src_ms / 1000:.1f}s ({src}similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
                    if s.repeat_src_ms is not None else "")
             n = sum(1 for x in self.notes if s.start_ms <= x.start < s.end_ms)
             ramp = " build-up" if s.ramp > 0.25 else (" fade" if s.ramp < -0.25 else "")

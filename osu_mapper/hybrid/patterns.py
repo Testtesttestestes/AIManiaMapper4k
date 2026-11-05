@@ -154,6 +154,9 @@ class PatternModel:
         times, masks, lns = chord_events(notes)
         if times.size < 8:
             return
+        if not hasattr(self, "_ln_shares"):
+            self._ln_shares = []
+        self._ln_shares.append((float(star_rating), float(np.mean([n.ln for n in notes])) if notes else 0.0))
         s = sr_bin(star_rating)
         self.maps[s] += 1
         reds = sorted((tp for tp in timing_points if tp.uninherited and tp.beat_len > 0), key=lambda r: r.time)
@@ -339,6 +342,35 @@ class PatternModel:
             setattr(self, k, b.copy() if a is None else a + b)
         for cache in ("_m_uni", "_m_gap", "_m_prev"):
             self.__dict__.pop(cache, None)
+
+    def with_style(self, style: "PatternModel", strength: float = 4.0) -> "PatternModel":
+        """Dataset model + the patterns of a few chosen maps ("map like this mapper").
+
+        For every star-rating bin the style counts (taken from the nearest bin the style maps cover) are scaled to
+        ``strength`` x the dataset's own count in that bin and added: the chosen maps decide what is typical (jacks,
+        chords, divisors, long notes...), the dataset still fills contexts the few style maps never show.
+        """
+        out = PatternModel.empty()
+        out.merge(self)
+        have = np.flatnonzero(style.maps > 0)
+        if have.size == 0:
+            return out
+        for k in ("lane", "chord", "rhythm_hits", "rhythm_beats", "ln") + OPTIONAL_ARRAYS:
+            src, dst = getattr(style, k, None), getattr(out, k, None)
+            if src is None or dst is None or src.shape[0] != SR_BINS:
+                continue
+            dst = dst.astype(np.float64)
+            for b in range(SR_BINS):
+                sb = int(have[np.argmin(np.abs(have - b))])
+                s_tot, d_tot = float(src[sb].sum()), float(dst[b].sum())
+                if s_tot <= 0:
+                    continue
+                scale = strength * d_tot / s_tot if d_tot > 0 else 1.0
+                dst[b] = dst[b] + scale * src[sb]
+            setattr(out, k, dst.astype(getattr(self, k).dtype if getattr(self, k, None) is not None else np.float64))
+        out.maps = self.maps + np.array([style.maps[int(have[np.argmin(np.abs(have - b))])] for b in range(SR_BINS)])
+        out.style_ln_share = getattr(style, "style_ln_share", None)
+        return out
 
     # ------------------------------------------------------------------------------------------
     def _sr_weights(self, sr: float) -> List[Tuple[int, float]]:
@@ -726,3 +758,20 @@ def format_ln_quality(q: Dict[str, np.ndarray]) -> str:
             f"| release on a press {100 * r[0]:.0f}%, free tick {100 * r[1]:.0f}%, off grid {100 * r[2]:.0f}% "
             f"| holds over 0/1/2/3/4-7/8+ chords {'/'.join(f'{100 * x:.0f}' for x in s)}% "
             f"| presses during a hold: same hand {q['hand'][0]:.1f}, other hand {q['hand'][1]:.1f}")
+
+
+def style_model_from_maps(maps: Sequence[Tuple[Sequence[Note], Sequence[RawTimingPoint], float]]) -> PatternModel:
+    """A pattern model counted over a few chosen maps (notes, timing points, star rating), see with_style."""
+    m = PatternModel.empty()
+    for notes, tps, sr in maps:
+        m.add_map(notes, tps, sr)
+    m.style_ln_share = list(getattr(m, "_ln_shares", []))
+    return m
+
+
+def style_ln_share_at(model: PatternModel, sr: float) -> Optional[float]:
+    """LN share of the style map closest to this star rating (None when no style maps were given)."""
+    shares = getattr(model, "style_ln_share", None)
+    if not shares:
+        return None
+    return float(min(shares, key=lambda x: abs(x[0] - sr))[1])

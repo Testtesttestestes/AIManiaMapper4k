@@ -172,6 +172,23 @@ class TestPatternModel(unittest.TestCase):
         model.add_map(notes, [RawTimingPoint(1000.0, 400.0)], 4.5)
         self.assertGreaterEqual(model.event_gap_floor(4.5), 90.0)
 
+    def test_style_model_dominates(self):
+        base = pattern_model_from_synthetic()
+        style = PatternModel.empty()
+        jacks = []
+        for i in range(200):  # a chordjack map: the same [12] chord again and again
+            t = 1000 + 150 * i
+            jacks += [Note(t, 0, t), Note(t, 1, t)]
+        from osu_mapper.hybrid.patterns import style_ln_share_at, style_model_from_maps
+        style = style_model_from_maps([(jacks, [RawTimingPoint(1000.0, 600.0)], 3.5)])
+        mixed = base.with_style(style, 4.0)
+        lp_base = base.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
+        lp_mix = mixed.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
+        self.assertGreater(lp_mix[0b0011], lp_base[0b0011])          # the chord jack became typical
+        self.assertEqual(int(np.argmax(lp_mix)), 0b0011)
+        self.assertEqual(style_ln_share_at(mixed, 3.5), 0.0)
+        self.assertAlmostEqual(float(mixed.chord_marginal(3.5)[1]), 1.0, delta=0.25)
+
     def test_save_load(self):
         model = pattern_model_from_synthetic()
         with tempfile.TemporaryDirectory() as d:
