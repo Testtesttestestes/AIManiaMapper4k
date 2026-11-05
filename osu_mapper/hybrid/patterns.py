@@ -41,6 +41,8 @@ DIV_CLASSES: Tuple[str, ...] = ("1/1", "1/2", "1/4", "1/3-1/6", "1/8", "1/12-1/1
 N_DIV = len(DIV_CLASSES)
 DIV_TICKS_PER_BEAT = np.array([1, 1, 2, 4, 4, 12, 1], dtype=np.float64)  # ticks of each class per beat
 POP = np.array([bin(m).count("1") for m in range(16)])
+MIN_BIN_MAPS = 10        # a star-rating bin with fewer maps is mixed with its nearest well-filled neighbour
+STAGGER_MS = 30          # chord-to-chord gaps below this are one chord with offset notes (or a grace note), not rhythm
 REPEAT_BIN_MS = 5
 REPEAT_BINS = 400                                          # 0..2 s
 LN_SPAN_BINS = 33                                          # 0..31 chords during a hold, 32 = more
@@ -346,13 +348,23 @@ class PatternModel:
         out = [(a, 1.0 - w)]
         if w > 0 and a + 1 < SR_BINS:
             out.append((a + 1, w))
-        # empty bins borrow from the nearest filled one
-        res = []
+        # empty bins borrow from the nearest filled one; thin bins (a handful of maps, e.g. 10* in most datasets) are
+        # mixed with the nearest well-filled bin in proportion to their map count, so the statistics of a star rating
+        # are not the style of one or two maps
+        res: List[Tuple[int, float]] = []
         filled = np.flatnonzero(self.maps > 0)
+        solid = np.flatnonzero(self.maps >= MIN_BIN_MAPS)
         for b, wt in out:
             if self.maps[b] == 0 and filled.size:
                 b = int(filled[np.argmin(np.abs(filled - b))])
-            res.append((b, wt))
+            n = float(self.maps[b])
+            if 0 < n < MIN_BIN_MAPS and solid.size:
+                nb = int(solid[np.argmin(np.abs(solid - b))])
+                own = n / MIN_BIN_MAPS
+                res.append((b, wt * own))
+                res.append((nb, wt * (1.0 - own)))
+            else:
+                res.append((b, wt))
         return res
 
     def lane_logprob(self, sr: float, gap_ms: float, prev: int, prev2: int, size: int, alpha: float = 4.0) -> np.ndarray:
@@ -428,16 +440,26 @@ class PatternModel:
                 h += wt * table[b] / table[b].sum()
         return h if h.sum() > 0 else None
 
-    def gap_share_below(self, sr: float, gap_ms: float) -> Optional[float]:
-        """Share of chord-to-chord gaps in real maps of this difficulty that are shorter than ``gap_ms``."""
+    def _rhythm_gaps(self, sr: float) -> Optional[np.ndarray]:
+        """Chord-to-chord gap histogram without the < 30 ms gaps: those are chords whose notes are a few ms apart
+        (or grace notes), counted as two events by the chord grouping, not a rhythm anyone plays."""
         h = self._hist(self.event_gap, sr)
+        if h is None:
+            return None
+        h = h.copy()
+        h[: STAGGER_MS // REPEAT_BIN_MS] = 0.0
+        return h if h.sum() > 0 else None
+
+    def gap_share_below(self, sr: float, gap_ms: float) -> Optional[float]:
+        """Share of chord-to-chord gaps (rhythm, >= 30 ms) in real maps of this difficulty shorter than ``gap_ms``."""
+        h = self._rhythm_gaps(sr)
         if h is None:
             return None
         return float(h[: max(0, int(gap_ms) // REPEAT_BIN_MS)].sum() / h.sum())
 
     def event_gap_floor(self, sr: float, quantile: float = 0.005) -> Optional[float]:
-        """Chord-to-chord gap (ms) that only ``quantile`` of real gaps at this difficulty are shorter than."""
-        h = self._hist(self.event_gap, sr)
+        """Chord-to-chord gap (ms, rhythm only) that only ``quantile`` of real gaps at this difficulty are shorter than."""
+        h = self._rhythm_gaps(sr)
         if h is None:
             return None
         return float(np.searchsorted(np.cumsum(h) / h.sum(), quantile) * REPEAT_BIN_MS)
