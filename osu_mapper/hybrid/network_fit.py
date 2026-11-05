@@ -6,11 +6,19 @@ notes where it hears something. Its weaknesses are (1) the star rating: one thre
 network finds typical, often 0.5-3 stars away from the request, and (2) on some audio its milliseconds are shifted
 against the template's grid (a constant per song, up to ~10 ms).
 
-``fit_network_map`` keeps everything the network decides (which moments, chords, lanes, long notes) and only
-(1) moves the event threshold until the rendered map has the requested star rating, never below ``min_threshold``
-(below it the network does not hear a note: such notes would be on silence), and (2) subtracts the per-song lag.
-If the requested star rating needs more notes than the network hears, the map stays at the closest reachable
-rating and the result says so, instead of filling silence.
+Measured on maps the v2 network never saw: at the same number of notes its maps are 0.3-1.5 stars harder than the
+human map, and the reason is its lanes - 16-27 % fast jacks against 3-13 % in the human maps of the same songs.
+Re-assigning lanes against jacks brings it to the human rating (EXHAUST 4.97 -> 4.58 = target); long notes and
+chord sizes change it by 0.1 at most.
+
+``fit_network_map`` keeps the network's moments, chords and long notes and
+(1) subtracts the per-song lag of its milliseconds against the red lines;
+(2) re-assigns only as many lanes as needed for the share of fast jacks real maps of this star rating have (or the
+    chosen style: a chordjack mapper's 60 % stay), with the ergonomics beam search;
+(3) moves the event threshold until the rendered map has the requested star rating, never below ``min_threshold``
+    (below it the network does not hear a note: such notes would be on silence).
+If the request needs more notes than the network hears, the map stays at the closest reachable rating and the
+result says so, instead of filling silence.
 """
 
 from __future__ import annotations
@@ -31,7 +39,10 @@ class NetworkFit:
     star_rating: float
     threshold: float
     lag_ms: int
-    reached: bool          # False: the requested rating needs notes the network does not hear (or fewer than it is sure of)
+    reached: bool
+    lane_strength: float = 0.0   # ergonomics strength used to bring the fast-jack share to the data
+    jack_share: float = 0.0
+    jack_target: Optional[float] = None          # False: the requested rating needs notes the network does not hear (or fewer than it is sure of)
 
 
 def star_rating(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], od: float = 8.0) -> float:
@@ -69,6 +80,11 @@ def network_lag(out: HeadOutputs, timing_points: Sequence[RawTimingPoint], min_e
     return int(round(float(np.median(d)))) if d.size >= min_events else 0
 
 
+def fast_jack_share(notes: Sequence[Note], jack_ms: float = 160.0) -> float:
+    from .ergonomics import ergonomics_report
+    return float(ergonomics_report(notes, jack_ms=jack_ms).get("fast_jack_pct", 0.0)) / 100.0
+
+
 def fit_network_map(
     out: HeadOutputs,
     knobs: DecodeKnobs,
@@ -80,36 +96,81 @@ def fit_network_map(
     tolerance: float = 0.05,
     iterations: int = 14,
     fix_lag: bool = True,
+    jack_target: Optional[float] = None,
+    log=None,
 ) -> NetworkFit:
-    """Decodes the network's map at the event threshold whose rendered star rating matches ``target_sr``."""
+    """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
+    (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes."""
+    from .ergonomics import improve_ergonomics
+
     lag = network_lag(out, timing_points) if fix_lag else 0
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
-    cache = {}
+    strength = 0.0
 
-    def run(th: float):
-        th = round(float(th), 4)
-        if th not in cache:
-            notes = decode_outputs(out, dataclasses.replace(base, onset_threshold=th), timing_points)
-            cache[th] = (star_rating(notes, timing_points, od), notes)
-        return cache[th]
+    def decode(th: float, st: float) -> List[Note]:
+        notes = decode_outputs(out, dataclasses.replace(base, onset_threshold=th), timing_points)
+        if st > 0:
+            notes = improve_ergonomics(notes, timing_points, st, release_gap_ms=base.ln_release_gap_ms,
+                                       release_gap_beats=base.ln_release_gap_beats)
+        return notes
 
-    lo, hi = float(min_threshold), float(max_threshold)
-    sr_lo, _ = run(lo)          # the most notes the network hears
-    sr_hi, _ = run(hi)          # only what it is sure about
-    if target_sr >= sr_lo:
-        sr, notes = run(lo)
-        return NetworkFit(notes, sr, lo, lag, abs(sr - target_sr) <= tolerance)
-    if target_sr <= sr_hi:
-        sr, notes = run(hi)
-        return NetworkFit(notes, sr, hi, lag, abs(sr - target_sr) <= tolerance)
-    for _ in range(iterations):  # star rating falls as the threshold rises
-        mid = 0.5 * (lo + hi)
-        sr, _ = run(mid)
-        if abs(sr - target_sr) <= tolerance:
-            break
-        if sr > target_sr:
-            lo = mid
-        else:
-            hi = mid
-    th, (sr, notes) = min(cache.items(), key=lambda kv: abs(kv[1][0] - target_sr))
-    return NetworkFit(notes, sr, th, lag, abs(sr - target_sr) <= tolerance)
+    def calibrate_lanes(th: float, current: float) -> float:
+        """The least re-assignment that gives the fast-jack share of real maps at threshold ``th``."""
+        share = fast_jack_share(decode(th, current))
+        if jack_target is None or abs(share - jack_target) <= 0.02 or (share < jack_target and current == 0.0):
+            return current
+        lo_s, hi_s, best = 0.0, 1.0, (abs(share - jack_target), current)
+        for _ in range(8):
+            mid = 0.5 * (lo_s + hi_s)
+            sh = fast_jack_share(decode(th, mid))
+            if abs(sh - jack_target) < best[0] - 1e-9:
+                best = (abs(sh - jack_target), mid)
+            if sh > jack_target:
+                lo_s = mid
+            else:
+                hi_s = mid
+        return best[1]
+
+    def fit_threshold():
+        cache = {}
+
+        def run(th: float):
+            th = round(float(th), 4)
+            if th not in cache:
+                notes = decode(th, strength)
+                cache[th] = (star_rating(notes, timing_points, od), notes)
+            return cache[th]
+
+        lo, hi = float(min_threshold), float(max_threshold)
+        sr_lo, _ = run(lo)          # the most notes the network hears
+        sr_hi, _ = run(hi)          # only what it is sure about
+        if target_sr >= sr_lo:
+            return (lo,) + run(lo)
+        if target_sr <= sr_hi:
+            return (hi,) + run(hi)
+        for _ in range(iterations):  # star rating falls as the threshold rises
+            mid = 0.5 * (lo + hi)
+            sr, _ = run(mid)
+            if abs(sr - target_sr) <= tolerance:
+                break
+            if sr > target_sr:
+                lo = mid
+            else:
+                hi = mid
+        th, (sr, notes) = min(cache.items(), key=lambda kv: abs(kv[1][0] - target_sr))
+        return th, sr, notes
+
+    # (2) lanes, (3) threshold; the threshold changes the jack share a little, so lanes are checked once more at the
+    # fitted threshold and, if they moved, the threshold is fitted again
+    th0 = float(np.clip(knobs.onset_threshold, min_threshold, max_threshold))
+    first = fast_jack_share(decode(th0, 0.0))
+    strength = calibrate_lanes(th0, 0.0)
+    th, sr, notes = fit_threshold()
+    again = calibrate_lanes(th, strength)
+    if again != strength:
+        strength = again
+        th, sr, notes = fit_threshold()
+    if log and jack_target is not None:
+        log(f"    lanes: fast jacks {100 * first:.0f}% -> {100 * fast_jack_share(notes):.0f}% (real maps {100 * jack_target:.0f}%), "
+            f"re-assignment strength {strength:.2f}")
+    return NetworkFit(notes, sr, th, lag, abs(sr - target_sr) <= tolerance, strength, fast_jack_share(notes), jack_target)
