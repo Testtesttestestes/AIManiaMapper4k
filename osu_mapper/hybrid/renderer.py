@@ -76,6 +76,18 @@ class HeadOutputs:
     ln_resid: np.ndarray          # [F, 4] in [0, 1], position inside the bucket
     frame_ms: int = FRAME_MS
     chord_logprobs: Optional[np.ndarray] = None  # [F, 4] log P(chord size = 1..4)
+    importance: Optional[np.ndarray] = None      # [F] difficulty-ladder importance (model with the importance head)
+    ladder: Optional[tuple] = None               # (c0, c[LADDER_BINS]) of the monotone threshold theta(sr)
+
+    def ladder_probs(self, sr: float) -> Optional[np.ndarray]:
+        """[F] P(this moment is mapped at star rating ``sr``) from the difficulty ladder, None without the head."""
+        if self.importance is None or self.ladder is None:
+            return None
+        c0, c = self.ladder
+        c = np.asarray(c, np.float64)
+        ramp = np.clip(float(sr) - np.arange(c.size), 0.0, 1.0)
+        theta = float(c0) - float((np.logaddexp(0.0, c) * ramp).sum())
+        return 1.0 / (1.0 + np.exp(-(self.importance.astype(np.float64) - theta)))
 
     @property
     def num_frames(self) -> int:
@@ -112,6 +124,15 @@ class DecodeKnobs:
     ln_snap_ms: Optional[float] = None  # snap LN releases to the PREVIOUS tick within this tolerance (None = same as snap_ms)
     snap_divisors: Tuple[int, ...] = (1, 2, 4, 3, 6, 8, 12, 16)
     seed: int = 0
+    # optional prior over lanes from real maps: f(prev mask, prev2 mask, ms since the previous chord) -> [16] log P(mask |
+    # its chord size, context); added to the network's lane logits x lane_prior_weight (the chord size stays the network's)
+    lane_prior: Optional[object] = None
+    lane_prior_weight: float = 1.0
+    # optional [k] P(the next fast chord stays on the same hand | one-hand run of k chords) from real maps: continuing
+    # the run is scored log p, switching hands log(1 - p) (the network alone made one-hand runs of 25-64 chords)
+    hand_run_continue: Optional[np.ndarray] = None
+    hand_run_weight: float = 1.0
+    hand_run_ms: float = 200.0
 
 
 def extract_events(
@@ -310,6 +331,9 @@ def decode_outputs(
     last_start = np.full(NUM_LANES, -10 ** 9, dtype=np.int64)
     busy_until = np.full(NUM_LANES, -10 ** 9, dtype=np.int64)
     notes: List[Note] = []
+    last_t = -10 ** 9
+    run_hand, run_len = 0, 0          # 1 = left hand (lanes 0-1), 2 = right hand (lanes 2-3)
+    hand_of = np.array([0] + [1 if not (m & 0b1100) else (2 if not (m & 0b0011) else 0) for m in range(1, 16)])
 
     for t, f in zip(ev_t.tolist(), ev_f.tolist()):
         masks = LANE_TABLE[prev, prev2].astype(np.int64)
@@ -318,6 +342,14 @@ def decode_outputs(
         if out.chord_logprobs is not None and k.chord_weight > 0:
             logits = logits + k.chord_weight * out.chord_logprobs[f].astype(np.float64)[np.clip(pops - 1, 0, 3)]
         valid = (masks > 0) & (pops <= k.max_chord)
+        if k.lane_prior is not None and k.lane_prior_weight > 0 and prev:
+            lp = np.asarray(k.lane_prior(prev, prev2, float(t - last_t)), dtype=np.float64)
+            logits = logits + k.lane_prior_weight * np.where(masks > 0, np.maximum(lp[np.clip(masks, 0, 15)], -12.0), 0.0)
+
+        if k.hand_run_continue is not None and k.hand_run_weight > 0 and run_len > 0 and (t - last_t) < k.hand_run_ms:
+            pc = float(k.hand_run_continue[min(run_len, len(k.hand_run_continue) - 1)])
+            hands = hand_of[np.clip(masks, 0, 15)]
+            logits = logits + k.hand_run_weight * np.where(hands == run_hand, math.log(pc), math.log(1.0 - pc))
 
         # a note inside a predicted hold goes to a free lane; a note just after the release keeps its lane and the
         # LN is shortened to leave the release gap (resolve_lane_conflicts), as mappers do
@@ -344,6 +376,12 @@ def decode_outputs(
         else:
             code = int(cand_idx[np.argmax(logits[cand_idx])])
         mask = int(masks[code])
+        h = int(hand_of[mask])
+        if h and h == run_hand and (t - last_t) < k.hand_run_ms:
+            run_len += 1
+        else:
+            run_hand, run_len = h, (1 if h else 0)
+        last_t = int(t)
 
         for m, c in enumerate(mask_lanes(mask)):
             st = int(out.stagger[f, m]) if k.use_stagger else 0

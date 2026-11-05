@@ -57,6 +57,8 @@ class HybridModelConfig:
     max_members: int = MAX_MEMBERS
     rope_base: float = 10000.0
     event_prior: float = 0.03
+    canvas: bool = False              # masked discrete diffusion: a partially known map of the window as input (canvas.py)
+    importance_head: bool = False     # difficulty ladder: per-frame importance + monotone threshold per star rating
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -73,6 +75,17 @@ PRESETS: Dict[str, Dict[str, int]] = {
     "base": dict(d_model=256, conv_layers=4, attn_layers=6, n_heads=8, out_conv_layers=2),
     "large": dict(d_model=384, conv_layers=6, attn_layers=10, n_heads=8, out_conv_layers=2),
 }
+
+
+LADDER_BINS = 12
+
+
+def ladder_threshold(c0: torch.Tensor, c: torch.Tensor, sr: torch.Tensor) -> torch.Tensor:
+    """theta(sr): importance a moment needs to be mapped at star rating ``sr``. Monotone DEcreasing in sr (harder maps
+    keep less important moments too): c0 - sum_j softplus(c_j) * clamp(sr - j, 0, 1)."""
+    j = torch.arange(c.shape[0], device=sr.device, dtype=torch.float32)
+    ramp = (sr.float().unsqueeze(-1) - j).clamp(0.0, 1.0)
+    return c0 - (F.softplus(c) * ramp).sum(dim=-1)
 
 
 def build_config(rep_dims: Dict[str, int], coarse_dim: int, preset: str = "base", **overrides: object) -> HybridModelConfig:
@@ -185,6 +198,15 @@ class HybridParamNet(nn.Module):
         self.rep_missing = nn.Parameter(torch.zeros(n_reps, d))
         self.beat_stem = nn.Linear(cfg.beat_dim, d)
         self.in_norm = nn.LayerNorm(d)
+        if cfg.canvas:
+            from .canvas import N_CANVAS_STATES
+            from .params import NUM_LANES
+            self.canvas_state = nn.Embedding(N_CANVAS_STATES, d)
+            self.canvas_ms = nn.Embedding(H, d)
+            self.canvas_ln = nn.Linear(NUM_LANES, d)
+            self.canvas_out = nn.Linear(d, d)
+            nn.init.zeros_(self.canvas_out.weight)   # starts as the plain network: an older checkpoint is unchanged
+            nn.init.zeros_(self.canvas_out.bias)
 
         cond_in = 2 + 2 * cfg.style_dim
         self.cond_mlp = nn.Sequential(nn.Linear(cond_in, d), nn.SiLU(), nn.Linear(d, d))
@@ -215,6 +237,11 @@ class HybridParamNet(nn.Module):
         self.ln_bucket_head = nn.Linear(d, M * cfg.n_ln_buckets)
         self.ln_resid_head = nn.Linear(d, M)
         self.style_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.style_dim))
+        if cfg.importance_head:
+            # difficulty ladder: how important a moment is; it is mapped at star rating s when importance > theta(s)
+            self.importance_head = nn.Linear(d, 1)
+            self.ladder_c0 = nn.Parameter(torch.tensor(3.0))
+            self.ladder_c = nn.Parameter(torch.full((LADDER_BINS,), -0.5))
 
         with torch.no_grad():
             p = cfg.event_prior
@@ -253,6 +280,7 @@ class HybridParamNet(nn.Module):
         coarse: Optional[torch.Tensor] = None,
         coarse_mask: Optional[torch.Tensor] = None,
         rep_present: Optional[torch.Tensor] = None,
+        canvas: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
         B, T, _ = feats.shape
@@ -283,6 +311,16 @@ class HybridParamNet(nn.Module):
             h = self.stems[name](feats[..., s0:s1])
             p = present[:, i].view(B, 1, 1)
             x = x + self.rep_gate[i] * (h * p + self.rep_missing[i].view(1, 1, -1) * (1.0 - p))
+        if cfg.canvas:
+            if canvas is None:
+                st = torch.zeros(B, T, dtype=torch.long, device=dev)
+                cms = torch.zeros(B, T, dtype=torch.long, device=dev)
+                cln = torch.zeros(B, T, self.canvas_ln.in_features, device=dev)
+            else:
+                st, cms, cln = canvas[0].long().to(dev), canvas[1].long().to(dev), canvas[2].float().to(dev)
+            e = self.canvas_state(st) + self.canvas_ms(cms.clamp(0, cfg.frame_ms - 1)) * (st >= 2).unsqueeze(-1).float() \
+                + self.canvas_ln(cln)
+            x = x + self.canvas_out(e)
         x = self.in_norm(x)
         c = self._condition(sr, style.float(), style_mask, coarse, coarse_mask, use_global)
 
@@ -302,7 +340,11 @@ class HybridParamNet(nn.Module):
         u = self.out_norm(u)[:, :T]
 
         M, Hm = cfg.max_members, cfg.frame_ms
+        extra = {}
+        if cfg.importance_head:
+            extra = {"importance": self.importance_head(u).squeeze(-1), "ladder_c0": self.ladder_c0, "ladder_c": self.ladder_c}
         return {
+            **extra,
             "time_logits": self.time_head(u),
             "lane_logits": self.lane_head(u),
             "chord_logits": self.chord_head(u),

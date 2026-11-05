@@ -174,7 +174,16 @@ def main(argv=None) -> None:
                          "red lines, only as many lanes are re-assigned as needed for the share of fast jacks real maps of this "
                          "SR have, then the event threshold is moved until the star rating matches (never below --min_threshold, "
                          "so no notes on silence). off: one threshold, the star rating is whatever comes out")
+    ap.add_argument("--repeat_memory", default="on", choices=["on", "off"],
+                    help="with --fit_sr: a phrase that repeats earlier music gets the original's rhythm and chord sizes, lanes "
+                         "alternating as in the original / mirrored (as mappers do; the network alone does not keep repeats)")
     ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
+    ap.add_argument("--refine_steps", type=int, default=4,
+                    help="with --fit_sr and a model trained with the map canvas (--canvas_prob): passes of masked diffusion - "
+                         "each fixes the most confident notes, the next sees them on both sides; 1 = one pass")
+    ap.add_argument("--ladder_mix", type=float, default=0.5,
+                    help="with --fit_sr and a model trained with the difficulty ladder: share of 'is this moment mapped at "
+                         "this star rating' (learnt from songs with several difficulties) in the event probability; 0 = off")
     ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--sr_guidance", default="1",
@@ -307,6 +316,13 @@ def main(argv=None) -> None:
 
         sr_hi = float(predictor.sr_range[2]) if getattr(predictor, "sr_range", None) else 8.0
         guidances = [float(x) for x in str(args.sr_guidance).replace(" ", "").split(",") if x] or [1.0]
+        song_repeats = None
+        if args.fit_sr == "on" and args.repeat_memory == "on":
+            from osu_mapper.hybrid.composer import analyze_song, segment_sections
+            an = analyze_song(inputs.feats, fcfg.slices(), timing, inputs.duration_ms, fcfg.frame_ms)
+            segment_sections(an)  # finds the repeated phrases
+            song_repeats = [r for r in an.repeats if r[3] >= 0.9]
+            print(f"[repeats] {len(song_repeats)} repeated phrases (4 bars, similarity >= 0.9) mapped like their originals")
         for target, guidance in [(t, g) for t in parse_sr_list(args.sr) for g in guidances]:
             if target > sr_hi:
                 print(f"[warn] star rating {target:g} is outside what the model was trained on (up to ~{sr_hi:g}*): "
@@ -319,8 +335,23 @@ def main(argv=None) -> None:
                 if args.fit_sr == "on" and user_thresholds is None:
                     from osu_mapper.hybrid.network_fit import fit_network_map
                     jt = pattern_model.fast_repeat_share(target) if pattern_model is not None else None
-                    fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                          min_threshold=args.min_threshold, jack_target=jt, log=print)
+                    lp = pattern_model.lane_prior(target) if pattern_model is not None else None
+                    hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
+                    k_th = dataclasses.replace(knobs, onset_threshold=th)
+                    fit_kw = dict(min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp, hand_run_continue=hr,
+                                  repeats=song_repeats, ladder_mix=args.ladder_mix)
+                    if args.refine_steps > 1 and getattr(predictor.model.cfg, "canvas", False):
+                        # masked diffusion: later passes see the most confident notes of the earlier ones on both sides
+                        from osu_mapper.hybrid.canvas import refine
+                        g_ = guidance
+                        out, fit = refine(
+                            lambda cv: predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv),
+                            lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
+                            out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
+                            steps=args.refine_steps, log=print, first=out)
+                    else:
+                        fit = fit_network_map(out, k_th, timing, target, args.od, log=print, **fit_kw)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
@@ -332,7 +363,8 @@ def main(argv=None) -> None:
                             out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
                                                      sr_guidance=g2, style_guidance=args.style_guidance)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                                   min_threshold=args.min_threshold, jack_target=jt)
+                                                   min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp,
+                                                   hand_run_continue=hr, repeats=song_repeats, ladder_mix=args.ladder_mix)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
                                 print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
                                 fit, out = fit2, out2

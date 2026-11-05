@@ -165,3 +165,49 @@ def calibration_samples(pred_notes: Sequence[Note], ref_notes: Sequence[Note], t
             if a.ln and b.ln and a.end > a.start and b.end > b.start:
                 ln_ratios.append(float(np.log2((a.end - a.start) / (b.end - b.start))))
     return starts, ln_ratios
+
+
+SOUND_FEATURES = ("onset", "spectral", "hpss", "demucs_stems")
+
+
+def sound_consistency(notes: Sequence[Note], feats: np.ndarray, slices: Dict[str, Tuple[int, int]], frame_ms: int = 10,
+                      window_ms: int = 16000, top: float = 0.1, seed: int = 0) -> Dict[str, float]:
+    """Do hits that sound alike get alike patterns? For every hit, the 10 % most similar-sounding hits of the next
+    ``window_ms`` (cosine of z-scored onset / spectral / HPSS / stem features) against as many random hits of the same
+    window: how often the chord size, the LN-or-tap choice and the exact lanes match. ``*_lift`` = similar - random.
+    Human maps (15 maps of 6 songs the network never saw): chord size +0.07, LN +0.09, lanes +0.01; the v2 network:
+    +0.055, +0.04, +0.03 - the sound already decides its chord sizes, its long notes depend on it half as much."""
+    names = [k for k in SOUND_FEATURES if k in slices]
+    if not names or not notes:
+        return {}
+    X = np.concatenate([feats[:, slices[k][0]:slices[k][1]] for k in names], axis=1).astype(np.float64)
+    X = (X - X.mean(0)) / (X.std(0) + 1e-6)
+    groups: Dict[int, List[Note]] = {}
+    for n in notes:
+        groups.setdefault(int(n.start), []).append(n)
+    times = np.array(sorted(groups))
+    fr = np.clip(times // frame_ms, 0, len(X) - 1)
+    x = X[fr]
+    x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-9)
+    size = np.array([len(groups[t]) for t in times])
+    ln = np.array([any(n.ln for n in groups[t]) for t in times])
+    lanes = np.array([sum(1 << n.col for n in groups[t]) for t in times])
+    rng = np.random.default_rng(seed)
+    sim, base = [], []
+    win = window_ms // frame_ms
+    for i in range(times.size):
+        j = np.flatnonzero((fr > fr[i]) & (fr <= fr[i] + win))
+        if j.size < 5:
+            continue
+        cs = x[j] @ x[i]
+        close = j[cs >= np.quantile(cs, 1.0 - top)]
+        rand = rng.choice(j, size=close.size)
+        for out, J in ((sim, close), (base, rand)):
+            out.append(((size[J] == size[i]).mean(), (ln[J] == ln[i]).mean(), (lanes[J] == lanes[i]).mean()))
+    if not sim:
+        return {}
+    s, b = np.mean(sim, axis=0), np.mean(base, axis=0)
+    res: Dict[str, float] = {}
+    for k, name in enumerate(("chord_size", "ln", "lanes")):
+        res[f"{name}_similar"], res[f"{name}_random"], res[f"{name}_lift"] = float(s[k]), float(b[k]), float(s[k] - b[k])
+    return res
