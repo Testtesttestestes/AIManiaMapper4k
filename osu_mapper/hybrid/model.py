@@ -57,6 +57,7 @@ class HybridModelConfig:
     max_members: int = MAX_MEMBERS
     rope_base: float = 10000.0
     event_prior: float = 0.03
+    importance_head: bool = False     # difficulty ladder: per-frame importance + monotone threshold per star rating
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -73,6 +74,17 @@ PRESETS: Dict[str, Dict[str, int]] = {
     "base": dict(d_model=256, conv_layers=4, attn_layers=6, n_heads=8, out_conv_layers=2),
     "large": dict(d_model=384, conv_layers=6, attn_layers=10, n_heads=8, out_conv_layers=2),
 }
+
+
+LADDER_BINS = 12
+
+
+def ladder_threshold(c0: torch.Tensor, c: torch.Tensor, sr: torch.Tensor) -> torch.Tensor:
+    """theta(sr): importance a moment needs to be mapped at star rating ``sr``. Monotone DEcreasing in sr (harder maps
+    keep less important moments too): c0 - sum_j softplus(c_j) * clamp(sr - j, 0, 1)."""
+    j = torch.arange(c.shape[0], device=sr.device, dtype=torch.float32)
+    ramp = (sr.float().unsqueeze(-1) - j).clamp(0.0, 1.0)
+    return c0 - (F.softplus(c) * ramp).sum(dim=-1)
 
 
 def build_config(rep_dims: Dict[str, int], coarse_dim: int, preset: str = "base", **overrides: object) -> HybridModelConfig:
@@ -215,6 +227,11 @@ class HybridParamNet(nn.Module):
         self.ln_bucket_head = nn.Linear(d, M * cfg.n_ln_buckets)
         self.ln_resid_head = nn.Linear(d, M)
         self.style_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.style_dim))
+        if cfg.importance_head:
+            # difficulty ladder: how important a moment is; it is mapped at star rating s when importance > theta(s)
+            self.importance_head = nn.Linear(d, 1)
+            self.ladder_c0 = nn.Parameter(torch.tensor(3.0))
+            self.ladder_c = nn.Parameter(torch.full((LADDER_BINS,), -0.5))
 
         with torch.no_grad():
             p = cfg.event_prior
@@ -302,7 +319,11 @@ class HybridParamNet(nn.Module):
         u = self.out_norm(u)[:, :T]
 
         M, Hm = cfg.max_members, cfg.frame_ms
+        extra = {}
+        if cfg.importance_head:
+            extra = {"importance": self.importance_head(u).squeeze(-1), "ladder_c0": self.ladder_c0, "ladder_c": self.ladder_c}
         return {
+            **extra,
             "time_logits": self.time_head(u),
             "lane_logits": self.lane_head(u),
             "chord_logits": self.chord_head(u),

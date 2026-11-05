@@ -560,6 +560,130 @@ class TestSampling(unittest.TestCase):
         self.assertAlmostEqual(float(balanced.weights[9]), 0.5, places=6)
 
 
+class TestJackLoss(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_jack_probability_from_lane_codes(self):
+        from osu_mapper.hybrid.losses import jack_loss
+        from osu_mapper.hybrid.params import LANE_OPS, N_LANE_CODES, code_for_mask
+
+        T = 40
+        tc = torch.zeros(1, T, dtype=torch.long)
+        em = torch.zeros(1, T, dtype=torch.long)
+        for f, m in ((0, 0b0001), (10, 0b0010), (20, 0b0010), (30, 0b0100)):   # 100 ms apart; frame 20 is a jack
+            tc[0, f], em[0, f] = 1, m
+        logits = torch.full((1, T, N_LANE_CODES), -20.0)
+        logits[0, :, LANE_OPS.index("SAME")] = 20.0       # always "repeat the previous chord"
+        loss_same, n = jack_loss(logits, tc, em, torch.ones(1, T), 10)
+        self.assertEqual(n, 2)
+        logits2 = torch.full((1, T, N_LANE_CODES), -20.0)
+        logits2[0, :, code_for_mask(0b1000)] = 20.0        # never touches lanes 1-2: no jack
+        loss_far, _ = jack_loss(logits2, tc, em, torch.ones(1, T), 10)
+        # one jack and one non-jack: either constant answer is half wrong, by the same amount
+        self.assertAlmostEqual(float(loss_same), float(loss_far), delta=0.05)
+        logits3 = logits2.clone()
+        logits3[0, 20] = logits[0, 20]                     # right at both
+        loss_right, _ = jack_loss(logits3.requires_grad_(), tc, em, torch.ones(1, T), 10)
+        self.assertLess(float(loss_right), 1e-3)
+        tc_slow = tc.clone()
+        tc_slow[0, 20], tc_slow[0, 30], tc_slow[0, 10] = 0, 0, 0
+        self.assertEqual(jack_loss(logits, tc_slow, em, torch.ones(1, T), 10)[1], 0)
+
+
+class TestSoundConsistency(unittest.TestCase):
+    def test_same_sound_same_chord_has_lift(self):
+        from osu_mapper.hybrid.metrics import sound_consistency
+
+        rng = np.random.default_rng(0)
+        T = 6000
+        feats = rng.standard_normal((T, 20)).astype(np.float32) * 0.1
+        kinds = rng.integers(0, 2, size=200)
+        notes = []
+        for i, kd in enumerate(kinds):
+            t = 200 + 250 * i
+            feats[t // 10, :10] += 3.0 if kd else -3.0                 # two kinds of hit
+            notes += [Note(t, c, t, False) for c in ((0, 3) if kd else (1,))]
+        res = sound_consistency(notes, feats, {"onset": (0, 10), "spectral": (10, 20)})
+        self.assertGreater(res["chord_size_lift"], 0.3)
+        self.assertAlmostEqual(res["chord_size_similar"], 1.0, places=6)
+
+
+class TestDifficultyLadder(unittest.TestCase):
+    """Importance head: a moment is mapped at star rating s when importance > theta(s), theta falls with s."""
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_threshold_monotone_and_numpy_matches_torch(self):
+        from osu_mapper.hybrid.model import LADDER_BINS, ladder_threshold
+        from osu_mapper.hybrid.renderer import HeadOutputs
+
+        c0, c = torch.tensor(3.0), torch.randn(LADDER_BINS)
+        srs = torch.linspace(0.0, 11.0, 45)
+        th = ladder_threshold(c0, c, srs)
+        self.assertTrue(bool((th[1:] <= th[:-1] + 1e-6).all()))
+        imp = np.array([-2.0, 0.0, 1.5, 4.0], np.float32)
+        out = HeadOutputs(np.zeros((4, 11), np.float32), np.zeros((4, 16), np.float32), np.zeros((4, 4), np.int64),
+                          np.zeros((4, 4), np.float32), np.zeros((4, 4), np.int64), np.zeros((4, 4), np.float32),
+                          importance=imp, ladder=(3.0, c.numpy()))
+        for sr in (0.5, 3.2, 7.9):
+            want = torch.sigmoid(torch.from_numpy(imp) - ladder_threshold(c0, c, torch.tensor(sr))).numpy()
+            np.testing.assert_allclose(out.ladder_probs(sr), want, rtol=1e-5, atol=1e-6)
+
+    def test_with_ladder_reweights_events_keeps_offsets(self):
+        from osu_mapper.hybrid.network_fit import with_ladder
+        from osu_mapper.hybrid.renderer import HeadOutputs
+
+        tp = np.zeros((3, 11), np.float32)
+        tp[:, 0] = 0.2
+        tp[:, 4] = 0.8
+        args = (tp, np.zeros((3, 16), np.float32), np.zeros((3, 4), np.int64), np.zeros((3, 4), np.float32),
+                np.zeros((3, 4), np.int64), np.zeros((3, 4), np.float32))
+        plain = HeadOutputs(*args)
+        self.assertIs(with_ladder(plain, 3.0), plain)  # no head: unchanged
+        out = HeadOutputs(*args, importance=np.array([-6.0, 0.0, 6.0], np.float32), ladder=(0.0, np.full(12, -30.0)))
+        new = with_ladder(out, 3.0, 0.5)
+        pe = 1.0 - new.time_probs[:, 0]
+        self.assertTrue(pe[0] < pe[1] < pe[2])                       # weak moment drops first
+        np.testing.assert_allclose(new.time_probs.sum(axis=1), 1.0, atol=1e-5)
+        self.assertTrue((np.argmax(new.time_probs[:, 1:], axis=1) == 3).all())  # ms inside the frame kept
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_dataset_ladder_and_loss(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset, collate_hybrid
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        fcfg = FeatureConfig()
+        hard = solve_map([Note(250 * i, i % 4, 250 * i, False) for i in range(4, 100)], num_frames=3000)
+        easy = solve_map([Note(1000 * i, i % 4, 1000 * i, False) for i in range(1, 25)], num_frames=3000)
+        tracks = [easy, hard, easy]
+        st = {"style": [0.0] * STYLE_DIM, "style_mask": [0.0] * STYLE_DIM}
+        index = SimpleNamespace(maps=[{"sr": 1.5, "song_id": "a", **st}, {"sr": 4.0, "song_id": "a", **st}, {"sr": 2.0, "song_id": "b", **st}],
+                                track=lambda i: tracks[i], feature_config=fcfg,
+                                features=lambda song, v=0: np.zeros((3000, fcfg.total_dim()), np.float32),
+                                coarse=lambda song: np.zeros((5, fcfg.total_dim()), np.float32), num_variants=lambda song: 1)
+        ds = HybridCropDataset(index, range(3), 512, 4, train=False, ladder_k=3)
+        item = ds[0]
+        self.assertEqual(tuple(item["ladder_presence"].shape), (3, 512))
+        srs = item["ladder_sr"].numpy()
+        self.assertEqual(int((srs > 0).sum()), 2)                  # one other map of the same song, one padding row
+        pres = item["ladder_presence"].numpy()
+        self.assertTrue((pres[srs <= 0] >= 0).all() and (pres[srs <= 0] <= 1).all())
+        self.assertGreaterEqual(pres[srs > 0].max(), 1.0)
+
+        cfg = build_config(fcfg.dims(), fcfg.total_dim(), "tiny")
+        cfg.importance_head = True
+        model = HybridParamNet(cfg)
+        batch = collate_hybrid([ds[i] for i in range(4)])
+        out = model(batch["feats"], batch["beat"], batch["sr"], batch["style"], batch["style_mask"], batch["coarse"], batch["coarse_mask"])
+        loss, logs = compute_losses(out, batch, LossWeights(ladder=0.3), cfg.frame_ms)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("ladder", logs)
+        loss.backward()
+        self.assertIsNotNone(model.ladder_c.grad)
+
+
 @unittest.skipUnless(TORCH_AVAILABLE and _ffmpeg_available(), "needs PyTorch and FFmpeg")
 class TestEndToEndSmoke(unittest.TestCase):
     def test_prepare_train_generate(self):

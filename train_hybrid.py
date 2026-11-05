@@ -257,6 +257,13 @@ def main() -> None:
                          "(default 0.15 for all); high values stop the model from recognising performers by voice")
     ap.add_argument("--density_weight", type=float, default=0.3, help="loss: expected events/notes per window vs the reference")
     ap.add_argument("--pair_weight", type=float, default=0.3, help="loss: density ratio of the same window at two difficulties")
+    ap.add_argument("--ladder_weight", type=float, default=0.3,
+                    help="loss: difficulty ladder - which moments of a song its maps of different star ratings all map "
+                         "(adds the importance head; 0 = off; an older checkpoint gets the head on --resume)")
+    ap.add_argument("--jack_weight", type=float, default=0.2,
+                    help="loss: at fast transitions (< 160 ms) P(the lane code repeats a lane of the previous chord) vs the map "
+                         "(unseen maps: network 0.27, human 0.09); 0 = off")
+    ap.add_argument("--ladder_k", type=int, default=4, help="difficulty ladder: maps of the same song per training crop")
     ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
     ap.add_argument("--sr_balance", type=float, default=0.0,
@@ -348,6 +355,10 @@ def main() -> None:
         print(f"[resume] {rp} (epoch {resume_ckpt.get('epoch')}, step {resume_ckpt.get('step')})")
     else:
         cfg = build_config(fcfg.dims(), fcfg.total_dim(), args.preset)
+    new_head = False
+    if args.ladder_weight > 0 and not cfg.importance_head and not args.eval_only:
+        cfg.importance_head = True
+        new_head = resume_ckpt is not None
 
     if args.rep_dropout is not None:  # training-only setting: may be changed when resuming
         overrides = {}
@@ -384,10 +395,13 @@ def main() -> None:
     calib = {"onset_shift_ms": 0, "ln_length_scale": 1.0}
     threshold_by_sr: Dict[int, float] = {}
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        model.load_state_dict(resume_ckpt["model_state"], strict=not new_head)
         if ema is not None and resume_ckpt.get("ema_state"):
-            ema.load_state_dict(resume_ckpt["ema_state"])
-        if resume_ckpt.get("optimizer_state"):
+            ema.load_state_dict(resume_ckpt["ema_state"], strict=not new_head)
+        if new_head:
+            # the parameter list changed: Adam moments of the old checkpoint do not line up any more
+            print("[resume] added the difficulty-ladder importance head; optimizer state starts fresh (warm restart)")
+        elif resume_ckpt.get("optimizer_state"):
             opt.load_state_dict(resume_ckpt["optimizer_state"])
         step = int(resume_ckpt.get("step", 0))
         start_epoch = int(resume_ckpt.get("epoch", 0))
@@ -401,7 +415,7 @@ def main() -> None:
     # wrap after loading the checkpoint; all ranks start from identical weights (DDP broadcasts rank 0)
     train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
 
-    weights = LossWeights(density=args.density_weight, pair=args.pair_weight)
+    weights = LossWeights(density=args.density_weight, pair=args.pair_weight, ladder=args.ladder_weight, jack=args.jack_weight)
     if args.pair_prob > 0 and args.batch_size % 2:
         print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
         args.pair_prob = 0.0
@@ -413,7 +427,7 @@ def main() -> None:
     # every rank draws its own random crops (different seed), so no sampler is needed
     train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank,
                                  sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0,
-                                 pitch_shift_prob=args.pitch_shift)
+                                 pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -542,7 +556,9 @@ def main() -> None:
                     avg = {k: v / n_run for k, v in run.items()}
                     print(f"  step {step:>7} | lr {lr:.2e} | sigma {sigma:.2f}ms | total {avg['total']:.4f} | time {avg['time']:.4f} lane {avg['lane']:.3f} chord {avg['chord']:.3f} "
                           f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f} "
-                          f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)", flush=True)
+                          f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)"
+                          + (f" ladder {avg['ladder']:.3f}" if "ladder" in avg else "")
+                          + (f" jack {avg['jack']:.3f}" if "jack" in avg else ""), flush=True)
                     run, n_run = {}, 0
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait

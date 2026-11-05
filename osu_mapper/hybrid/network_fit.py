@@ -40,7 +40,7 @@ class NetworkFit:
     threshold: float
     lag_ms: int
     reached: bool
-    lane_strength: float = 0.0   # ergonomics strength used to bring the fast-jack share to the data
+    lane_strength: float = 0.0   # weight of the pattern-model lane prior (or ergonomics strength) used for the jack share
     jack_share: float = 0.0
     jack_target: Optional[float] = None          # False: the requested rating needs notes the network does not hear (or fewer than it is sure of)
 
@@ -80,6 +80,52 @@ def network_lag(out: HeadOutputs, timing_points: Sequence[RawTimingPoint], min_e
     return int(round(float(np.median(d)))) if d.size >= min_events else 0
 
 
+def apply_repeats(notes: Sequence[Note], repeats, min_similarity: float = 0.9, gap_fn=None) -> List[Note]:
+    """Repeated phrases get the rhythm and chord sizes of their original, as mappers do (measured on human maps: the
+    rhythm of a repeat matches its original at F1 0.89, the lanes only 40 %: copies alternate with mirrors). The network
+    alone kept the rhythm at 0.27 on some maps (Circles of Death chy's Insane). ``repeats``: (start, end, source start,
+    similarity) from the composer's analysis (find_repeats); phrases are processed in time order, every second one is
+    mirrored. Long notes are cut at the phrase end."""
+    from .renderer import resolve_lane_conflicts
+
+    out = sorted(notes)
+    k = 0
+    for a, b, src, sim in sorted(repeats):
+        if sim < min_similarity or b <= a:
+            continue
+        span = b - a
+        orig = [n for n in out if src <= n.start < src + span]
+        if len(orig) < 4:
+            continue
+        mirror = k % 2 == 1
+        k += 1
+        shift = a - src
+        copied = []
+        for n in orig:
+            col = 3 - n.col if mirror else n.col
+            end = min(n.end + shift, b - 1) if n.ln else n.start + shift
+            copied.append(Note(n.start + shift, col, end, bool(n.ln and end - (n.start + shift) >= 30)))
+        out = sorted([n for n in out if not (a <= n.start < b)] + copied)
+    return resolve_lane_conflicts(out, 40, 30, gap_fn)
+
+
+def with_ladder(out: HeadOutputs, target_sr: float, mix: float = 0.5) -> HeadOutputs:
+    """Event probabilities weighted by the difficulty ladder (a model trained with the importance head): the moment's
+    probability becomes p_event^(1-mix) * P(mapped at target_sr)^mix. The ladder learnt from songs with several
+    difficulties which hits every map keeps (the strong ones) and which only hard maps add, so at a low rating the
+    threshold drops the fills first instead of whatever the network is least sure of. Unchanged without the head."""
+    pl = out.ladder_probs(target_sr)
+    if pl is None or mix <= 0:
+        return out
+    tp = out.time_probs.astype(np.float64)
+    pe = np.clip(1.0 - tp[:, 0], 1e-9, 1.0)
+    pn = pe ** (1.0 - mix) * np.clip(pl, 1e-9, 1.0) ** mix
+    new = np.empty_like(tp)
+    new[:, 0] = 1.0 - pn
+    new[:, 1:] = tp[:, 1:] * (pn / pe)[:, None]
+    return dataclasses.replace(out, time_probs=new.astype(np.float32))
+
+
 def fast_jack_share(notes: Sequence[Note], jack_ms: float = 160.0) -> float:
     from .ergonomics import ergonomics_report
     return float(ergonomics_report(notes, jack_ms=jack_ms).get("fast_jack_pct", 0.0)) / 100.0
@@ -98,16 +144,35 @@ def fit_network_map(
     fix_lag: bool = True,
     jack_target: Optional[float] = None,
     log=None,
+    lane_prior=None,
+    hand_run_continue=None,
+    repeats=None,
+    ladder_mix: float = 0.5,
 ) -> NetworkFit:
     """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
     (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes."""
     from .ergonomics import improve_ergonomics
 
     lag = network_lag(out, timing_points) if fix_lag else 0
+    out = with_ladder(out, target_sr, ladder_mix)
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
+    if hand_run_continue is not None:
+        base = dataclasses.replace(base, hand_run_continue=hand_run_continue)
     strength = 0.0
 
+    from .renderer import release_gap_fn
+    gap_fn = release_gap_fn(timing_points, base.ln_release_gap_ms, base.ln_release_gap_beats)
+
     def decode(th: float, st: float) -> List[Note]:
+        notes = _decode(th, st)
+        return apply_repeats(notes, repeats, gap_fn=gap_fn) if repeats else notes
+
+    def _decode(th: float, st: float) -> List[Note]:
+        if lane_prior is not None:
+            # the network chooses lanes together with what real maps do after these chords (pattern model); st is the
+            # weight of that prior here, not an after-the-fact re-assignment
+            return decode_outputs(out, dataclasses.replace(base, onset_threshold=th, lane_prior=lane_prior if st > 0 else None,
+                                                           lane_prior_weight=st), timing_points)
         notes = decode_outputs(out, dataclasses.replace(base, onset_threshold=th), timing_points)
         if st > 0:
             notes = improve_ergonomics(notes, timing_points, st, release_gap_ms=base.ln_release_gap_ms,
@@ -119,7 +184,7 @@ def fit_network_map(
         share = fast_jack_share(decode(th, current))
         if jack_target is None or abs(share - jack_target) <= 0.02 or (share < jack_target and current == 0.0):
             return current
-        lo_s, hi_s, best = 0.0, 1.0, (abs(share - jack_target), current)
+        lo_s, hi_s, best = 0.0, (0.6 if lane_prior is not None else 1.0), (abs(share - jack_target), current)
         for _ in range(8):
             mid = 0.5 * (lo_s + hi_s)
             sh = fast_jack_share(decode(th, mid))

@@ -170,6 +170,8 @@ class HybridPredictor:
 
         time_acc = np.zeros((F, 1 + H), dtype=np.float32)
         w_acc = np.zeros(F, dtype=np.float32)
+        imp_acc = np.zeros(F, dtype=np.float32)
+        ladder = None
         best_w = np.zeros(F, dtype=np.float32)
         lane = np.zeros((F, cfg.n_lane_codes), dtype=np.float32)
         chord = np.zeros((F, cfg.max_members), dtype=np.float32)
@@ -224,12 +226,17 @@ class HybridPredictor:
             ll = out["ln_logits"].float().cpu().numpy()
             lb = out["ln_bucket_logits"].argmax(dim=-1).cpu().numpy()
             lr = out["ln_resid"].float().cpu().numpy()
+            imp = out["importance"].float().cpu().numpy() if "importance" in out else None
+            if imp is not None and ladder is None:
+                ladder = (float(out["ladder_c0"].float()), out["ladder_c"].float().cpu().numpy().copy())
             for j, s in enumerate(chunk):
                 a, b = max(0, s), min(F, s + W)
                 if b <= a:
                     continue
                 wj = weight[a - s: b - s]
                 time_acc[a:b] += tp[j, a - s: b - s] * wj[:, None]
+                if imp is not None:
+                    imp_acc[a:b] += imp[j, a - s: b - s] * wj
                 w_acc[a:b] += wj
                 better = wj > best_w[a:b]
                 rows = np.flatnonzero(better) + a
@@ -254,6 +261,8 @@ class HybridPredictor:
             ln_resid=ln_resid,
             frame_ms=H,
             chord_logprobs=chord,
+            importance=(imp_acc / np.maximum(w_acc, 1e-6)).astype(np.float32) if ladder is not None else None,
+            ladder=ladder,
         )
 
 
