@@ -105,9 +105,10 @@ def to_device(batch: Dict[str, torch.Tensor], dev: torch.device) -> Dict[str, to
 
 
 def forward_batch(model: HybridParamNet, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    canvas = (batch["canvas_state"], batch["canvas_ms"], batch["canvas_ln"]) if "canvas_state" in batch else None
     return model(
         batch["feats"], batch["beat"], batch["sr"], batch["style"], batch["style_mask"],
-        batch["coarse"], batch["coarse_mask"],
+        batch["coarse"], batch["coarse_mask"], canvas=canvas,
     )
 
 
@@ -263,6 +264,9 @@ def main() -> None:
     ap.add_argument("--jack_weight", type=float, default=0.2,
                     help="loss: at fast transitions (< 160 ms) P(the lane code repeats a lane of the previous chord) vs the map "
                          "(unseen maps: network 0.27, human 0.09); 0 = off")
+    ap.add_argument("--canvas_prob", type=float, default=0.5,
+                    help="masked discrete diffusion: share of crops that get part of their own map as input (the rest are "
+                         "fully masked = the plain network); adds the canvas input; 0 = off (see osu_mapper/hybrid/canvas.py)")
     ap.add_argument("--ladder_k", type=int, default=4, help="difficulty ladder: maps of the same song per training crop")
     ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
@@ -359,6 +363,9 @@ def main() -> None:
     if args.ladder_weight > 0 and not cfg.importance_head and not args.eval_only:
         cfg.importance_head = True
         new_head = resume_ckpt is not None
+    if args.canvas_prob > 0 and not cfg.canvas and not args.eval_only:
+        cfg.canvas = True
+        new_head = new_head or resume_ckpt is not None
 
     if args.rep_dropout is not None:  # training-only setting: may be changed when resuming
         overrides = {}
@@ -400,7 +407,7 @@ def main() -> None:
             ema.load_state_dict(resume_ckpt["ema_state"], strict=not new_head)
         if new_head:
             # the parameter list changed: Adam moments of the old checkpoint do not line up any more
-            print("[resume] added the difficulty-ladder importance head; optimizer state starts fresh (warm restart)")
+            print("[resume] added new parts (difficulty-ladder head / map canvas); optimizer state starts fresh (warm restart)")
         elif resume_ckpt.get("optimizer_state"):
             opt.load_state_dict(resume_ckpt["optimizer_state"])
         step = int(resume_ckpt.get("step", 0))
@@ -427,7 +434,8 @@ def main() -> None:
     # every rank draws its own random crops (different seed), so no sampler is needed
     train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank,
                                  sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0,
-                                 pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0)
+                                 pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0,
+                                 canvas_prob=args.canvas_prob)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:

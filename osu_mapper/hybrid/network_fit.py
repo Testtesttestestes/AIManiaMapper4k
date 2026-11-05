@@ -148,13 +148,38 @@ def fit_network_map(
     hand_run_continue=None,
     repeats=None,
     ladder_mix: float = 0.5,
+    hedge_fallback: Sequence[tuple] = ((60, 1.2), (60, 1.0), (40, 1.0)),
 ) -> NetworkFit:
     """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
-    (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes."""
-    from .ergonomics import improve_ergonomics
+    (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes.
 
+    ``hedge_fallback``: (hedge_ms, hedge_sum) steps tried, in order, only when the rating is not reached at the lowest
+    threshold. The hedge merges two close, weak events into one note; at the lowest threshold it also merges real
+    neighbours (15 unseen maps: rating reached on 11 -> 15, mean error 0.24 -> 0.03; on the 4 maps it changed, notes
+    match the human map -0.02 on average (all 15: 0.703 -> 0.698), notes <= 30 ms from another up to 2.2 %). The other maps are not touched."""
     lag = network_lag(out, timing_points) if fix_lag else 0
     out = with_ladder(out, target_sr, ladder_mix)
+    fit = _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
+               jack_target, log, lane_prior, hand_run_continue, repeats)
+    for hm, hs in hedge_fallback:
+        if fit.reached or fit.star_rating > target_sr or not knobs.hedge_ms:
+            break
+        k2 = dataclasses.replace(knobs, hedge_ms=int(min(hm, knobs.hedge_ms)), hedge_sum=float(min(hs, knobs.hedge_sum)))
+        if (k2.hedge_ms, k2.hedge_sum) == (knobs.hedge_ms, knobs.hedge_sum):
+            continue
+        f2 = _fit(out, k2, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
+                  jack_target, None, lane_prior, hand_run_continue, repeats)
+        if abs(f2.star_rating - target_sr) < abs(fit.star_rating - target_sr):
+            if log:
+                log(f"    rating {fit.star_rating:.2f} not reachable at the lowest threshold: close weak events kept apart "
+                    f"(hedge {k2.hedge_ms} ms / {k2.hedge_sum:g}) -> {f2.star_rating:.2f}")
+            fit = f2
+    return fit
+
+
+def _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
+         jack_target, log, lane_prior, hand_run_continue, repeats) -> NetworkFit:
+    from .ergonomics import improve_ergonomics
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
     if hand_run_continue is not None:
         base = dataclasses.replace(base, hand_run_continue=hand_run_continue)

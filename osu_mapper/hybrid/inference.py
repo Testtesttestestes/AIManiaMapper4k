@@ -150,6 +150,7 @@ class HybridPredictor:
         progress: Optional[Callable[[int, int], None]] = None,
         sr_guidance: float = 1.0,
         style_guidance: float = 1.0,
+        canvas: Optional[tuple] = None,
     ) -> HeadOutputs:
         """Sliding-window inference over the whole track.
 
@@ -200,6 +201,10 @@ class HybridPredictor:
             n = len(chunk)
             feats = torch.from_numpy(np.stack([window_slice(inputs.feats, s) for s in chunk])).to(dev)
             beat = torch.from_numpy(np.stack([window_slice(inputs.beat, s) for s in chunk])).to(dev)
+            cv = None
+            if canvas is not None and getattr(self.model.cfg, "canvas", False):
+                # outside the song: state 0 = masked
+                cv = tuple(torch.from_numpy(np.stack([window_slice(np.asarray(a), s) for s in chunk])).to(dev) for a in canvas)
             def run(sr_value: float, use_style: bool) -> Dict[str, torch.Tensor]:
                 return self.model(
                     feats, beat,
@@ -209,6 +214,7 @@ class HybridPredictor:
                     coarse.expand(n, -1, -1),
                     None,
                     rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
+                    canvas=cv,
                 )
 
             out = run(star_rating, True)

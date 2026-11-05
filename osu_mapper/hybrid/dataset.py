@@ -193,6 +193,7 @@ class HybridCropDataset(Dataset):
         pair_prob: float = 0.0,
         pitch_shift_prob: float = 0.0,
         ladder_k: int = 0,
+        canvas_prob: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -204,6 +205,7 @@ class HybridCropDataset(Dataset):
         self.augment = augment and train
         self.pitch_shift_prob = float(pitch_shift_prob) if self.augment else 0.0
         self.ladder_k = int(ladder_k)
+        self.canvas_prob = float(canvas_prob)
         self.epoch = 0
         self.tracks = [SparseTrack(index.track(i)) for i in self.map_indices]
         self.entries = [index.maps[i] for i in self.map_indices]
@@ -309,6 +311,11 @@ class HybridCropDataset(Dataset):
         }
         for key, arr in tgt.items():
             item[key] = torch.from_numpy(arr)
+        if self.canvas_prob > 0:
+            from .canvas import canvas_from_targets, sample_known
+            known = sample_known(self.crop, rng, track.frame_ms) if rng.random() < self.canvas_prob else np.zeros(self.crop, bool)
+            cs, cm, cl = canvas_from_targets(tgt, known)
+            item["canvas_state"], item["canvas_ms"], item["canvas_ln"] = torch.from_numpy(cs), torch.from_numpy(cm), torch.from_numpy(cl)
         if ladder is not None:
             item["ladder_presence"] = torch.from_numpy(ladder[0])
             item["ladder_sr"] = torch.from_numpy(ladder[1])

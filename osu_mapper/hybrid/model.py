@@ -57,6 +57,7 @@ class HybridModelConfig:
     max_members: int = MAX_MEMBERS
     rope_base: float = 10000.0
     event_prior: float = 0.03
+    canvas: bool = False              # masked discrete diffusion: a partially known map of the window as input (canvas.py)
     importance_head: bool = False     # difficulty ladder: per-frame importance + monotone threshold per star rating
 
     def to_dict(self) -> Dict[str, object]:
@@ -197,6 +198,15 @@ class HybridParamNet(nn.Module):
         self.rep_missing = nn.Parameter(torch.zeros(n_reps, d))
         self.beat_stem = nn.Linear(cfg.beat_dim, d)
         self.in_norm = nn.LayerNorm(d)
+        if cfg.canvas:
+            from .canvas import N_CANVAS_STATES
+            from .params import NUM_LANES
+            self.canvas_state = nn.Embedding(N_CANVAS_STATES, d)
+            self.canvas_ms = nn.Embedding(H, d)
+            self.canvas_ln = nn.Linear(NUM_LANES, d)
+            self.canvas_out = nn.Linear(d, d)
+            nn.init.zeros_(self.canvas_out.weight)   # starts as the plain network: an older checkpoint is unchanged
+            nn.init.zeros_(self.canvas_out.bias)
 
         cond_in = 2 + 2 * cfg.style_dim
         self.cond_mlp = nn.Sequential(nn.Linear(cond_in, d), nn.SiLU(), nn.Linear(d, d))
@@ -270,6 +280,7 @@ class HybridParamNet(nn.Module):
         coarse: Optional[torch.Tensor] = None,
         coarse_mask: Optional[torch.Tensor] = None,
         rep_present: Optional[torch.Tensor] = None,
+        canvas: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
         B, T, _ = feats.shape
@@ -300,6 +311,16 @@ class HybridParamNet(nn.Module):
             h = self.stems[name](feats[..., s0:s1])
             p = present[:, i].view(B, 1, 1)
             x = x + self.rep_gate[i] * (h * p + self.rep_missing[i].view(1, 1, -1) * (1.0 - p))
+        if cfg.canvas:
+            if canvas is None:
+                st = torch.zeros(B, T, dtype=torch.long, device=dev)
+                cms = torch.zeros(B, T, dtype=torch.long, device=dev)
+                cln = torch.zeros(B, T, self.canvas_ln.in_features, device=dev)
+            else:
+                st, cms, cln = canvas[0].long().to(dev), canvas[1].long().to(dev), canvas[2].float().to(dev)
+            e = self.canvas_state(st) + self.canvas_ms(cms.clamp(0, cfg.frame_ms - 1)) * (st >= 2).unsqueeze(-1).float() \
+                + self.canvas_ln(cln)
+            x = x + self.canvas_out(e)
         x = self.in_norm(x)
         c = self._condition(sr, style.float(), style_mask, coarse, coarse_mask, use_global)
 

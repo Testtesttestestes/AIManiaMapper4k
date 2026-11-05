@@ -86,18 +86,20 @@ def compute_losses(
     tc = batch["time_class"]
     valid = batch["valid"].float()
     B, T = tc.shape
+    # masked diffusion: frames given on the canvas are not predicted (time, lanes, members count only masked frames)
+    valid_pred = valid * (batch["canvas_state"] == 0).float() if "canvas_state" in batch else valid
     logs: Dict[str, float] = {}
 
     # --- time (per-ms) -------------------------------------------------------------------------
     target = soft_time_targets(tc, frame_ms, sigma_ms)
     logp = F.log_softmax(out["time_logits"].float(), dim=-1)
     ce = -(target * logp).sum(dim=-1)
-    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid
+    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred
     loss_time = (ce * w).sum() / w.sum().clamp(min=1.0)
     total = weights.time * loss_time
     logs["time"] = float(loss_time.detach())
 
-    ev = (tc > 0) & (valid > 0)
+    ev = (tc > 0) & (valid_pred > 0)
     n_ev = int(ev.sum())
     logs["events"] = float(n_ev)
     # zero-valued terms stay connected to their heads, so every parameter receives a (zero) gradient:

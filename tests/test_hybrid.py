@@ -560,6 +560,79 @@ class TestSampling(unittest.TestCase):
         self.assertAlmostEqual(float(balanced.weights[9]), 0.5, places=6)
 
 
+class TestMapCanvas(unittest.TestCase):
+    """Masked discrete diffusion: the network gets a partially known map of the window."""
+
+    def test_canvas_from_targets(self):
+        from osu_mapper.hybrid.canvas import EMPTY, MASK, canvas_from_targets, sample_known
+
+        track = solve_map([Note(1003, 1, 1003, False), Note(1003, 3, 1300, True), Note(2007, 0, 2007, False)], num_frames=400)
+        tgt = track.crop_arrays(0, 300)
+        known = np.ones(300, bool)
+        known[200] = False                                 # the note at 2007 ms is masked
+        st, ms, ln = canvas_from_targets(tgt, known)
+        self.assertEqual(int(st[100]), 1 + 0b1010)
+        self.assertEqual(int(ms[100]), 3)
+        self.assertEqual(ln[100].tolist(), [0.0, 0.0, 0.0, 1.0])
+        self.assertEqual(int(st[200]), MASK)
+        self.assertEqual(int(st[150]), EMPTY)
+        k = sample_known(500, np.random.default_rng(0))
+        self.assertEqual(k.shape, (500,))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_canvas_starts_neutral(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        fcfg = FeatureConfig()
+        cfg = build_config(fcfg.dims(), fcfg.total_dim(), "tiny")
+        cfg.canvas = True
+        torch.manual_seed(0)
+        m = HybridParamNet(cfg).eval()
+        B, T, D = 2, 128, fcfg.total_dim()
+        args = (torch.randn(B, T, D), torch.zeros(B, T, 13), torch.full((B, 1), 3.0), torch.zeros(B, STYLE_DIM), torch.zeros(B, STYLE_DIM))
+        cv = (torch.randint(0, 17, (B, T)), torch.randint(0, 10, (B, T)), torch.rand(B, T, 4))
+        with torch.no_grad():
+            a = m(*args)["time_logits"]
+            b = m(*args, canvas=cv)["time_logits"]
+            self.assertLess(float((a - b).abs().max()), 1e-6)  # zero-initialised: an older checkpoint is unchanged
+            m.canvas_out.weight.normal_(0, 0.1)
+            c = m(*args, canvas=cv)["time_logits"]
+        self.assertGreater(float((a - c).abs().max()), 1e-4)
+
+    def test_refine_keeps_fixed_notes(self):
+        from osu_mapper.hybrid.canvas import refine
+        from osu_mapper.hybrid.network_fit import fit_network_map
+        from osu_mapper.hybrid.renderer import DecodeKnobs
+
+        rng = random.Random(4)
+        track = solve_map(random_map(rng, 80))
+        out = oracle_outputs(track)
+        r = np.random.default_rng(1)
+        ev = np.flatnonzero(out.time_probs[:, 0] < 0.5)
+        p = r.uniform(0.3, 1.0, ev.size)
+        out.time_probs[ev] *= p[:, None]
+        out.time_probs[ev, 0] = 1.0 - p
+        seen = []
+
+        def predict(cv):
+            seen.append(int((cv[0] >= 2).sum()))
+            return out
+
+        fit = lambda o: fit_network_map(o, DecodeKnobs(), track.timing_points, 30.0, fix_lag=False)  # unreachable: all notes
+        o4, f4 = refine(predict, fit, out.num_frames, out.frame_ms, lambda f: 0, steps=4)
+        self.assertEqual(seen[0], 0)
+        self.assertTrue(seen == sorted(seen) and seen[-1] > 0)         # more notes fixed each pass
+        fixed_p = 1.0 - o4.time_probs[:, 0]
+        self.assertGreaterEqual(int((fixed_p == 1.0).sum()), seen[-1])
+        n1, n4 = len({n.start for n in fit(out).notes}), len({n.start for n in f4.notes})
+        self.assertLessEqual(abs(n4 - n1), max(2, 0.05 * n1))   # near a fixed note (probability 1) the hedge may decide otherwise
+        starts = np.array(sorted({n.start for n in f4.notes}))
+        for f in np.flatnonzero(fixed_p == 1.0):                 # every fixed event is in the final map
+            t = f * out.frame_ms + int(np.argmax(o4.time_probs[f, 1:]))
+            self.assertLessEqual(int(np.abs(starts - t).min()), 20)
+
+
 class TestJackLoss(unittest.TestCase):
     @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
     def test_jack_probability_from_lane_codes(self):
