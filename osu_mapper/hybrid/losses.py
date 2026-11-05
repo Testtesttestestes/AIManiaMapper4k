@@ -37,6 +37,7 @@ class LossWeights:
     style: float = 0.05
     density: float = 0.3   # expected events / notes per window vs the reference (do not under-/over-fill)
     pair: float = 0.3      # same window at two difficulties: the density RATIO must match the references
+    ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -165,6 +166,27 @@ def compute_losses(
     logs["density"] = float(loss_density.detach())
     logs["pair"] = float(loss_pair.detach())
     logs["pairs"] = float(pidx.numel()) if pidx is not None else 0.0
+
+    # --- difficulty ladder ---------------------------------------------------------------------
+    # every moment that any map of the song has (+-1 frame): mapped at star rating s_k or not, for each of the song's maps
+    # -> sigma(importance - theta(s_k)); strong hits end up important at every difficulty, fills only at the hard ones
+    if weights.ladder > 0 and "importance" in out and "ladder_presence" in batch:
+        from .model import ladder_threshold
+        pres = batch["ladder_presence"].float()                    # [B, K, T]
+        srs = batch["ladder_sr"].float()                           # [B, K]
+        have = (srs > 0).float().unsqueeze(-1)                     # [B, K, 1]
+        known = (pres >= 0).float() * have                         # [B, K, T]
+        union = ((pres * known).amax(dim=1) > 0).float() * valid  # [B, T]
+        theta = ladder_threshold(out["ladder_c0"], out["ladder_c"], srs.clamp(min=0.0))  # [B, K]
+        logit = out["importance"].float().unsqueeze(1) - theta.unsqueeze(-1)          # [B, K, T]
+        m = known * union.unsqueeze(1)
+        if m.sum() > 0:
+            bce = F.binary_cross_entropy_with_logits(logit, pres.clamp(min=0.0), reduction="none")
+            loss_ladder = (bce * m).sum() / m.sum()
+        else:
+            loss_ladder = out["importance"].float().sum() * 0.0 + out["ladder_c"].sum() * 0.0
+        total = total + weights.ladder * loss_ladder
+        logs["ladder"] = float(loss_ladder.detach())
 
     # --- auto-style ----------------------------------------------------------------------------
     sm = batch["style_mask"].float()

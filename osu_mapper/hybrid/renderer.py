@@ -76,6 +76,18 @@ class HeadOutputs:
     ln_resid: np.ndarray          # [F, 4] in [0, 1], position inside the bucket
     frame_ms: int = FRAME_MS
     chord_logprobs: Optional[np.ndarray] = None  # [F, 4] log P(chord size = 1..4)
+    importance: Optional[np.ndarray] = None      # [F] difficulty-ladder importance (model with the importance head)
+    ladder: Optional[tuple] = None               # (c0, c[LADDER_BINS]) of the monotone threshold theta(sr)
+
+    def ladder_probs(self, sr: float) -> Optional[np.ndarray]:
+        """[F] P(this moment is mapped at star rating ``sr``) from the difficulty ladder, None without the head."""
+        if self.importance is None or self.ladder is None:
+            return None
+        c0, c = self.ladder
+        c = np.asarray(c, np.float64)
+        ramp = np.clip(float(sr) - np.arange(c.size), 0.0, 1.0)
+        theta = float(c0) - float((np.logaddexp(0.0, c) * ramp).sum())
+        return 1.0 / (1.0 + np.exp(-(self.importance.astype(np.float64) - theta)))
 
     @property
     def num_frames(self) -> int:

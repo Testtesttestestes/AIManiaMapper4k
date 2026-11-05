@@ -109,6 +109,23 @@ def apply_repeats(notes: Sequence[Note], repeats, min_similarity: float = 0.9, g
     return resolve_lane_conflicts(out, 40, 30, gap_fn)
 
 
+def with_ladder(out: HeadOutputs, target_sr: float, mix: float = 0.5) -> HeadOutputs:
+    """Event probabilities weighted by the difficulty ladder (a model trained with the importance head): the moment's
+    probability becomes p_event^(1-mix) * P(mapped at target_sr)^mix. The ladder learnt from songs with several
+    difficulties which hits every map keeps (the strong ones) and which only hard maps add, so at a low rating the
+    threshold drops the fills first instead of whatever the network is least sure of. Unchanged without the head."""
+    pl = out.ladder_probs(target_sr)
+    if pl is None or mix <= 0:
+        return out
+    tp = out.time_probs.astype(np.float64)
+    pe = np.clip(1.0 - tp[:, 0], 1e-9, 1.0)
+    pn = pe ** (1.0 - mix) * np.clip(pl, 1e-9, 1.0) ** mix
+    new = np.empty_like(tp)
+    new[:, 0] = 1.0 - pn
+    new[:, 1:] = tp[:, 1:] * (pn / pe)[:, None]
+    return dataclasses.replace(out, time_probs=new.astype(np.float32))
+
+
 def fast_jack_share(notes: Sequence[Note], jack_ms: float = 160.0) -> float:
     from .ergonomics import ergonomics_report
     return float(ergonomics_report(notes, jack_ms=jack_ms).get("fast_jack_pct", 0.0)) / 100.0
@@ -130,12 +147,14 @@ def fit_network_map(
     lane_prior=None,
     hand_run_continue=None,
     repeats=None,
+    ladder_mix: float = 0.5,
 ) -> NetworkFit:
     """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
     (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes."""
     from .ergonomics import improve_ergonomics
 
     lag = network_lag(out, timing_points) if fix_lag else 0
+    out = with_ladder(out, target_sr, ladder_mix)
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
     if hand_run_continue is not None:
         base = dataclasses.replace(base, hand_run_continue=hand_run_continue)

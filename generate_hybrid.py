@@ -178,6 +178,9 @@ def main(argv=None) -> None:
                     help="with --fit_sr: a phrase that repeats earlier music gets the original's rhythm and chord sizes, lanes "
                          "alternating as in the original / mirrored (as mappers do; the network alone does not keep repeats)")
     ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
+    ap.add_argument("--ladder_mix", type=float, default=0.5,
+                    help="with --fit_sr and a model trained with the difficulty ladder: share of 'is this moment mapped at "
+                         "this star rating' (learnt from songs with several difficulties) in the event probability; 0 = off")
     ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--sr_guidance", default="1",
@@ -333,7 +336,7 @@ def main(argv=None) -> None:
                     hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
                     fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                           min_threshold=args.min_threshold, jack_target=jt, log=print, lane_prior=lp,
-                                          hand_run_continue=hr, repeats=song_repeats)
+                                          hand_run_continue=hr, repeats=song_repeats, ladder_mix=args.ladder_mix)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
@@ -346,7 +349,7 @@ def main(argv=None) -> None:
                                                      sr_guidance=g2, style_guidance=args.style_guidance)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                                    min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp,
-                                                   hand_run_continue=hr, repeats=song_repeats)
+                                                   hand_run_continue=hr, repeats=song_repeats, ladder_mix=args.ladder_mix)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
                                 print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
                                 fit, out = fit2, out2
