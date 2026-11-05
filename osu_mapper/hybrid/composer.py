@@ -542,6 +542,7 @@ class NetHints:
     chord_logprobs: Optional[np.ndarray]
     ln_prob: Optional[np.ndarray]    # [F] max member LN probability
     ln_len_ms: Optional[np.ndarray] = None  # [F] LN length the network predicts (it hears how long a sound lasts)
+    lag_ms: int = 0                          # how much later than the mapper's grid the network's milliseconds come
 
     @classmethod
     def from_outputs(cls, out) -> "NetHints":
@@ -552,6 +553,24 @@ class NetHints:
         if getattr(out, "ln_bucket", None) is not None and getattr(out, "ln_resid", None) is not None:
             ln_len = ln_bucket_to_length(out.ln_bucket[:, 0], out.ln_resid[:, 0]).astype(np.int64)
         return cls(1.0 - tp[:, 0], np.argmax(tp[:, 1:], axis=1), out.lane_logits, out.chord_logprobs, ln, ln_len)
+
+    def calibrate_lag(self, ticks: np.ndarray, tick_div: np.ndarray, frame_ms: int) -> None:
+        """Per-song offset of the network's predicted milliseconds against the template's grid: median distance from
+        confident network events to the nearest beat / half-beat tick. Measured: 0 on most songs, but on some audio the
+        network's milliseconds are shifted (Exit This Earth's Atomosphere: 61 % of the old decoder's notes off-grid), and
+        a candidate weighting by the distance to the predicted ms then prefers the wrong neighbouring tick."""
+        pe = self.p_event
+        fr = np.flatnonzero((pe >= 0.5) & (pe >= np.roll(pe, 1)) & (pe >= np.roll(pe, -1)))
+        strong = np.sort(ticks[np.isin(tick_div, [1, 2])])
+        if fr.size < 30 or strong.size < 30:
+            return
+        ms = fr * frame_ms + self.offset_ms[fr]
+        j = np.clip(np.searchsorted(strong, ms), 1, strong.size - 1)
+        a, b = ms - strong[j], ms - strong[j - 1]
+        d = np.where(np.abs(a) < np.abs(b), a, b)
+        d = d[np.abs(d) <= 20]
+        if d.size >= 30:
+            self.lag_ms = int(round(float(np.median(d))))
 
     def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15, sigma_ms: float = 4.0) -> np.ndarray:
         """Network note probability AT a candidate time: the probability of each nearby frame, weighted by how far the
@@ -564,7 +583,7 @@ class NetHints:
         out = np.zeros(t.shape)
         for d in range(-r, r + 1):
             ff = np.clip(f + d, 0, F - 1)
-            ms = ff * frame_ms + self.offset_ms[ff]
+            ms = ff * frame_ms + self.offset_ms[ff] - self.lag_ms
             w = np.exp(-0.5 * ((t - ms) / sigma_ms) ** 2)
             out = np.maximum(out, self.p_event[ff] * w)
         return out
@@ -674,11 +693,12 @@ class Composer:
         div = an.tick_div.copy()
         net = np.zeros(t.size)
         if self.hints is not None:
+            self.hints.calibrate_lag(an.ticks, an.tick_div, H)
             net = self.hints.p_at(t, H)
             # confident network events far from every tick (off-grid notes, wrong tempo estimate)
             pe = self.hints.p_event
             peaks = np.flatnonzero((pe >= 0.5) & (pe >= np.roll(pe, 1)) & (pe >= np.roll(pe, -1)))
-            et = peaks * H + self.hints.offset_ms[peaks]
+            et = peaks * H + self.hints.offset_ms[peaks] - self.hints.lag_ms
             if t.size:
                 pos = np.clip(np.searchsorted(t, et), 1, t.size - 1)
                 dist = np.minimum(np.abs(t[pos] - et), np.abs(t[pos - 1] - et))
