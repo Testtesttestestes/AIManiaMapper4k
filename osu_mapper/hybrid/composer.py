@@ -96,6 +96,8 @@ class ComposerConfig:
     max_iterations: int = 16
     families: Optional[Sequence[str]] = None   # allowed pattern families (None = all)
     net_weight: float = 1.0          # weight of the network's event probability / lane prior (if given)
+    net_rhythm: float = 3.0          # how strongly the network's note probability ranks the candidates (x net_weight)
+    net_shape: float = 1.0           # 0..1: section densities from the audio intensity (0) or the network (1)
     repeat_memory: bool = True       # repeated sections reuse the earlier mapping
     mirror_repeats: Optional[bool] = None      # None = decided per repeat by the seed
     seed: int = 0
@@ -551,13 +553,20 @@ class NetHints:
             ln_len = ln_bucket_to_length(out.ln_bucket[:, 0], out.ln_resid[:, 0]).astype(np.int64)
         return cls(1.0 - tp[:, 0], np.argmax(tp[:, 1:], axis=1), out.lane_logits, out.chord_logprobs, ln, ln_len)
 
-    def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15) -> np.ndarray:
+    def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15, sigma_ms: float = 4.0) -> np.ndarray:
+        """Network note probability AT a candidate time: the probability of each nearby frame, weighted by how far the
+        candidate is from the millisecond the network predicts inside that frame. Neighbouring 1/16 ticks are 30 ms
+        apart at 125 BPM - a plain max over +-15 ms gave both the same probability and lost the network's timing."""
         F = self.p_event.size
-        f = np.asarray(t, dtype=np.int64) // frame_ms
-        r = max(1, radius_ms // frame_ms)
-        out = np.zeros(f.shape)
+        t = np.asarray(t, dtype=np.int64)
+        f = t // frame_ms
+        r = max(1, int(math.ceil(radius_ms / frame_ms)))
+        out = np.zeros(t.shape)
         for d in range(-r, r + 1):
-            out = np.maximum(out, self.p_event[np.clip(f + d, 0, F - 1)])
+            ff = np.clip(f + d, 0, F - 1)
+            ms = ff * frame_ms + self.offset_ms[ff]
+            w = np.exp(-0.5 * ((t - ms) / sigma_ms) ** 2)
+            out = np.maximum(out, self.p_event[ff] * w)
         return out
 
 
@@ -575,6 +584,42 @@ def _level_params(L: float) -> Tuple[float, float, float]:
     gap = 420.0 * (38.0 / 420.0) ** min(1.0, L)
     chord = min(0.92, 0.02 + 0.55 * L ** 1.4)
     return eps, gap, chord
+
+
+def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, gaps: np.ndarray) -> List[int]:
+    """Lazy greedy selection of ``budget`` candidates by score. A candidate close to already chosen notes is not
+    forbidden, its score just drops the closer it gets (``gaps`` = comfortable gap per candidate); the budget alone sets
+    the density, so the star rating changes smoothly with the level instead of jumping when the gap crosses the song's
+    1/4 spacing. Two notes closer than 20 ms are one note."""
+    import heapq
+
+    heap = [(-float(sc[q]), q) for q in range(idx.size)]
+    heapq.heapify(heap)
+    taken: List[int] = []
+    taken_t = np.empty(0, dtype=np.int64)
+
+    def penalty(tk: int, g: float) -> float:
+        if not taken_t.size:
+            return 0.0
+        p = int(np.searchsorted(taken_t, tk))
+        d = min(taken_t[p] - tk if p < taken_t.size else 10 ** 9, tk - taken_t[p - 1] if p > 0 else 10 ** 9)
+        if d < 20:
+            return 1e9
+        return 12.0 * max(0.0, 1.0 - d / g) ** 1.5
+
+    while heap and len(taken) < budget:
+        _, q = heapq.heappop(heap)
+        tk = int(t[idx[q]])
+        cur = float(sc[q]) - penalty(tk, float(gaps[q]))
+        if heap and cur < -heap[0][0] - 1e-9:
+            if cur > -1e8:
+                heapq.heappush(heap, (-cur, q))
+            continue
+        if cur <= -1e8:
+            continue
+        taken_t = np.insert(taken_t, int(np.searchsorted(taken_t, tk)), tk)
+        taken.append(int(idx[q]))
+    return taken
 
 
 def _jack_min(L: float) -> float:
@@ -764,7 +809,19 @@ class Composer:
                     lo = e
                 else:
                     hi = e
-        self._shape = shape_for(e * self.cfg.contrast)
+        shape = shape_for(e * self.cfg.contrast)
+        w = float(np.clip(self.cfg.net_shape * self.cfg.net_weight, 0.0, 1.0)) if self.hints is not None else 0.0
+        if w > 0:
+            # the network's expected number of notes per section: on real songs its density graph follows the mapper's
+            # far better than the audio intensity does (Poisoned Bathwater: 0.94 vs 0.75)
+            H = self.an.frame_ms
+            pe = self.hints.p_event
+            dens = np.array([float(pe[s.start_ms // H: max(s.start_ms // H + 1, s.end_ms // H)].mean()) for s in self.sections])
+            net_shape = np.maximum(dens, 1e-4) ** self.cfg.contrast
+            net_shape = net_shape / max(1e-6, (net_shape * dur).sum() / dur.sum())
+            shape = np.where(shape > 0, shape, 1e-3) ** (1.0 - w) * net_shape ** w
+            shape = shape / max(1e-6, (shape * dur).sum() / dur.sum())
+        self._shape = shape
         return self._shape
 
     # --- rhythm (which candidates become events) ---------------------------------------------------
@@ -775,7 +832,11 @@ class Composer:
         w_net = cfg.net_weight if self.hints is not None else 0.0
         # simple rhythms first on easy levels, audio decides on hard ones
         w_metric = 0.55 * (1.2 - min(1.0, L))
-        base = 1.6 * self.attack + w_metric * self.metric / 4.0 + 1.4 * w_net * self.net
+        base = 1.6 * self.attack + w_metric * self.metric / 4.0
+        if self.hints is not None:
+            # the network knows which sounds mappers map: its note probability ranks the candidates first
+            q = np.clip(self.net, 0.02, 0.98)
+            base = base + cfg.net_rhythm * w_net * np.log(q / (1.0 - q))
         if self.patterns is not None:
             # how often real maps of this difficulty put a note on a tick of this divisor
             use = self.patterns.tick_usage(self.target_sr)
@@ -786,6 +847,8 @@ class Composer:
         chosen = np.zeros(t.size, dtype=bool)
         sec_of = self.sec_of
         chosen_t: List[np.ndarray] = []  # times chosen so far (sections are processed in order)
+        groups = []
+        global_pick = self.hints is not None and cfg.net_shape * cfg.net_weight >= 0.5
         for si, s in enumerate(self.sections):
             idx = np.flatnonzero(sec_of == si)
             if idx.size == 0 or shape[si] <= 0:
@@ -801,10 +864,11 @@ class Composer:
             sc = base[idx].copy()
             sc = sc + 0.8 * s.ramp * self.pos[idx] + 0.5 * self.energy[idx]
             div = self.div[idx]
-            if s.triplet:
-                sc[np.isin(div, BINARY_FINE)] -= 0.8
-            else:
-                sc[np.isin(div, list(TRIPLET))] -= 0.8
+            # binary vs triplet feel of the section; where the network is sure about a note of the other kind (a 1/12
+            # fill in a straight section), it wins
+            other = np.isin(div, BINARY_FINE) if s.triplet else np.isin(div, list(TRIPLET))
+            sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
+            sc = sc - 0.8 * other * (1.0 - sure)
             if cfg.repeat_memory and chosen_t and self.an.repeats:
                 # remember the rhythm of the earlier occurrence of a repeated phrase
                 src = np.sort(np.concatenate(chosen_t))
@@ -813,43 +877,24 @@ class Composer:
                     pos = np.clip(np.searchsorted(src, rel), 1, max(1, src.size - 1))
                     d = np.minimum(np.abs(src[np.minimum(pos, src.size - 1)] - rel), np.abs(src[pos - 1] - rel))
                     sc = sc + 1.2 * ((d <= 6) & (rel >= 0))
-            g = gap
-            if s.family in ("chordjack", "jack"):
-                g = gap * 1.25
-            # lazy greedy: a candidate close to already chosen notes is not forbidden, its score just drops the
-            # closer it gets (g = comfortable gap of this level); the budget alone sets the density, so the star
-            # rating changes smoothly with the level instead of jumping when g crosses the song's 1/4 spacing
-            import heapq
-            heap = [(-float(sc[q]), int(k)) for q, k in enumerate(idx)]
-            heapq.heapify(heap)
-            score_of = {int(k): float(sc[q]) for q, k in enumerate(idx)}
-            taken: List[int] = []
-            taken_t = np.empty(0, dtype=np.int64)
-
-            def penalty(tk: int) -> float:
-                if not taken_t.size:
-                    return 0.0
-                p = int(np.searchsorted(taken_t, tk))
-                d = min(taken_t[p] - tk if p < taken_t.size else 10 ** 9, tk - taken_t[p - 1] if p > 0 else 10 ** 9)
-                if d < 20:
-                    return 1e9  # two notes this close are one note
-                return 3.0 * max(0.0, 1.0 - d / g) ** 1.5 * 4.0
-
-            while heap and len(taken) < budget:
-                neg, k = heapq.heappop(heap)
-                tk = int(t[k])
-                cur = score_of[k] - penalty(tk)
-                if heap and cur < -heap[0][0] - 1e-9:
-                    if cur > -1e8:
-                        heapq.heappush(heap, (-cur, k))
-                    continue
-                if cur <= -1e8:
-                    continue
-                p = int(np.searchsorted(taken_t, tk))
-                taken_t = np.insert(taken_t, p, tk)
-                taken.append(int(k))
+            g = gap * (1.25 if s.family in ("chordjack", "jack") else 1.0)
+            gv = np.full(idx.size, g)
+            if self.hints is not None:
+                # a note the network is sure about may sit closer to its neighbours (real 1/8 and 1/16 runs)
+                gv = gv * (1.0 - 0.8 * np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net))
+            groups.append((idx, sc, budget, gv))
+            if not global_pick:
+                taken = _greedy_pick(t, idx, sc, budget, gv)
+                chosen[taken] = True
+                chosen_t.append(t[taken])
+        if global_pick and groups:
+            # with a network the whole song is one pool: the network decides WHERE the notes go (its density shape
+            # is already in the section budgets), per-section quotas would move notes away from where it wants them
+            idx = np.concatenate([g_[0] for g_ in groups])
+            sc = np.concatenate([g_[1] for g_ in groups])
+            gv = np.concatenate([g_[3] for g_ in groups])
+            taken = _greedy_pick(t, idx, sc, int(sum(g_[2] for g_ in groups)), gv)
             chosen[taken] = True
-            chosen_t.append(t[taken])
         ev = np.flatnonzero(chosen)
         # two notes closer than 20 ms across a section border are one note
         keep = np.ones(ev.size, dtype=bool)
@@ -926,6 +971,8 @@ class Composer:
                 ok = np.abs(t[pos] - mids) <= 4
                 strong = (self.attack[pos] >= 0.72 - 0.15 * max(0.0, s.ramp) - 0.05 * self.cfg.creativity) & self.audible[pos]
                 want = ok & strong
+                if self.hints is not None:
+                    want = want & (self.net[pos] >= 0.35)  # with a network: only where it hears a note too
                 # take the longest stretch of consecutive wanted fills, at most 2 beats
                 best_a = best_b = cur = 0
                 for q in range(want.size):
