@@ -139,7 +139,7 @@ def parse_style(items: List[str]) -> Dict[str, float]:
     return res
 
 
-def main() -> None:
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Hybrid osu!mania 4K map generator")
     ap.add_argument("audio", nargs="?", default=None, help="audio file (.mp3/.ogg/.wav/.flac) or template .osz/.osu")
     ap.add_argument("--template", default=None, help="template .osz / .osu / folder: its audio and timing points are used")
@@ -169,6 +169,13 @@ def main() -> None:
     ap.add_argument("--hitsound_set", default="auto", choices=["auto", "normal", "soft", "drum"])
     ap.add_argument("--no_additions", action="store_true", help="hitsounds: volume and sample set only, no clap/whistle/finish")
     ap.add_argument("--no_ln", action="store_true", help="taps only: no long notes at all (style ln_ratio=0 + every LN becomes a tap)")
+    ap.add_argument("--fit_sr", default="on", choices=["on", "off"],
+                    help="on (default): the network's own map at the requested star rating - its milliseconds are aligned to the "
+                         "red lines, only as many lanes are re-assigned as needed for the share of fast jacks real maps of this "
+                         "SR have, then the event threshold is moved until the star rating matches (never below --min_threshold, "
+                         "so no notes on silence). off: one threshold, the star rating is whatever comes out")
+    ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
+    ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
     ap.add_argument("--sr_guidance", default="1",
                     help="make the map follow --sr more strongly (classifier-free guidance): 1 = off, 2-3 = strong; "
@@ -197,7 +204,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--batch_size", type=int, default=8)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     ckpt = Path(args.checkpoint)
     if not ckpt.exists():
@@ -223,6 +230,12 @@ def main() -> None:
             timing_from_user = True
 
         predictor = HybridPredictor.from_checkpoint(ckpt, device=args.device, disable_reps=args.disable_reps)
+        pattern_model = None
+        if args.fit_sr == "on":
+            from osu_mapper.hybrid.patterns import load_default
+            pattern_model = load_default(args.patterns)
+            if pattern_model is None:
+                print("[fit] no pattern model: the network's lanes are kept (no jack correction), only the threshold is fitted")
         if args.disable_reps:
             print(f"[model] representations: {', '.join(r + (' (OFF)' if r in args.disable_reps else '') for r in predictor.model.rep_names)}")
         fcfg = predictor.feature_cfg
@@ -301,8 +314,41 @@ def main() -> None:
             t1 = time.time()
             out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
                                     sr_guidance=guidance, style_guidance=args.style_guidance)
+            fit_info = ""
             for th in (thresholds if user_thresholds is not None or not predictor.threshold_by_sr else [predictor.threshold_for(target)]):
-                notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
+                if args.fit_sr == "on" and user_thresholds is None:
+                    from osu_mapper.hybrid.network_fit import fit_network_map
+                    jt = pattern_model.fast_repeat_share(target) if pattern_model is not None else None
+                    fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
+                                          min_threshold=args.min_threshold, jack_target=jt, log=print)
+                    notes, th = fit.notes, fit.threshold
+                    fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
+                                f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
+                    if not fit.reached and fit.star_rating < target and guidance == 1.0:
+                        # the network hears too few notes for this rating: SR guidance makes it hear more (measured: Artificial
+                        # Horizon 5.35 -> 5.53 for 5.57*, The Last Petal 5.39 -> 5.78 for 7.14*); only as a fallback, since
+                        # where the rating is reachable without it guidance only blurs the network (F1 0.70 -> 0.70, 3: 0.70)
+                        for g2 in (2.0, 3.0):
+                            out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+                                                     sr_guidance=g2, style_guidance=args.style_guidance)
+                            fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
+                                                   min_threshold=args.min_threshold, jack_target=jt)
+                            if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
+                                print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
+                                fit, out = fit2, out2
+                                notes, th = fit.notes, fit.threshold
+                                fit_info = (f" | fitted with SR guidance {g2:g}: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, "
+                                            f"lanes re-assigned {fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
+                            if fit.reached:
+                                break
+                    if not fit.reached:
+                        print(f"    [!] {target:.2f}* is not reachable without notes the network does not hear: the closest is "
+                              f"{fit.star_rating:.2f}* (try --min_threshold lower, the composer, or another difficulty)"
+                              if fit.star_rating < target else
+                              f"    [!] even with only the notes the network is sure about the map is {fit.star_rating:.2f}* "
+                              f"(harder than {target:.2f}*): use a lower --sr for this song or the composer")
+                else:
+                    notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
                 if args.ergonomics > 0:
                     from osu_mapper.hybrid.ergonomics import ergonomics_report, format_report, improve_ergonomics
                     before = ergonomics_report(notes)
@@ -328,7 +374,7 @@ def main() -> None:
                     print(f"    hitsounds: {hitsound_summary(hs)}")
                 last = notes[-1].start / 1000.0 if notes else 0.0
                 print(f"[{version}] {len(notes)} notes ({sum(n.ln for n in notes)} LN), last note {last:.1f}s / {inputs.duration_ms / 1000:.1f}s, "
-                      f"threshold {th:.3f}, star rating {sr_val:.2f} (target {target:.2f}) in {time.time() - t1:.1f}s")
+                      f"threshold {th:.3f}, star rating {sr_val:.2f} (target {target:.2f}) in {time.time() - t1:.1f}s{fit_info}")
                 if ref_map is not None:
                     from osu_mapper.hybrid.metrics import per_ms_report
                     r = per_ms_report(notes, ref_map.notes)
