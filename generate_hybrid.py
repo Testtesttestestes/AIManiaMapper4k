@@ -97,7 +97,7 @@ def reference_style(path: str, diff: str = ""):
             m = parse_osu_mania(text)
         except Exception:
             continue
-        if m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
+        if m is not None and m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
             maps.append((name, m))
     if not maps:
         raise SystemExit(f"--style_from: no 4K mania difficulty{' matching ' + repr(diff) if diff else ''} in {path}")
@@ -124,7 +124,7 @@ def load_reference(path: str, diff: str = ""):
             m = parse_osu_mania(text)
         except Exception:
             continue
-        if m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
+        if m is not None and m.notes and (not diff or diff.lower() in name.lower() or diff.lower() in m.metadata.get("Version", "").lower()):
             return m
     raise SystemExit(f"--reference: no 4K mania difficulty{' matching ' + repr(diff) if diff else ''} in {path}")
 
