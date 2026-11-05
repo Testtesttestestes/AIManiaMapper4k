@@ -240,6 +240,19 @@ class TestComposer(unittest.TestCase):
         self.assertLessEqual(abs(res.star_rating - 3.0), 0.15)
         self._check_playable(res.notes)
 
+    def test_every_sound_has_a_candidate(self):
+        # grid ticks down to 1/16 plus attack peaks between ticks: a note can be put on any audible event,
+        # including the humanized (+-3 ms off-grid) leads of the synthetic songs
+        feats, slices, reds, dur, events = song(21)
+        an = analyze_song(feats, slices, reds, dur)
+        self.assertLessEqual(abs(an.peak_lag), 12)
+        comp = Composer(an, segment_sections(an), ComposerConfig(), None, lambda *_: None, target_sr=3.0)
+        heard = np.array(sorted({e.time_ms for e in events}))
+        cand = np.sort(comp.t)
+        j = np.clip(np.searchsorted(cand, heard), 1, cand.size - 1)
+        d = np.minimum(np.abs(cand[j] - heard), np.abs(cand[j - 1] - heard))
+        self.assertGreater(float((d <= 5).mean()), 0.95)
+
     def test_notes_land_on_attacks(self):
         feats, slices, reds, dur, events = song(21)
         an = analyze_song(feats, slices, reds, dur)
