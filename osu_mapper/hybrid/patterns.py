@@ -33,7 +33,7 @@ import numpy as np
 
 from .beatmap import Note, RawTimingPoint
 
-PATTERN_VERSION = "patterns-v2"
+PATTERN_VERSION = "patterns-v3"
 SR_BINS = 12                                               # 0-1*, 1-2*, ..., 10-11*, 11+*
 GAP_EDGES_MS = np.array([45, 70, 95, 125, 160, 210, 280, 380, 550, 800, 1500], dtype=np.float64)
 N_GAP = GAP_EDGES_MS.size + 1
@@ -44,6 +44,27 @@ POP = np.array([bin(m).count("1") for m in range(16)])
 REPEAT_BIN_MS = 5
 REPEAT_BINS = 400                                          # 0..2 s
 LN_SPAN_BINS = 33                                          # 0..31 chords during a hold, 32 = more
+# long notes: the LN style of a map (its LN share) is the mapper's choice, so every LN statistic is kept per style
+LN_STYLE_EDGES = np.array([0.05, 0.15, 0.30, 0.45])        # rice < 5% | light | hybrid | LN | full LN > 45%
+N_LN_STYLE = LN_STYLE_EDGES.size + 1
+LN_STYLE_NAMES = ("rice", "light", "hybrid", "ln", "full")
+LN_STYLE_SHARE = (0.02, 0.10, 0.22, 0.38, 0.55)            # typical LN share of each style (for presets)
+BEAT_GAP_EDGES = np.array([0.13, 0.2, 0.3, 0.4, 0.6, 0.9, 1.4, 2.5])  # gaps in beats: 1/8 .. 2+ beats
+N_BGAP = BEAT_GAP_EDGES.size + 1
+LN_LEN_BEATS = np.array([0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
+N_LN_LEN = LN_LEN_BEATS.size
+
+
+def ln_style_bin(share: float) -> int:
+    return int(np.searchsorted(LN_STYLE_EDGES, float(share), side="right"))
+
+
+def beat_gap_bin(gap_beats: float) -> int:
+    return int(np.searchsorted(BEAT_GAP_EDGES, float(gap_beats), side="right"))
+
+
+def ln_len_class(beats: float) -> int:
+    return int(np.argmin(np.abs(np.log(LN_LEN_BEATS) - math.log(max(1e-3, beats)))))
 
 
 def gap_bin(gap_ms: float) -> int:
@@ -101,7 +122,13 @@ class PatternModel:
     ln_span: Optional[np.ndarray] = None     # [SR, LN_SPAN_BINS] chords that start while a long note is held
     density_cv: Optional[np.ndarray] = None  # [SR, 2] sum / count of the density variation (std/mean of notes per 4 s)
     event_gap: Optional[np.ndarray] = None   # [SR, REPEAT_BINS] chord-to-chord gaps (any lanes), 5 ms bins
-    intensity_fit: Optional[np.ndarray] = None  # [SR, 3] least squares of log section density vs log audio intensity: sum xy, sum xx, n
+    intensity_fit: Optional[np.ndarray] = None
+    ln_ctx: Optional[np.ndarray] = None      # [SR, STYLE, gap next, gap prev (beat bins), size, metric, 2] chords without / with LN
+    ln_members: Optional[np.ndarray] = None  # [SR, STYLE, size, 5] how many members of a chord with LN are long
+    ln_len: Optional[np.ndarray] = None      # [SR, STYLE, gap next (beat bin), N_LN_LEN] LN length in beats
+    ln_style_maps: Optional[np.ndarray] = None  # [SR, STYLE] maps of each LN style
+    ln_span_style: Optional[np.ndarray] = None  # [SR, STYLE, LN_SPAN_BINS] chords during a hold
+    ln_release: Optional[np.ndarray] = None  # [SR, STYLE, 3] LN releases: on another chord's start / on a free tick / off grid  # [SR, 3] least squares of log section density vs log audio intensity: sum xy, sum xx, n
     version: str = PATTERN_VERSION
 
     # ------------------------------------------------------------------------------------------
@@ -173,6 +200,132 @@ class PatternModel:
         n_ln = POP[lns]
         np.add.at(self.ln, (s, gnb, 1), n_ln)
         np.add.at(self.ln, (s, gnb, 0), POP[masks] - n_ln)
+        self._add_ln_style(notes, times, masks, lns, reds, cls, s)
+
+    def _ensure_ln(self) -> None:
+        if self.ln_ctx is None:
+            self.ln_ctx = np.zeros((SR_BINS, N_LN_STYLE, N_BGAP, N_BGAP, 4, 3, 2), np.float64)
+            self.ln_members = np.zeros((SR_BINS, N_LN_STYLE, 4, 5), np.float64)
+            self.ln_len = np.zeros((SR_BINS, N_LN_STYLE, N_BGAP, N_LN_LEN), np.float64)
+            self.ln_style_maps = np.zeros((SR_BINS, N_LN_STYLE), np.float64)
+            self.ln_span_style = np.zeros((SR_BINS, N_LN_STYLE, LN_SPAN_BINS), np.float64)
+        if self.ln_release is None:
+            self.ln_release = np.zeros((SR_BINS, N_LN_STYLE, 3), np.float64)
+
+    def _add_ln_style(self, notes, times, masks, lns, reds, cls, s: int) -> None:
+        """Where real mappers of a given LN style put long notes (rhythm context), how many chord members and how long."""
+        self._ensure_ln()
+        share = float(np.mean([n.ln for n in notes])) if notes else 0.0
+        st = ln_style_bin(share)
+        self.ln_style_maps[s, st] += 1
+        if reds:
+            rt = np.array([r.time for r in reds])
+            bl = np.array([r.beat_len for r in reds])
+            beat = bl[np.clip(np.searchsorted(rt, times, side="right") - 1, 0, len(reds) - 1)]
+        else:
+            beat = np.full(times.size, 500.0)
+        gn = np.append(np.diff(times), 10 ** 6) / beat
+        gp = np.diff(times, prepend=times[0] - 10 ** 6) / beat
+        gnb = np.searchsorted(BEAT_GAP_EDGES, gn, side="right")
+        gpb = np.searchsorted(BEAT_GAP_EDGES, gp, side="right")
+        size = np.clip(POP[masks] - 1, 0, 3)
+        met = np.array([metric_bin(int(c)) for c in cls])
+        has = (lns > 0).astype(np.int64)
+        np.add.at(self.ln_ctx, (s, st, gnb, gpb, size, met, has), 1.0)
+        np.add.at(self.ln_members, (s, st, size[has > 0], POP[lns[has > 0]]), 1.0)
+        index = {int(t): i for i, t in enumerate(times)}
+        for n in notes:
+            if n.ln and n.end > n.start:
+                i = index.get(int(n.start))
+                if i is None:
+                    continue
+                self.ln_len[s, st, gnb[i], ln_len_class((n.end - n.start) / beat[i])] += 1
+                inside = int(np.searchsorted(times, n.end, side="left") - np.searchsorted(times, n.start, side="right"))
+                self.ln_span_style[s, st, min(LN_SPAN_BINS - 1, inside)] += 1
+                j = int(np.searchsorted(times, n.end))
+                near = min(abs(int(times[min(j, times.size - 1)]) - n.end), abs(int(times[max(j - 1, 0)]) - n.end))
+                kind = 0 if near <= 5 else (1 if div_class(float(n.end), reds) != N_DIV - 1 else 2)
+                self.ln_release[s, st, kind] += 1
+
+    # --- long-note queries (backed off over neighbouring styles when a cell is thin) -----------
+    def _style_weights(self, style: int, sr_bin_: Optional[int] = None) -> List[Tuple[int, float]]:
+        """The requested LN style (or the nearest style that has maps in this star-rating bin) + its neighbours."""
+        if sr_bin_ is not None and self.ln_style_maps is not None:
+            filled = np.flatnonzero(self.ln_style_maps[sr_bin_] > 0)
+            if filled.size and style not in filled:
+                style = int(filled[np.argmin(np.abs(filled - style))])
+        return [(style, 1.0)] + [(x, 0.15) for x in (style - 1, style + 1) if 0 <= x < N_LN_STYLE]
+
+    def has_ln_model(self) -> bool:
+        return self.ln_ctx is not None and self.ln_ctx.sum() > 0
+
+    def typical_ln_style(self, sr: float) -> int:
+        """Most common LN style of real maps at this star rating."""
+        if not self.has_ln_model():
+            return 1
+        c = np.zeros(N_LN_STYLE)
+        for b, wt in self._sr_weights(sr):
+            c += wt * self.ln_style_maps[b]
+        return int(np.argmax(c)) if c.sum() > 0 else 1
+
+    def ln_chord_prob(self, sr: float, style: int, gap_next_beats: float, gap_prev_beats: float, size: int, metric: int) -> float:
+        """P(this chord has a long note | rhythm context) for maps of this star rating and LN style."""
+        gn, gp, k = beat_gap_bin(gap_next_beats), beat_gap_bin(gap_prev_beats), int(np.clip(size - 1, 0, 3))
+        p = 0.0
+        wsum = 0.0
+        for b, wt in self._sr_weights(sr):
+            for st, ws in self._style_weights(style, b):
+                T = self.ln_ctx[b, st]
+                prior = T.sum(axis=(0, 1, 2, 3))
+                if prior.sum() == 0:
+                    continue
+                q = (prior[1] + 0.5) / (prior.sum() + 1.0)
+                for c in (T[gn].sum(axis=(0, 1, 2)), T[gn, gp].sum(axis=(0, 1)), T[gn, gp, k].sum(axis=0), T[gn, gp, k, metric]):
+                    q = (c[1] + 4.0 * q) / (c.sum() + 4.0)
+                p += wt * ws * q
+                wsum += wt * ws
+        return float(p / wsum) if wsum > 0 else 0.0
+
+    def ln_member_count(self, sr: float, style: int, size: int) -> np.ndarray:
+        """P(number of long members = 1..size | the chord has a long note)."""
+        c = np.zeros(5)
+        for b, wt in self._sr_weights(sr):
+            for st, ws in self._style_weights(style, b):
+                c += wt * ws * self.ln_members[b, st, int(np.clip(size - 1, 0, 3))]
+        c = c[1:size + 1] + 0.1
+        return c / c.sum()
+
+    def ln_length_dist(self, sr: float, style: int, gap_next_beats: float) -> np.ndarray:
+        """P(LN length class) over LN_LEN_BEATS for this context."""
+        g = beat_gap_bin(gap_next_beats)
+        c = np.zeros(N_LN_LEN)
+        for b, wt in self._sr_weights(sr):
+            for st, ws in self._style_weights(style, b):
+                T = self.ln_len[b, st]
+                c += wt * ws * (T[g] + 0.2 * T.sum(axis=0) / max(1.0, T.sum()) * 5.0)
+        c = c + 1e-3
+        return c / c.sum()
+
+    def ln_release_on_chord(self, sr: float, style: int) -> float:
+        """Share of LN releases of real maps (this SR and style) that coincide with another chord's press."""
+        if self.ln_release is None:
+            return 0.0
+        c = np.zeros(3)
+        for b, wt in self._sr_weights(sr):
+            for st, ws in self._style_weights(style, b):
+                c += wt * ws * self.ln_release[b, st]
+        return float((c[0] + 0.5) / (c.sum() + 1.0))
+
+    def ln_span_limit_style(self, sr: float, style: int, quantile: float = 0.9) -> Optional[int]:
+        h = np.zeros(LN_SPAN_BINS)
+        for b, wt in self._sr_weights(sr):
+            for st, ws in self._style_weights(style, b):
+                hb = self.ln_span_style[b, st]
+                if hb.sum() > 0:
+                    h += wt * ws * hb / hb.sum()
+        if h.sum() == 0:
+            return None
+        return int(np.searchsorted(np.cumsum(h) / h.sum(), quantile))
 
     # ------------------------------------------------------------------------------------------
     def _sr_weights(self, sr: float) -> List[Tuple[int, float]]:
@@ -368,14 +521,10 @@ class PatternModel:
 
     # ------------------------------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
+        extra = {k: getattr(self, k) for k in OPTIONAL_ARRAYS if getattr(self, k) is not None}
         np.savez_compressed(path, lane=self.lane, chord=self.chord, rhythm_hits=self.rhythm_hits,
                             rhythm_beats=self.rhythm_beats, ln=self.ln, maps=self.maps,
-                            repeat_gap=self.repeat_gap if self.repeat_gap is not None else np.zeros((SR_BINS, REPEAT_BINS)),
-                            ln_span=self.ln_span if self.ln_span is not None else np.zeros((SR_BINS, LN_SPAN_BINS)),
-                            density_cv=self.density_cv if self.density_cv is not None else np.zeros((SR_BINS, 2)),
-                            intensity_fit=self.intensity_fit if self.intensity_fit is not None else np.zeros((SR_BINS, 3)),
-                            event_gap=self.event_gap if self.event_gap is not None else np.zeros((SR_BINS, REPEAT_BINS)),
-                            version=np.array([self.version]))
+                            version=np.array([self.version]), **extra)
 
     @classmethod
     def load(cls, path: str | Path) -> "PatternModel":
@@ -383,12 +532,9 @@ class PatternModel:
         v = str(d["version"][0])
         if v != PATTERN_VERSION:
             raise ValueError(f"pattern model '{path}' has version {v}, code expects {PATTERN_VERSION}: re-run learn_patterns.py")
+        extra = {k: d[k] for k in OPTIONAL_ARRAYS if k in d}
         return cls(lane=d["lane"], chord=d["chord"], rhythm_hits=d["rhythm_hits"], rhythm_beats=d["rhythm_beats"],
-                   ln=d["ln"], maps=d["maps"], repeat_gap=d["repeat_gap"] if "repeat_gap" in d else None,
-                   ln_span=d["ln_span"] if "ln_span" in d else None,
-                   density_cv=d["density_cv"] if "density_cv" in d else None,
-                   intensity_fit=d["intensity_fit"] if "intensity_fit" in d else None,
-                   event_gap=d["event_gap"] if "event_gap" in d else None, version=v)
+                   ln=d["ln"], maps=d["maps"], version=v, **extra)
 
     def summary(self) -> str:
         rows = [f"pattern model: {int(self.maps.sum())} maps, {int(self.lane.sum())} chord transitions"]
@@ -411,6 +557,10 @@ class PatternModel:
                         f" | density variation {self.density_variation(b + 0.5) or 0:.2f}"
                         + (f", follows audio intensity ^{e:.2f}" if (e := self.intensity_exponent(b + 0.5)) is not None else ""))
         return "\n".join(rows)
+
+
+OPTIONAL_ARRAYS = ("repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
+                   "ln_ctx", "ln_members", "ln_len", "ln_style_maps", "ln_span_style", "ln_release")
 
 
 def default_pattern_path() -> Path:
@@ -456,3 +606,90 @@ def density_graph(notes: Sequence[Note], duration_ms: int, width: int = 72, scal
     top = float(scale or max(1e-6, prof.max()))
     bars = " ▁▂▃▄▅▆▇█"
     return "".join(bars[int(round(np.clip(v / top, 0.0, 1.0) * (len(bars) - 1)))] for v in prof)
+
+
+# ----------------------------------------------------------------------------------------------
+# long-note quality: how the holds of a map look, compared distribution by distribution
+# ----------------------------------------------------------------------------------------------
+
+LN_SPAN_GROUPS = ((0, 0), (1, 1), (2, 2), (3, 3), (4, 7), (8, 10 ** 9))
+
+
+def ln_quality(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint]) -> Dict[str, np.ndarray]:
+    """Distributions that describe the long notes of a map (shares, each sums to 1 when there are LNs):
+
+    length       length in beats over LN_LEN_BEATS (1/8 .. 8 beats)
+    release      release on another chord's press / on a free grid tick / off the grid
+    after        pause from the release to the next press on the same lane, beat bins (BEAT_GAP_EDGES)
+    span         chords pressed while the LN is held: 0, 1, 2, 3, 4-7, 8+
+    hand         presses during the hold on the same hand / on the other hand (mean per LN)
+    """
+    reds = sorted((tp for tp in timing_points if tp.uninherited and tp.beat_len > 0), key=lambda r: r.time)
+    times, masks, _ = chord_events(notes)
+    lns = [n for n in notes if n.ln and n.end > n.start]
+    out: Dict[str, np.ndarray] = {"share": np.array([len(lns) / max(1, len(notes))])}
+    if not lns or times.size == 0:
+        return out
+    rt = np.array([r.time for r in reds]) if reds else np.array([0.0])
+    bl = np.array([r.beat_len for r in reds]) if reds else np.array([500.0])
+
+    def beat_at(t: float) -> float:
+        return float(bl[max(0, int(np.searchsorted(rt, t, side="right")) - 1)])
+
+    by_lane: Dict[int, List[int]] = {}
+    for n in notes:
+        by_lane.setdefault(n.col, []).append(n.start)
+    for v in by_lane.values():
+        v.sort()
+    length = np.zeros(N_LN_LEN)
+    release = np.zeros(3)
+    after = np.zeros(N_BGAP + 1)  # last bin: no further note on the lane
+    span = np.zeros(len(LN_SPAN_GROUPS))
+    same = other = 0.0
+    for n in lns:
+        b = beat_at(n.start)
+        length[ln_len_class((n.end - n.start) / b)] += 1
+        j = int(np.searchsorted(times, n.end))
+        near = min(abs(int(times[min(j, times.size - 1)]) - n.end), abs(int(times[max(j - 1, 0)]) - n.end))
+        release[0 if near <= 5 else (1 if div_class(float(n.end), reds) != N_DIV - 1 else 2)] += 1
+        lane = by_lane[n.col]
+        k = int(np.searchsorted(lane, n.end, side="right"))
+        after[beat_gap_bin((lane[k] - n.end) / b) if k < len(lane) else N_BGAP] += 1
+        a0, a1 = int(np.searchsorted(times, n.start, side="right")), int(np.searchsorted(times, n.end, side="left"))
+        inside = a1 - a0
+        span[[g for g, (lo, hi) in enumerate(LN_SPAN_GROUPS) if lo <= inside <= hi][0]] += 1
+        hand = (0b0011 if n.col < 2 else 0b1100) & ~(1 << n.col)
+        for m in masks[a0:a1]:
+            same += POP[m & hand]
+            other += POP[m & ~(0b0011 if n.col < 2 else 0b1100) & 15]
+    out.update(length=length / length.sum(), release=release / release.sum(), after=after / after.sum(),
+               span=span / span.sum(), hand=np.array([same / len(lns), other / len(lns)]))
+    return out
+
+
+def ln_similarity(a: Dict[str, np.ndarray], b: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """1 - Jensen-Shannon divergence (base 2) of every LN distribution: 1 = identical, 0 = nothing in common."""
+    def js(p: np.ndarray, q: np.ndarray) -> float:
+        p, q = p + 1e-12, q + 1e-12
+        p, q = p / p.sum(), q / q.sum()
+        m = 0.5 * (p + q)
+        return float(0.5 * (p * np.log2(p / m)).sum() + 0.5 * (q * np.log2(q / m)).sum())
+    out = {}
+    for k in ("length", "release", "after", "span"):
+        if k in a and k in b:
+            out[k] = 1.0 - js(a[k], b[k])
+    return out
+
+
+def format_ln_quality(q: Dict[str, np.ndarray]) -> str:
+    if "length" not in q:
+        return f"LN {100 * float(q['share'][0]):.0f}% (no holds)"
+    L = q["length"]
+    short = L[LN_LEN_BEATS <= 0.375].sum()
+    mid = L[(LN_LEN_BEATS > 0.375) & (LN_LEN_BEATS <= 1.0)].sum()
+    long_ = L[LN_LEN_BEATS > 1.0].sum()
+    r, s = q["release"], q["span"]
+    return (f"LN {100 * float(q['share'][0]):.0f}% | length <=3/8 beat {100 * short:.0f}%, 1/2-1 {100 * mid:.0f}%, >1 beat {100 * long_:.0f}% "
+            f"| release on a press {100 * r[0]:.0f}%, free tick {100 * r[1]:.0f}%, off grid {100 * r[2]:.0f}% "
+            f"| holds over 0/1/2/3/4-7/8+ chords {'/'.join(f'{100 * x:.0f}' for x in s)}% "
+            f"| presses during a hold: same hand {q['hand'][0]:.1f}, other hand {q['hand'][1]:.1f}")

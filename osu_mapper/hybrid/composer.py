@@ -86,7 +86,8 @@ FAMILY_SHAPE: Dict[str, Tuple[float, float, float, float]] = {
 class ComposerConfig:
     creativity: float = 0.5          # 0 = conservative and repeatable, 1 = adventurous pattern choices
     contrast: float = 1.0            # how strongly section intensity shapes density (0 = flat, 2 = extreme)
-    ln_ratio: Optional[float] = None # share of long notes (None = from the audio: sustained sounds)
+    ln_ratio: Optional[float] = None # exact share of long notes (overrides ln_style)
+    ln_style: Optional[str] = None   # rice / light / hybrid / ln / full; None = the most common style at this SR
     max_chord: int = 4
     variants: int = 4                # composed variants, the critic keeps the best one
     sr_tolerance: float = 0.05
@@ -499,12 +500,17 @@ class NetHints:
     lane_logits: Optional[np.ndarray]
     chord_logprobs: Optional[np.ndarray]
     ln_prob: Optional[np.ndarray]    # [F] max member LN probability
+    ln_len_ms: Optional[np.ndarray] = None  # [F] LN length the network predicts (it hears how long a sound lasts)
 
     @classmethod
     def from_outputs(cls, out) -> "NetHints":
+        from .params import ln_bucket_to_length
         tp = out.time_probs
         ln = 1.0 / (1.0 + np.exp(-out.ln_logits[:, 0])) if out.ln_logits is not None else None
-        return cls(1.0 - tp[:, 0], np.argmax(tp[:, 1:], axis=1), out.lane_logits, out.chord_logprobs, ln)
+        ln_len = None
+        if getattr(out, "ln_bucket", None) is not None and getattr(out, "ln_resid", None) is not None:
+            ln_len = ln_bucket_to_length(out.ln_bucket[:, 0], out.ln_resid[:, 0]).astype(np.int64)
+        return cls(1.0 - tp[:, 0], np.argmax(tp[:, 1:], axis=1), out.lane_logits, out.chord_logprobs, ln, ln_len)
 
     def p_at(self, t: np.ndarray, frame_ms: int, radius_ms: int = 15) -> np.ndarray:
         F = self.p_event.size
@@ -942,6 +948,9 @@ class Composer:
         rep_cdf = self.patterns.repeat_cdf(self.target_sr) if self.patterns is not None else None
         span_limit = self.patterns.ln_span_limit(self.target_sr, min(0.99, 0.85 + 0.14 * cfg.creativity)) if self.patterns is not None else None
         gaps_next = np.append(np.diff(t_all), 10 ** 6)
+        ln_plan = self.plan_long_notes(ev, sizes, rng) if (self.patterns is not None and self.patterns.has_ln_model()) else None
+        if ln_plan is not None:
+            span_limit = ln_plan[2]
         ln_target = self._ln_targets()
         ln_score = self._ln_scores(ev, gaps_next)
         from .renderer import release_gap_fn
@@ -1116,9 +1125,25 @@ class Composer:
             # long notes
             quota = ln_target[si]
             ln_seen[si] = ln_seen.get(si, 0) + 1
+            planned_lanes: set = set()
+            if ln_plan is not None and ln_plan[0][i] > 0:
+                lanes_m = list(LANES_OF[m])
+                rng.shuffle(lanes_m)
+                planned_lanes = set(lanes_m[: int(ln_plan[0][i])])
             for c in LANES_OF[m]:
                 make_ln = False
-                if quota > 0 and ln_score[i] > 0:
+                if ln_plan is not None:
+                    if c in planned_lanes:
+                        length = int(ln_plan[1][i])
+                        if span_limit is not None and i + span_limit + 1 < n:
+                            length = min(length, int(t_all[i + span_limit + 1] - t) - gap_fn(int(t_all[i + span_limit + 1])))
+                        if length >= 40:
+                            notes.append(Note(t, c, t + length, True))
+                            hold_note[c] = len(notes) - 1
+                            busy_until[c] = t + length
+                            last_start[c] = t
+                            continue
+                elif quota > 0 and ln_score[i] > 0:
                     have = ln_quota.get(si, 0.0)
                     if have < quota * ln_seen[si] * POP[m]:
                         make_ln = ln_score[i] >= 0.35 or have < 0.5 * quota * ln_seen[si] * POP[m]
@@ -1145,6 +1170,98 @@ class Composer:
             last_t = t
         from .renderer import resolve_lane_conflicts
         return resolve_lane_conflicts([x for x in notes if x is not None], cfg.release_gap_ms, 30, gap_fn)
+
+    def ln_style_and_share(self) -> Tuple[int, float]:
+        """LN style of the map and its target LN share. The style is a mapper's choice (real maps of one star rating
+        range from 0 % to 55 % long notes), so it is never averaged: an explicit ratio, a named style, or the most
+        common style of real maps at this star rating."""
+        from .patterns import LN_STYLE_NAMES, LN_STYLE_SHARE, ln_style_bin
+        if self.cfg.ln_ratio is not None:
+            r = float(self.cfg.ln_ratio)
+            return ln_style_bin(r), r
+        if self.cfg.ln_style:
+            st = LN_STYLE_NAMES.index(self.cfg.ln_style)
+            return st, LN_STYLE_SHARE[st]
+        st = self.patterns.typical_ln_style(self.target_sr)
+        return st, LN_STYLE_SHARE[st]
+
+    def plan_long_notes(self, ev: np.ndarray, sizes: np.ndarray, rng: np.random.Generator):
+        """(long members per event, LN length in ms per event, hold span limit) from the learned LN model.
+
+        Which chords get long notes comes from the rhythm context in real maps of this LN style and star rating
+        (time to the next / from the previous chord in beats, chord size, metric position): measured on real maps the
+        rhythm predicts LN placement (AUC 0.65), the sound of the note barely does (0.53). The most likely chords are
+        taken until the target LN share is reached. The length is drawn from the real length distribution in beats
+        for that context, preferring releases on a following chord's press as often as real maps do it.
+        """
+        pm = self.patterns
+        n = ev.size
+        members = np.zeros(n, dtype=np.int64)
+        lengths = np.zeros(n, dtype=np.int64)
+        if n == 0:
+            return members, lengths, None
+        style, share = self.ln_style_and_share()
+        if share <= 0.0:
+            return members, lengths, 0
+        from .patterns import LN_LEN_BEATS
+        t = self.t[ev]
+        tb = self.an.ticks
+        beat = self.an.tick_beat[np.clip(np.searchsorted(tb, t), 0, max(0, tb.size - 1))] if tb.size else np.full(n, 500.0)
+        gn = np.append(np.diff(t), 10 ** 6) / beat
+        gp = np.diff(t, prepend=t[0] - 10 ** 6) / beat
+        mbin = np.where(self.metric[ev] >= 3.0, 0, np.where(self.metric[ev] >= 1.2, 1, 2))
+        p = np.array([pm.ln_chord_prob(self.target_sr, style, float(a), float(b), int(k), int(mb))
+                      for a, b, k, mb in zip(gn, gp, sizes, mbin)])
+        p = np.clip(p, 1e-4, 1 - 1e-4)
+        score = np.log(p / (1 - p))
+        fam_bonus = np.array([0.8 if self.sections[int(si)].family == "ln" else 0.0 for si in self.sec_of[ev]])
+        score = score + fam_bonus + _gumbel(rng, n) * 0.4 * self.cfg.creativity
+        if self.hints is not None and self.hints.ln_prob is not None:
+            f = np.clip(t // self.an.frame_ms, 0, self.an.num_frames - 1)
+            q = np.clip(self.hints.ln_prob[f], 1e-4, 1 - 1e-4)
+            score = score + 0.5 * self.cfg.net_weight * np.log(q / (1 - q))
+        target = share * float(sizes.sum())
+        have = 0.0
+        r_on_chord = pm.ln_release_on_chord(self.target_sr, style)
+        for i in np.argsort(-score, kind="stable"):
+            if have >= target:
+                break
+            dist = pm.ln_member_count(self.target_sr, style, int(sizes[i]))
+            k = int(rng.choice(dist.size, p=dist)) + 1
+            # length: drawn from the real distribution (in beats) for this gap, not its mode - taking the most likely
+            # length every time would average the map again. How often a release lands on a later press is matched
+            # to real maps of this style. The network (if any) adds its own length: it hears how long a sound lasts.
+            pl = pm.ln_length_dist(self.target_sr, style, float(gn[i]))
+            ends = t[i] + np.round(LN_LEN_BEATS * beat[i]).astype(np.int64)
+            if self.hints is not None and self.hints.ln_len_ms is not None:
+                f = int(min(self.an.num_frames - 1, t[i] // self.an.frame_ms))
+                ends = np.append(ends, t[i] + int(self.hints.ln_len_ms[f] * 1.0))
+                pl = np.append(pl * (1.0 - 0.4 * self.cfg.net_weight), 0.4 * self.cfg.net_weight)
+            j = np.clip(np.searchsorted(t, ends), 0, n - 1)
+            jm = np.clip(j - 1, 0, n - 1)
+            near = np.minimum(np.abs(t[j] - ends), np.abs(t[jm] - ends))
+            on_chord = near <= np.maximum(8, beat[i] / 16)
+            m_on = float(pl[on_chord].sum())
+            if 0.0 < m_on < 1.0:
+                pl = np.where(on_chord, pl * r_on_chord / m_on, pl * (1.0 - r_on_chord) / (1.0 - m_on))
+            temp = 1.0 + 0.6 * max(0.0, self.cfg.creativity - 0.5)   # creative maps spread the lengths a little more
+            pl = pl ** (1.0 / temp)
+            pl = pl / pl.sum()
+            c = int(rng.choice(pl.size, p=pl))
+            end = int(ends[c])
+            if on_chord[c]:  # release exactly on that press
+                end = int(t[j[c]] if abs(t[j[c]] - end) <= abs(t[jm[c]] - end) else t[jm[c]])
+            elif self.an.ticks.size:  # a free release still sits on the grid (real maps: ~100 %)
+                q = int(np.searchsorted(self.an.ticks, end))
+                cand = self.an.ticks[max(0, q - 1): q + 1]
+                end = int(cand[np.argmin(np.abs(cand - end))]) if cand.size else end
+            if end - t[i] < 40:
+                continue
+            members[i] = min(k, int(sizes[i]))
+            lengths[i] = end - t[i]
+            have += members[i]
+        span = pm.ln_span_limit_style(self.target_sr, style, min(0.99, 0.85 + 0.14 * self.cfg.creativity))
+        return members, lengths, span
 
     def _ln_targets(self) -> Dict[int, float]:
         out = {}
