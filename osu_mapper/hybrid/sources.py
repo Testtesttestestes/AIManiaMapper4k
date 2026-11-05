@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from .beatmap import ManiaMap, parse_osu_mania
+from .data_checks import audio_reference_problem
 
 AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus")
 
@@ -108,9 +109,9 @@ def iter_song_groups(input_dir: str | Path, keys: int = 4, log: Callable[[str], 
                     m = parse_osu_mania(text, keys=keys)
                     if m is None or not m.notes:
                         continue
-                    audio = _resolve_audio(m.metadata.get("AudioFilename", ""), names, infos)
+                    audio, problem = audio_reference_problem(text, m.metadata.get("AudioFilename", ""), names, infos)
                     if audio is None:
-                        log(f"  [skip] {osz.name} :: {name}: no audio file in archive")
+                        log(f"  [skip] {osz.name} :: {name}: {problem}")
                         continue
                     if audio not in groups:
                         groups[audio] = SongGroup(
@@ -140,9 +141,9 @@ def iter_song_groups(input_dir: str | Path, keys: int = 4, log: Callable[[str], 
             m = parse_osu_mania(text, keys=keys)
             if m is None or not m.notes:
                 continue
-            audio = _resolve_audio(m.metadata.get("AudioFilename", ""), names, sizes)
+            audio, problem = audio_reference_problem(text, m.metadata.get("AudioFilename", ""), names, sizes)
             if audio is None:
-                log(f"  [skip] {folder} :: {p.name}: no audio file in folder")
+                log(f"  [skip] {folder} :: {p.name}: {problem}")
                 continue
             if audio not in groups:
                 groups[audio] = SongGroup(

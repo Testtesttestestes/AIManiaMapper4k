@@ -261,6 +261,16 @@ def main() -> None:
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
     ap.add_argument("--sr_balance", type=float, default=0.0,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
+    ap.add_argument("--pitch_shift", type=float, default=0.5,
+                    help="share of training crops transposed by +-1..2 semitones in feature space (stops the network from "
+                         "recognizing songs; 0 = off)")
+    ap.add_argument("--global_dropout", type=float, default=None,
+                    help="probability to hide the whole-song summary during training (default 0.2 from the config). The summary "
+                         "identifies the song; 0.5 makes memorizing harder")
+    ap.add_argument("--style_dropout", type=float, default=None, help="probability to hide the whole style vector (default 0.3)")
+    ap.add_argument("--dropout", type=float, default=None, help="dropout inside the network (default 0.1; 0.2 for small datasets)")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="stop when the validation score did not improve for N epochs (0 = train all epochs)")
     ap.add_argument("--val_crops", type=int, default=256)
     ap.add_argument("--val_maps", type=int, default=24, help="complete validation maps rendered per epoch (per-ms metrics)")
     ap.add_argument("--val_sr_response", type=int, default=8,
@@ -347,6 +357,11 @@ def main() -> None:
                 sys.exit(f"--rep_dropout: expected NAME=P with NAME in {list(cfg.rep_dims)}, got '{item}'")
             overrides[name] = float(val)
         cfg.rep_dropout_by_name = overrides
+    for name in ("global_dropout", "style_dropout", "dropout"):  # training-only regularization, may change on --resume
+        if getattr(args, name) is not None:
+            setattr(cfg, name, float(getattr(args, name)))
+    print(f"[model] regularization: dropout {cfg.dropout:g}, song summary dropout {cfg.global_dropout:g}, style dropout {cfg.style_dropout:g}, "
+          f"pitch-shift augmentation {args.pitch_shift:g}")
     if cfg.rep_dropout_by_name:
         print(f"[model] modality dropout: {cfg.rep_dropout:g} default, " + ", ".join(f"{k}={v:g}" for k, v in cfg.rep_dropout_by_name.items()))
     model = HybridParamNet(cfg).to(dev)
@@ -397,7 +412,8 @@ def main() -> None:
 
     # every rank draws its own random crops (different seed), so no sampler is needed
     train_ds = HybridCropDataset(index, train_idx, crop_frames, args.steps_per_epoch * args.batch_size, train=True, seed=args.seed + 1000 * rank,
-                                 sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0)
+                                 sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0,
+                                 pitch_shift_prob=args.pitch_shift)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -489,6 +505,11 @@ def main() -> None:
         return
 
     epoch = start_epoch
+    best_epoch = start_epoch
+    if args.patience > 0 and distributed:
+        print("[warn] --patience is not supported with several GPUs (torchrun): training runs all epochs, "
+              "hybrid_best.pt still keeps the best one")
+        args.patience = 0
     try:
         for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
             train_ds.set_epoch(epoch)
@@ -540,8 +561,14 @@ def main() -> None:
             save_checkpoint(last_path, **payload(epoch, summary))
             if score > best_score:
                 best_score = score
+                best_epoch = epoch
                 save_checkpoint(best_path, **payload(epoch, summary))
                 print(f"  * new best ({score:.4f}) -> {best_path}")
+            elif args.patience > 0 and epoch - best_epoch >= args.patience:
+                print(f"[early stop] no improvement for {epoch - best_epoch} epochs (best {best_score:.4f} at epoch {best_epoch})")
+                with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
+                    json.dump(history, fh, indent=1)
+                break
             with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
                 json.dump(history, fh, indent=1)
             if distributed:
