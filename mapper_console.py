@@ -190,9 +190,31 @@ def save_settings(s: Dict[str, object]) -> None:
         pass
 
 
+MODEL_DIRS = (REPO / "checkpoints" / "hybrid", REPO / "test_NN")
+
+
+def find_model(name: str) -> Optional[Path]:
+    """checkpoints/hybrid/<name>, else test_NN/<name> (weights committed to the repository)."""
+    for d in MODEL_DIRS:
+        p = d / name
+        if p.is_file() and p.stat().st_size > 1024:  # not a Git LFS pointer
+            return p
+    return None
+
+
+def model_argv() -> List[str]:
+    out: List[str] = []
+    ck, pt = find_model("hybrid_best.pt"), find_model("patterns.npz")
+    if ck is not None:
+        out += ["--checkpoint", str(ck)]
+    if pt is not None:
+        out += ["--patterns", str(pt)]
+    return out
+
+
 def status_line() -> Tuple[bool, bool]:
-    patterns = (REPO / "checkpoints" / "hybrid" / "patterns.npz").exists()
-    net = (REPO / "checkpoints" / "hybrid" / "hybrid_best.pt").exists()
+    patterns = find_model("patterns.npz") is not None
+    net = find_model("hybrid_best.pt") is not None
     ok, no = color("есть", "32"), color("нет", "33")
     print(f"Модель паттернов: {ok if patterns else no}" + ("" if patterns else color("  (python learn_patterns.py --data dataset_hybrid)", "2")))
     print(f"Нейросеть:        {ok if net else no}" + ("" if net else color("  (необязательно: карты строятся и без неё)", "2")))
@@ -250,20 +272,65 @@ def choose_stars(last: Dict[str, object], info: Dict[str, object]) -> List[float
     return stars
 
 
+def network_dialog(last, use_last, argv, info, template, stars, song_argv):
+    """Questions for the network-first generator (generate_hybrid.py --fit_sr on)."""
+    title("4. Лонгноты")
+    no_ln = ask_yes("Убрать лонгноты (только тапы)?", bool(last.get("net_no_ln", False)))
+    if no_ln:
+        argv.append("--no_ln")
+    title("5. Дополнительно")
+    if template is not None and info.get("diffs"):
+        opts = [("Не сравнивать", "")] + [(f"{v}", f"{sr:.2f}*, {n} нот") for v, sr, n in info["diffs"]]
+        r = ask_choice("Сравнить результат с картой из архива?", opts, 1)
+        if r > 1:
+            argv += ["--reference", str(template), "--reference_diff", str(info["diffs"][r - 2][0])]
+    hs = last.get("hitsounds", False) if use_last else ask_yes("Добавить хитсаунды?", False)
+    if hs:
+        argv.append("--hitsounds")
+    creator = ask("Автор (Creator)", str(last.get("creator", "AIManiaMapper")))
+    argv += ["--creator", creator]
+    safe = "".join(c for c in str(info.get("title") or "map") if c.isalnum() or c in " -_()").strip() or "map"
+    out = clean_path(ask("Куда сохранить", str(REPO / "output_beatmaps" / f"{safe} (network).osz")))
+    argv += ["--output", out]
+    title("Итог")
+    print(f"  Песня:      {info.get('title') or song_argv[-1]}")
+    print(f"  Сложности:  {', '.join(f'{s:g}*' for s in stars)}")
+    print(f"  Строит:     нейросеть (звёзды подгоняются, тайминг выравнивается по красной линии)")
+    print(f"  Лонгноты:   {'нет' if no_ln else 'как решит сеть'}    Хитсаунды: {'да' if hs else 'нет'}")
+    print(f"  Файл:       {out}")
+    if not ask_yes("Начать генерацию?", True):
+        return None
+    last.update({"song": song_argv[1] if song_argv[0] == "--template" else song_argv[0], "engine": "network",
+                 "stars": " ".join(f"{s:g}" for s in stars), "net_no_ln": no_ln, "hitsounds": hs, "creator": creator})
+    save_settings(last)
+    return ("network", argv)
+
+
 def run_dialog() -> Optional[List[str]]:
     last = load_settings()
     patterns, net = status_line()
     use_last = bool(last) and ask_yes("Взять настройки прошлого раза (песню и сложности спрошу заново)?", True)
     song_argv, info, template = choose_song(last)
     stars = choose_stars(last, info)
-    argv: List[str] = song_argv + ["--sr", ",".join(f"{s:g}" for s in stars)]
+    argv: List[str] = song_argv + ["--sr", ",".join(f"{s:g}" for s in stars)] + model_argv()
+
+    engine = "composer"
+    if net:
+        title("3. Чем строить карту")
+        e = ask_choice("Как строить?", [
+            ("Нейросеть", "карта самой сети, подогнанная под звёзды: ноты там, где сеть слышит звук (рекомендуется)"),
+            ("Композитор", "план по секциям, стиль конкретной карты, сеть только подсказывает"),
+        ], 1 if last.get("engine", "network") == "network" else 2)
+        engine = "network" if e == 1 else "composer"
+    if engine == "network":
+        return network_dialog(last, use_last, argv, info, template, stars, song_argv)
 
     def pick(key: str, question: str, options, default: int) -> int:
         if use_last and isinstance(last.get(key), int):
             return int(last[key])
         return ask_choice(question, [(o[0], o[1]) for o in options], default)
 
-    title("3. Стиль")
+    title("4. Стиль")
     style_argv: List[str] = []
     opts = [("Обычный", "как в среднем по всем картам этой сложности"),
             ("Как у карты из этого архива", "джеки, аккорды, лонгноты — как у маппера этого .osz (ноты не копируются)"),
@@ -284,7 +351,7 @@ def run_dialog() -> Optional[List[str]]:
         style_argv = ["--style_from", str(sp)]
     argv += style_argv
 
-    title("4. Лонгноты")
+    title("5. Лонгноты")
     if style_argv:
         print(color("  Стиль задан картой: «как обычно» = столько лонгнот, сколько у неё на этой сложности.", "2"))
     ln = pick("ln", "Сколько лонгнот?", LN_CHOICES, 1)
@@ -305,7 +372,7 @@ def run_dialog() -> Optional[List[str]]:
         print(f"  {LN_CHOICES[ln - 1][0]} (как в прошлый раз)")
     argv += ln_argv
 
-    title("5. Характер карты")
+    title("6. Характер карты")
     style = pick("style", "Насколько смело?", STYLE_CHOICES, 2)
     contrast = pick("contrast", "Перепады плотности между частями песни?", CONTRAST_CHOICES, 2)
     quality = pick("quality", "Сколько вариантов перебрать?", QUALITY_CHOICES, 2)
@@ -315,7 +382,7 @@ def run_dialog() -> Optional[List[str]]:
     argv += ["--creativity", STYLE_CHOICES[style - 1][2], "--contrast", CONTRAST_CHOICES[contrast - 1][2],
              "--variants", QUALITY_CHOICES[quality - 1][2]]
 
-    title("6. Дополнительно")
+    title("7. Дополнительно")
     if net:
         use_net = last.get("net", True) if use_last else ask_yes("Использовать нейросеть (подсказывает, где ноты и лонгноты)?", True)
         if not use_net:
@@ -350,27 +417,33 @@ def run_dialog() -> Optional[List[str]]:
         return None
     last.update({"song": song_argv[1] if song_argv[0] == "--template" else song_argv[0],
                  "stars": " ".join(f"{s:g}" for s in stars), "ln": ln, "style": style, "contrast": contrast,
-                 "quality": quality, "net": "--no_model" not in argv, "hitsounds": hs, "creator": creator})
+                 "quality": quality, "net": "--no_model" not in argv, "hitsounds": hs, "creator": creator, "engine": "composer"})
     save_settings(last)
-    return argv
+    return ("composer", argv)
 
 
 def main() -> None:
     _setup_console()
     os.chdir(REPO)  # модели и output_beatmaps лежат рядом с программой
     sys.path.insert(0, str(REPO))
-    print(color("AIManiaMapper — композитор карт osu!mania 4K", "1;35"))
+    print(color("AIManiaMapper — генератор карт osu!mania 4K", "1;35"))
     print(color("Enter = вариант в [скобках]. Ctrl+C — выход.", "2"))
     while True:
         try:
-            argv = run_dialog()
-            if argv:
+            res = run_dialog()
+            if res:
+                engine, argv = res
                 title("Генерация")
-                import generate_composer
-                generate_composer.main(argv)
+                if engine == "network":
+                    import generate_hybrid as gen
+                    script = "generate_hybrid.py"
+                else:
+                    import generate_composer as gen
+                    script = "generate_composer.py"
+                gen.main(argv)
                 print()
                 print(color("Готово!", "1;32") + " Та же генерация одной командой:")
-                print("  python generate_composer.py " + " ".join(shlex.quote(a) if os.name != "nt" else (f'"{a}"' if " " in a else a) for a in argv))
+                print(f"  python {script} " + " ".join(shlex.quote(a) if os.name != "nt" else (f'"{a}"' if " " in a else a) for a in argv))
         except KeyboardInterrupt:
             print("\nВыход.")
             return
