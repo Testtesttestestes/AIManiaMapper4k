@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 import numpy as np
 
 from osu_mapper.hybrid.audio_features import QUALITY_VARIANTS, FeatureConfig, coarse_features, compute_stacked_features, degrade_audio, load_audio
+from osu_mapper.hybrid.data_checks import alignment_problems, audio_alignment_report
 from osu_mapper.hybrid.dataset import INDEX_VERSION, piece_name
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import render_track
@@ -51,6 +52,8 @@ def main() -> None:
     ap.add_argument("--ffmpeg", default=None, help="path to ffmpeg(.exe)")
     ap.add_argument("--quality_variants", nargs="*", default=[], choices=sorted(QUALITY_VARIANTS), help="extra degraded-audio feature copies")
     ap.add_argument("--keep_duplicates", action="store_true", help="keep difficulties whose notes are identical to an already added one")
+    ap.add_argument("--keep_suspicious", action="store_true",
+                    help="keep maps that fail the audio checks (notes outside the audio, on silence, not on onsets); they are reported anyway")
     ap.add_argument("--max_songs", type=int, default=0, help="stop after N songs (0 = all)")
     ap.add_argument("--overwrite", action="store_true", help="recompute features even if they exist")
     ap.add_argument("--device", default="auto", help="device for STFT features and neural encoders: auto (GPU if available) / cpu / cuda / cuda:1")
@@ -84,6 +87,7 @@ def main() -> None:
     maps: List[Dict[str, Any]] = []
     totals = {"songs": 0, "maps": 0, "roundtrip_fail": 0, "overflow_notes": 0, "notes": 0, "audio_hours": 0.0}
     t_start = time.time()
+    rejected: List[Dict[str, Any]] = []  # maps excluded by the audio checks (written to data_check_report.json)
     seen_charts: Dict[str, str] = {}  # notes hash -> first map with these notes (duplicate re-uploads are skipped)
 
     def write_index() -> None:
@@ -119,6 +123,7 @@ def main() -> None:
                     print(f"[skip] {label}: audio shorter than 1 s")
                     continue
                 stacked = compute_stacked_features(wave, fcfg, device=args.device)
+                check_feats = stacked
                 np.save(feat_file, stacked.astype(np.float16))
                 np.save(coarse_file, coarse_features(stacked).astype(np.float16))
                 for vname, vfile in zip(args.quality_variants, variant_files):
@@ -128,6 +133,7 @@ def main() -> None:
                 duration_ms = int(round(wave.size * 1000.0 / fcfg.sample_rate))
                 print(f"[song] {label}: {duration_ms / 1000:.1f}s, features {stacked.shape} in {time.time() - t0:.1f}s")
             else:
+                check_feats = np.load(feat_file, mmap_mode="r")
                 num_frames = int(old_songs[sid]["num_frames"])
                 duration_ms = int(old_songs[sid]["duration_ms"])
                 print(f"[song] {label}: cached features")
@@ -153,6 +159,16 @@ def main() -> None:
                 totals["duplicates_skipped"] = totals.get("duplicates_skipped", 0) + 1
                 continue
             seen_charts.setdefault(chart, f"{Path(group.source).name} :: {osu_name}")
+            check = audio_alignment_report(m.notes, check_feats, fcfg.slices(), fcfg.frame_ms, duration_ms)
+            problems = alignment_problems(check)
+            if problems:
+                rejected.append({"source": group.source, "osu_file": osu_name, "audio": group.audio_name, "problems": problems,
+                                 "check": {k: round(float(v), 3) for k, v in check.items()}})
+                if not args.keep_suspicious:
+                    print(f"  [audio check] {osu_name}: " + "; ".join(problems) + " - skipped (--keep_suspicious keeps it)")
+                    totals["audio_check_skipped"] = totals.get("audio_check_skipped", 0) + 1
+                    continue
+                print(f"  [audio check] {osu_name}: " + "; ".join(problems) + " - kept (--keep_suspicious)")
             mid = stable_id(group.source, osu_name)
             stats = SolveStats()
             track = solve_map(m, num_frames=num_frames, stats=stats)
@@ -179,6 +195,7 @@ def main() -> None:
                 "overflow_reasons": stats.overflow_reasons,
                 "overlaps_in_ln": stats.overlaps_in_ln,
                 "roundtrip_exact": bool(exact),
+                "alignment_z": round(float(check.get("alignment_z", 0.0)), 2),
             })
             totals["maps"] += 1
             totals["notes"] += len(m.notes)
@@ -192,10 +209,14 @@ def main() -> None:
             write_index()
 
     write_index()
+    (out / "data_check_report.json").write_text(json.dumps(rejected, indent=1, ensure_ascii=False), encoding="utf-8")
     print("\n" + "=" * 70)
     print(f"songs {totals['songs']} | maps {totals['maps']} | audio {totals['audio_hours']:.2f} h | notes {totals['notes']:,}")
     if totals.get("duplicates_skipped"):
         print(f"duplicate difficulties skipped (same notes as an earlier map): {totals['duplicates_skipped']}")
+    if rejected:
+        print(f"audio checks: {len(rejected)} difficulties look wrong (audio is not the music of the map) -> "
+              f"{'kept' if args.keep_suspicious else 'skipped'}, details in {out / 'data_check_report.json'}")
     print(f"exact roundtrip failures: {totals['roundtrip_fail']} | notes in overflow (not expressible densely): {totals['overflow_notes']}")
     print(f"index: {index_path} ({time.time() - t_start:.0f}s)")
     if totals["maps"] == 0:
