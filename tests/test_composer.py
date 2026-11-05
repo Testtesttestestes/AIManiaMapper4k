@@ -181,7 +181,8 @@ class TestPatternModel(unittest.TestCase):
             jacks += [Note(t, 0, t), Note(t, 1, t)]
         from osu_mapper.hybrid.patterns import style_ln_share_at, style_model_from_maps
         style = style_model_from_maps([(jacks, [RawTimingPoint(1000.0, 600.0)], 3.5)])
-        mixed = base.with_style(style, 4.0)
+        mixed = base.with_style(style, 20.0)
+        self.assertGreater(mixed.fast_repeat_share(3.5), 0.8)            # the style's jack rate becomes the target
         lp_base = base.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
         lp_mix = mixed.lane_logprob(3.5, 150, 0b0011, 0b0011, 2)
         self.assertGreater(lp_mix[0b0011], lp_base[0b0011])          # the chord jack became typical

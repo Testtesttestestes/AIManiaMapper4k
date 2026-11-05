@@ -569,6 +569,7 @@ class Composer:
         self.an, self.sections, self.cfg, self.hints, self.log = an, sections, cfg, hints, log
         self.patterns = patterns          # learned PatternModel (patterns.py) or None
         self.chord_boost = 1.0            # > 1 when the density alone cannot reach the requested star rating
+        self.repeat_scale = 1.0           # strength of the lane-repeat (jack / anchor) penalties, calibrated to the data
         self.target_sr = float(target_sr)
         self._candidates()
 
@@ -1050,15 +1051,15 @@ class Composer:
                         # repeats rarer in real maps of this SR than the 5% fastest cost more the rarer they are
                         q = float(rep_cdf[min(rep_cdf.size - 1, int(since) // 5)])
                         if q < 0.05:
-                            v -= 3.0 * (0.05 - q) / 0.05
+                            v -= self.repeat_scale * 3.0 * (0.05 - q) / 0.05
                     if since < jack_min:
                         allowed_jack = (fam == "jack" and same_sound) or (fam == "chordjack" and since >= 0.7 * jack_min)
-                        v -= 1.0 if allowed_jack else (6.0 * (1.0 - since / jack_min) + 2.0) * (1.0 - 0.5 * cfg.creativity)
+                        v -= self.repeat_scale * (1.0 if allowed_jack else (6.0 * (1.0 - since / jack_min) + 2.0) * (1.0 - 0.5 * cfg.creativity))
                 lh = sum(1 for c in lanes if c < 2)
                 rh = len(lanes) - lh
                 v -= 0.6 * max(0.0, (load[0] + lh) - (load[1] + rh)) ** 2 / 8.0 + 0.6 * max(0.0, (load[1] + rh) - (load[0] + lh)) ** 2 / 8.0
                 if len(hist) >= 3 and sum(1 for h in hist[-3:] if h & m) >= 3:
-                    v -= 1.5  # anchor
+                    v -= 1.5 * self.repeat_scale  # anchor
                 if k == 2 and m in (0b0011, 0b1100) and fam not in ("chordjack", "handstream"):
                     v -= 0.3
                 v_before_family = v
@@ -1376,7 +1377,16 @@ def pattern_entropy(notes: Sequence[Note]) -> float:
     return float(-(p * np.log2(p)).sum())
 
 
-def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis) -> Tuple[float, Dict[str, float]]:
+def fast_jack_share(notes: Sequence[Note], jack_ms: float = 160.0) -> float:
+    """Share of chords that repeat a lane of the previous chord less than ``jack_ms`` after it."""
+    from .ergonomics import ergonomics_report
+    return float(ergonomics_report(notes, jack_ms=jack_ms).get("fast_jack_pct", 0.0)) / 100.0
+
+
+def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis,
+           jack_target: Optional[float] = None) -> Tuple[float, Dict[str, float]]:
+    """Score of a composed variant. Jacks are judged against what real maps (or the chosen style) do at this star
+    rating: a chordjack style wants jacks, a stream style does not; without data, fewer jacks are better."""
     from .ergonomics import ergonomics_report
 
     if not notes:
@@ -1385,7 +1395,12 @@ def critic(notes: Sequence[Note], sr: float, target: float, an: SongAnalysis) ->
     ent = pattern_entropy(notes)
     starts = np.array([n.start for n in notes])
     on_attack = float(np.mean(an.attack_at(starts) > np.percentile(an.attack_ms, 75)))
-    score = (-20.0 * max(0.0, abs(sr - target) - 0.02) - 0.04 * er.get("fast_jack_pct", 0.0) - 0.25 * max(0.0, er.get("max_one_hand_run", 0.0) - 6)
+    jack_pct = er.get("fast_jack_pct", 0.0)
+    if jack_target is not None:
+        jack_term = 8.0 * abs(fast_jack_share(notes) - jack_target)  # same 160 ms cut as the model statistics
+    else:
+        jack_term = 0.04 * jack_pct
+    score = (-20.0 * max(0.0, abs(sr - target) - 0.02) - jack_term - 0.25 * max(0.0, er.get("max_one_hand_run", 0.0) - 6)
              - 1.5 * er.get("hand_imbalance", 0.0) + 0.35 * min(ent, 7.0) + 1.0 * on_attack)
     return float(score), {"pattern_entropy": ent, "on_attack": on_attack, **er}
 
@@ -1403,12 +1418,15 @@ def compose(
     cfg = cfg or ComposerConfig()
     secs = sections if sections is not None else segment_sections(an)
     comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr)
+    # how often real maps (or the chosen style) repeat a lane within 150 ms at this star rating
+    jack_target = patterns.fast_repeat_share(target_sr) if (patterns is not None and hasattr(patterns, "fast_repeat_share")) else None
     best: Optional[ComposeResult] = None
     best_score = -float("inf")
     for v in range(max(1, cfg.variants)):
         seed = cfg.seed * 1000 + v
         lo, hi = 0.0, LEVEL_MAX
         comp.chord_boost = 1.0
+        comp.repeat_scale = 1.0
         cache: Dict[float, Tuple[float, List[Note]]] = {}
 
         plan_level = float(np.clip(0.15 * target_sr + 0.17, 0.0, 1.6))  # typical level of this SR (measured on real songs)
@@ -1459,15 +1477,63 @@ def compose(
                 else:
                     b_hi = b
             _, comp.chord_boost, sr, notes = best_b
+        if jack_target is not None:
+            L, sr, notes = _calibrate_repeats(comp, an, cfg, L, sr, notes, seed, plan_level, target_sr, jack_target)
         comp.plan_families(plan_level, np.random.default_rng(seed + 7))
-        score, rep = critic(notes, sr, target_sr, an)
-        rep.update({"level": L, "variant": v, "critic": score, "chord_boost": comp.chord_boost})
+        score, rep = critic(notes, sr, target_sr, an, jack_target)
+        rep.update({"level": L, "variant": v, "critic": score, "chord_boost": comp.chord_boost,
+                    "repeat_scale": comp.repeat_scale, "jack_target": jack_target})
         log(f"    variant {v + 1}/{cfg.variants}: level {L:.3f} -> {len(notes)} notes, SR {sr:.2f} | "
             f"patterns {rep.get('pattern_entropy', 0):.2f} bits | on attacks {100 * rep.get('on_attack', 0):.0f}% | "
-            f"fast jacks {rep.get('fast_jack_pct', 0):.1f}% | critic {score:.2f}")
+            f"fast jacks {rep.get('fast_jack_pct', 0):.1f}%"
+            + (f" (real maps {100 * jack_target:.1f}%)" if jack_target is not None else "") + f" | critic {score:.2f}")
         if score > best_score:
             best_score = score
             import copy as _copy
             best = ComposeResult(notes=notes, star_rating=sr, level=L, sections=_copy.deepcopy(comp.sections), report=rep)
     assert best is not None
     return best
+
+
+def _calibrate_repeats(comp: "Composer", an: SongAnalysis, cfg: ComposerConfig, L: float, sr: float, notes: List[Note],
+                       seed: int, plan_level: float, target_sr: float, jack_target: float):
+    """Sets the strength of the jack / anchor penalties so that the share of fast lane repeats matches the data (the
+    dataset at this star rating, or the chosen style: a chordjack mapper's 60 % as well as a stream mapper's 2 %).
+    The level is re-searched after every change, since jacks change the star rating."""
+    rate = fast_jack_share(notes)
+    if abs(rate - jack_target) <= 0.02:
+        return L, sr, notes
+
+    def search(L0: float):
+        lo, hi = max(0.0, L0 - 0.25), min(LEVEL_MAX, L0 + 0.25)
+        best = None
+        Lc = L0
+        for _ in range(7):
+            n_ = comp.render(Lc, seed, plan_level)
+            s_ = star_rating(n_, an.timing_points, cfg.od)
+            if best is None or abs(s_ - target_sr) < abs(best[1] - target_sr):
+                best = (Lc, s_, n_)
+            if abs(s_ - target_sr) <= cfg.sr_tolerance:
+                break
+            lo, hi = (Lc, hi) if s_ < target_sr else (lo, Lc)
+            Lc = 0.5 * (lo + hi)
+        return best
+
+    best = (abs(rate - jack_target) + 2.0 * max(0.0, abs(sr - target_sr) - cfg.sr_tolerance), 1.0, L, sr, notes)
+    lo, hi = math.log(0.02), math.log(6.0)   # more penalty = fewer jacks
+    for _ in range(6):
+        mid = 0.5 * (lo + hi)
+        comp.repeat_scale = math.exp(mid)
+        Lm, srm, nm = search(L)
+        r = fast_jack_share(nm)
+        err = abs(r - jack_target) + 2.0 * max(0.0, abs(srm - target_sr) - cfg.sr_tolerance)
+        if err < best[0]:
+            best = (err, comp.repeat_scale, Lm, srm, nm)
+        if abs(r - jack_target) <= 0.02:
+            break
+        if r > jack_target:
+            lo = mid
+        else:
+            hi = mid
+    _, comp.repeat_scale, L, sr, notes = best
+    return L, sr, notes

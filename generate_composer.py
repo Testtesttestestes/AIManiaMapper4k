@@ -81,7 +81,8 @@ def main(argv=None) -> None:
     ap.add_argument("--style_from", default=None,
                     help="map in the style of this .osz/.osu (its difficulties set the jacks, chords, divisors, long notes...)")
     ap.add_argument("--style_diff", default="", help="only difficulties whose name contains this text (with --style_from)")
-    ap.add_argument("--style_strength", type=float, default=4.0, help="weight of --style_from against the dataset (default 4)")
+    ap.add_argument("--style_strength", type=float, default=20.0,
+                    help="weight of --style_from against the dataset (default 20: the style decides, the dataset only fills contexts the style maps never show)")
     ap.add_argument("--ln_ratio", type=float, default=None, help="exact share of long notes, e.g. 0.44 (overrides --ln_style)")
     ap.add_argument("--ln_style", default=None, choices=["rice", "light", "hybrid", "ln", "full"],
                     help="LN style: rice ~2%%, light ~10%%, hybrid ~22%%, ln ~38%%, full ~55%% long notes; where they go, how many "

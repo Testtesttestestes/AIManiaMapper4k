@@ -42,6 +42,7 @@ N_DIV = len(DIV_CLASSES)
 DIV_TICKS_PER_BEAT = np.array([1, 1, 2, 4, 4, 12, 1], dtype=np.float64)  # ticks of each class per beat
 POP = np.array([bin(m).count("1") for m in range(16)])
 MIN_BIN_MAPS = 10        # a star-rating bin with fewer maps is mixed with its nearest well-filled neighbour
+FAST_REPEAT_MS = 160.0   # "fast jack" limit: a gap-bin edge, so model statistics and measured maps use the same cut
 STAGGER_MS = 30          # chord-to-chord gaps below this are one chord with offset notes (or a grace note), not rhythm
 REPEAT_BIN_MS = 5
 REPEAT_BINS = 400                                          # 0..2 s
@@ -340,10 +341,10 @@ class PatternModel:
                 continue
             a = getattr(self, k, None)
             setattr(self, k, b.copy() if a is None else a + b)
-        for cache in ("_m_uni", "_m_gap", "_m_prev"):
+        for cache in ("_m_uni", "_m_gap", "_m_prev", "_overlap"):
             self.__dict__.pop(cache, None)
 
-    def with_style(self, style: "PatternModel", strength: float = 4.0) -> "PatternModel":
+    def with_style(self, style: "PatternModel", strength: float = 20.0) -> "PatternModel":
         """Dataset model + the patterns of a few chosen maps ("map like this mapper").
 
         For every star-rating bin the style counts (taken from the nearest bin the style maps cover) are scaled to
@@ -495,6 +496,26 @@ class PatternModel:
         if h is None:
             return None
         return float(np.searchsorted(np.cumsum(h) / h.sum(), quantile) * REPEAT_BIN_MS)
+
+    def fast_repeat_share(self, sr: float, max_gap_ms: float = FAST_REPEAT_MS) -> Optional[float]:
+        """Share of chords that repeat a lane of the previous chord less than ``max_gap_ms`` after it (fast jacks,
+        chordjacks), in real maps of this star rating: ~2-6 % in most maps, 40-65 % in chordjack maps."""
+        if not hasattr(self, "_overlap"):
+            self._overlap = ((np.arange(16)[:, None] & np.arange(16)[None, :]) > 0).astype(np.float64)  # [prev, mask]
+        num = den = 0.0
+        for b, wt in self._sr_weights(sr):
+            L = self.lane[b].astype(np.float64)              # [gap, prev, prev2, mask]
+            per_gap = L.sum(axis=2)                          # [gap, prev, mask]
+            tot = per_gap.sum()
+            if tot <= 0:
+                continue
+            lo_edges = np.concatenate([[0.0], GAP_EDGES_MS])
+            hi_edges = np.concatenate([GAP_EDGES_MS, [1e9]])
+            frac = (hi_edges <= max_gap_ms + 1e-6).astype(np.float64)  # whole gap bins (the limit is a bin edge)
+            fast = float((per_gap * self._overlap[None]).sum(axis=(1, 2)) @ frac)
+            num += wt * fast / tot
+            den += wt
+        return num / den if den > 0 else None
 
     def repeat_cdf(self, sr: float) -> Optional[np.ndarray]:
         """[REPEAT_BINS] share of lane repeats in real maps of this difficulty that are faster than each 5 ms bin."""
