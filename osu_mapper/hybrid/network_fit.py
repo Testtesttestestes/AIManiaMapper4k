@@ -40,7 +40,7 @@ class NetworkFit:
     threshold: float
     lag_ms: int
     reached: bool
-    lane_strength: float = 0.0   # ergonomics strength used to bring the fast-jack share to the data
+    lane_strength: float = 0.0   # weight of the pattern-model lane prior (or ergonomics strength) used for the jack share
     jack_share: float = 0.0
     jack_target: Optional[float] = None          # False: the requested rating needs notes the network does not hear (or fewer than it is sure of)
 
@@ -98,6 +98,8 @@ def fit_network_map(
     fix_lag: bool = True,
     jack_target: Optional[float] = None,
     log=None,
+    lane_prior=None,
+    hand_run_continue=None,
 ) -> NetworkFit:
     """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
     (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes."""
@@ -105,9 +107,16 @@ def fit_network_map(
 
     lag = network_lag(out, timing_points) if fix_lag else 0
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
+    if hand_run_continue is not None:
+        base = dataclasses.replace(base, hand_run_continue=hand_run_continue)
     strength = 0.0
 
     def decode(th: float, st: float) -> List[Note]:
+        if lane_prior is not None:
+            # the network chooses lanes together with what real maps do after these chords (pattern model); st is the
+            # weight of that prior here, not an after-the-fact re-assignment
+            return decode_outputs(out, dataclasses.replace(base, onset_threshold=th, lane_prior=lane_prior if st > 0 else None,
+                                                           lane_prior_weight=st), timing_points)
         notes = decode_outputs(out, dataclasses.replace(base, onset_threshold=th), timing_points)
         if st > 0:
             notes = improve_ergonomics(notes, timing_points, st, release_gap_ms=base.ln_release_gap_ms,
@@ -119,7 +128,7 @@ def fit_network_map(
         share = fast_jack_share(decode(th, current))
         if jack_target is None or abs(share - jack_target) <= 0.02 or (share < jack_target and current == 0.0):
             return current
-        lo_s, hi_s, best = 0.0, 1.0, (abs(share - jack_target), current)
+        lo_s, hi_s, best = 0.0, (0.6 if lane_prior is not None else 1.0), (abs(share - jack_target), current)
         for _ in range(8):
             mid = 0.5 * (lo_s + hi_s)
             sh = fast_jack_share(decode(th, mid))

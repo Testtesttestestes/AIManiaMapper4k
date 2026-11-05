@@ -319,8 +319,11 @@ def main(argv=None) -> None:
                 if args.fit_sr == "on" and user_thresholds is None:
                     from osu_mapper.hybrid.network_fit import fit_network_map
                     jt = pattern_model.fast_repeat_share(target) if pattern_model is not None else None
+                    lp = pattern_model.lane_prior(target) if pattern_model is not None else None
+                    hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
                     fit = fit_network_map(out, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                          min_threshold=args.min_threshold, jack_target=jt, log=print)
+                                          min_threshold=args.min_threshold, jack_target=jt, log=print, lane_prior=lp,
+                                          hand_run_continue=hr)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
@@ -332,7 +335,8 @@ def main(argv=None) -> None:
                             out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
                                                      sr_guidance=g2, style_guidance=args.style_guidance)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                                   min_threshold=args.min_threshold, jack_target=jt)
+                                                   min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp,
+                                                   hand_run_continue=hr)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
                                 print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
                                 fit, out = fit2, out2

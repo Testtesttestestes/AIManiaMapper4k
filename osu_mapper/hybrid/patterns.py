@@ -41,6 +41,11 @@ DIV_CLASSES: Tuple[str, ...] = ("1/1", "1/2", "1/4", "1/3-1/6", "1/8", "1/12-1/1
 N_DIV = len(DIV_CLASSES)
 DIV_TICKS_PER_BEAT = np.array([1, 1, 2, 4, 4, 12, 1], dtype=np.float64)  # ticks of each class per beat
 POP = np.array([bin(m).count("1") for m in range(16)])
+# P(the next fast chord stays on the same hand | the one-hand run has k chords), k = 1, 2, 3, >= 4; measured on 42 human
+# maps (37k runs of chords < 200 ms apart): runs longer than 4 are 0.2 % of runs, the v2 network made runs of 25-64
+DEFAULT_HAND_RUN_CONTINUE = np.array([0.22, 0.13, 0.24, 0.27])
+HAND_RUN_MS = 200.0
+HAND_RUN_BINS = 12
 MIN_BIN_MAPS = 10        # a star-rating bin with fewer maps is mixed with its nearest well-filled neighbour
 FAST_REPEAT_MS = 160.0   # "fast jack" limit: a gap-bin edge, so model statistics and measured maps use the same cut
 STAGGER_MS = 30          # chord-to-chord gaps below this are one chord with offset notes (or a grace note), not rhythm
@@ -131,6 +136,7 @@ class PatternModel:
     ln_len: Optional[np.ndarray] = None      # [SR, STYLE, gap next (beat bin), N_LN_LEN] LN length in beats
     ln_style_maps: Optional[np.ndarray] = None  # [SR, STYLE] maps of each LN style
     ln_span_style: Optional[np.ndarray] = None  # [SR, STYLE, LN_SPAN_BINS] chords during a hold
+    hand_runs: Optional[np.ndarray] = None   # [SR, HAND_RUN_BINS] one-hand runs of fast chords by length
     ln_release: Optional[np.ndarray] = None  # [SR, STYLE, 3] LN releases: on another chord's start / on a free tick / off grid  # [SR, 3] least squares of log section density vs log audio intensity: sum xy, sum xx, n
     version: str = PATTERN_VERSION
 
@@ -198,6 +204,21 @@ class PatternModel:
         if n_win >= 4:
             cnt = np.bincount(((times - times[0]) // win).clip(0, n_win - 1), minlength=n_win).astype(np.float64)
             self.density_cv[s] += (float(cnt.std() / max(1e-6, cnt.mean())), 1.0)
+        # one-hand runs: fast chords (< 200 ms apart) that stay on one hand
+        if self.hand_runs is None:
+            self.hand_runs = np.zeros((SR_BINS, HAND_RUN_BINS), np.float64)
+        cur, prev_h, pt = 0, None, -10 ** 9
+        for x, mk in zip(times, masks):
+            h = "L" if not (mk & 0b1100) else ("R" if not (mk & 0b0011) else "B")
+            if h != "B" and h == prev_h and x - pt < HAND_RUN_MS:
+                cur += 1
+            else:
+                if cur:
+                    self.hand_runs[s, min(HAND_RUN_BINS - 1, cur)] += 1
+                cur = 1 if h != "B" else 0
+            prev_h, pt = h, x
+        if cur:
+            self.hand_runs[s, min(HAND_RUN_BINS - 1, cur)] += 1
         # how many chords real mappers start while a long note is held (dense holds vs. isolated holds)
         for n in notes:
             if n.ln and n.end > n.start:
@@ -425,6 +446,42 @@ class PatternModel:
         with np.errstate(divide="ignore"):
             return np.where(valid, np.log(np.maximum(out / max(1e-12, out.sum()), 1e-9)), -np.inf)
 
+    def hand_run_continue(self, sr: float, from_length: int = 3) -> np.ndarray:
+        """[HAND_RUN_BINS] P(the next fast chord stays on the same hand | run length k), k = 0..; from the data when the
+        pattern model has counted runs, else DEFAULT_HAND_RUN_CONTINUE. Lengths >= 4 are pooled (few long runs)."""
+        cont = np.ones(HAND_RUN_BINS)
+        base = DEFAULT_HAND_RUN_CONTINUE
+        h = self._hist(self.hand_runs, sr) if self.hand_runs is not None else None
+        if h is not None and h.sum() > 0:
+            counts = h * 1000.0  # normalized histogram -> pseudo counts
+            ge = np.cumsum(counts[::-1])[::-1]
+            if ge[1] > 0:
+                base = np.array([(ge[k + 1] + 0.5) / (ge[k] + 1.0) for k in (1, 2, 3)] + [(ge[5] + 0.5) / (ge[4] + 1.0)])
+        cont[1:4] = base[:3]
+        cont[4:] = base[3]
+        # short runs are the network's business (applying the rule from length 1 made every pattern alternate hands:
+        # pattern entropy 4.48 -> 3.89); from length 3 the longest run comes to 5.5 (human maps 5.3)
+        cont[:from_length] = 0.5
+        return np.clip(cont, 0.02, 0.98)
+
+    def lane_prior(self, sr: float):
+        """f(prev, prev2, gap_ms) -> [16] log P(mask | its chord size, context) for every mask: what real maps of this star
+        rating do after these two chords at this speed. Used by the network decoder next to its own lane logits."""
+        cache = {}
+
+        def f(prev: int, prev2: int, gap_ms: float) -> np.ndarray:
+            key = (int(prev) & 15, int(prev2) & 15, gap_bin(gap_ms))
+            if key not in cache:
+                out = np.full(16, -12.0)
+                for size in range(1, 5):
+                    lp = self.lane_logprob(sr, gap_ms, key[0], key[1], size)
+                    sel = POP == size
+                    out[sel] = lp[sel]
+                out[0] = -12.0
+                cache[key] = out
+            return cache[key]
+        return f
+
     def chord_distribution(self, sr: float, metric: int = 1, gap_ms: Optional[float] = None) -> np.ndarray:
         """P(chord size 1..4 | star rating [, metric position, gap])."""
         p = np.zeros(4)
@@ -645,7 +702,7 @@ class PatternModel:
         return "\n".join(rows)
 
 
-OPTIONAL_ARRAYS = ("repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
+OPTIONAL_ARRAYS = ("hand_runs", "repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
                    "ln_ctx", "ln_members", "ln_len", "ln_style_maps", "ln_span_style", "ln_release")
 
 
