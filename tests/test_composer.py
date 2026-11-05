@@ -352,3 +352,55 @@ class TestPitchShift(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNetworkFit(unittest.TestCase):
+    def _outputs(self, shift_ms: int = 0, seed: int = 3):
+        """Graded 'network' outputs for a synthetic hard map: every real event gets a probability in 0.2..1."""
+        from osu_mapper.hybrid.renderer import oracle_outputs
+        from osu_mapper.hybrid.solver import solve_map
+        from osu_mapper.hybrid.beatmap import ManiaMap
+        wave, reds, events = synth_song(41, 40.0, bpm_change=False)
+        notes = map_events(events, "hard", reds[0].beat_len)
+        if shift_ms:
+            notes = [Note(n.start + shift_ms, n.col, n.end + shift_ms, n.ln) for n in notes]
+        track = solve_map(ManiaMap(notes=notes, timing_points=reds))
+        out = oracle_outputs(track)
+        rng = np.random.default_rng(seed)
+        ev = np.flatnonzero(out.time_probs[:, 0] < 0.5)
+        p = rng.uniform(0.2, 1.0, ev.size)
+        out.time_probs[ev] *= p[:, None]
+        out.time_probs[ev, 0] = 1.0 - p
+        return out, reds, notes
+
+    def test_fit_reaches_rating_without_new_notes(self):
+        from osu_mapper.hybrid.network_fit import fit_network_map
+        from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs
+        out, reds, notes = self._outputs()
+        full = decode_outputs(out, DecodeKnobs(onset_threshold=0.15), reds)
+        sr_full = star_rating(full, reds)
+        target = round(sr_full - 0.6, 2)
+        fit = fit_network_map(out, DecodeKnobs(), reds, target, min_threshold=0.15)
+        self.assertTrue(fit.reached, (fit.star_rating, target))
+        self.assertLessEqual(abs(fit.star_rating - target), 0.05)
+        self.assertGreaterEqual(fit.threshold, 0.15)
+        self.assertTrue({n.start for n in fit.notes} <= {n.start for n in full})  # only moments the network heard
+        too_hard = fit_network_map(out, DecodeKnobs(), reds, sr_full + 2.0, min_threshold=0.15)
+        self.assertFalse(too_hard.reached)                                        # says so instead of filling silence
+        self.assertLessEqual(too_hard.star_rating, sr_full + 0.05)
+
+    def test_network_lag(self):
+        from osu_mapper.hybrid.network_fit import network_lag
+        out, reds, _ = self._outputs(shift_ms=6)
+        self.assertEqual(network_lag(out, reds), 6)
+
+    def test_nested_chord_sizes(self):
+        from osu_mapper.hybrid.composer import _nested_sizes
+        rng = np.random.default_rng(0)
+        u = rng.random((1000, 3))
+        r = np.tile([0.3, 0.07, 0.01], (1000, 1))
+        sz = _nested_sizes(u, r)
+        self.assertAlmostEqual(float((sz >= 2).mean()), 0.3, delta=0.05)
+        self.assertAlmostEqual(float((sz >= 3).mean()), 0.07, delta=0.01)
+        self.assertAlmostEqual(float((sz >= 4).mean()), 0.01, delta=0.005)
+        self.assertTrue(np.all(sz[sz >= 3] >= 3) and np.all((u[:, 0] < 0.3)[sz >= 3]))  # triples only among 2+ chords
