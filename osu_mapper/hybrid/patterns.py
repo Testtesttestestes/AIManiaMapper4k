@@ -327,6 +327,17 @@ class PatternModel:
             return None
         return int(np.searchsorted(np.cumsum(h) / h.sum(), quantile))
 
+    def merge(self, other: "PatternModel") -> None:
+        """Adds the counts of another model (models counted in parallel on separate processes)."""
+        for k in ("lane", "chord", "rhythm_hits", "rhythm_beats", "ln", "maps") + OPTIONAL_ARRAYS:
+            b = getattr(other, k, None)
+            if b is None:
+                continue
+            a = getattr(self, k, None)
+            setattr(self, k, b.copy() if a is None else a + b)
+        for cache in ("_m_uni", "_m_gap", "_m_prev"):
+            self.__dict__.pop(cache, None)
+
     # ------------------------------------------------------------------------------------------
     def _sr_weights(self, sr: float) -> List[Tuple[int, float]]:
         x = float(np.clip(sr - 0.5, 0.0, SR_BINS - 1.0))

@@ -6,8 +6,8 @@ Learns the mapping-pattern model (osu_mapper/hybrid/patterns.py) from real maps.
     python learn_patterns.py --input_dir "sample beatmaps"         # straight from .osz archives, no audio needed
     python learn_patterns.py --data dataset_hybrid --out checkpoints/hybrid/patterns.npz
 
-Takes about a second per song on an SSD (no GPU, one CPU core, a few hundred MB of RAM); progress is printed every
-20 songs. --no_audio skips the audio part and needs no feature files at all. The composer (generate_composer.py) loads
+About a second per song per CPU core (no GPU), songs are counted on --workers processes in parallel; progress is
+printed as songs finish. --no_audio skips the audio part and needs no feature files at all. The composer (generate_composer.py) loads
 checkpoints/hybrid/patterns.npz automatically. Re-run it whenever the dataset grows.
 """
 
@@ -23,30 +23,24 @@ from pathlib import Path
 from osu_mapper.hybrid.patterns import PatternModel, default_pattern_path
 
 
-def from_dataset(model: PatternModel, data: Path, include_derived: bool, use_audio: bool = True) -> int:
-    """Counts every map of a prepared dataset. Maps are processed song by song, so the audio features of a song
-    (tens of MB on disk) are read once, not once per difficulty."""
+def _count_songs(job) -> "tuple":
+    """Worker: a fresh PatternModel counted over a chunk of songs (summed by the main process)."""
+    import os
+
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
     import numpy as np
 
     from osu_mapper.hybrid.params import ParamTrack
     from osu_mapper.hybrid.renderer import render_track
 
-    index = json.loads((data / "index.json").read_text(encoding="utf-8"))
-    maps = [m for m in index["maps"]
-            if not (m.get("derived") and not include_derived) and m.get("roundtrip_exact", True) and float(m.get("sr", 0.0)) > 0]
-    by_song = {}
-    for m in maps:
-        by_song.setdefault(m["song_id"], []).append(m)
-    slices = None
-    if use_audio:
-        from osu_mapper.hybrid.audio_features import FeatureConfig
-        from osu_mapper.hybrid.composer import analyze_song, segment_sections
-        slices = FeatureConfig.from_dict(index["feature_config"]).slices()
-    print(f"[learn] {len(maps)} maps of {len(by_song)} songs" + ("" if use_audio else " (no audio: section contrast not fitted)"), flush=True)
-    t0 = time.time()
+    data, songs, slices, use_audio = job
+    data = Path(data)
+    model = PatternModel.empty()
     n = 0
-    for k, (sid, song_maps) in enumerate(by_song.items(), 1):
-        song = index["songs"].get(sid, {})
+    if use_audio:
+        from osu_mapper.hybrid.composer import analyze_song, segment_sections
+    for song, song_maps in songs:
         feats = None
         sections_by_timing = {}
         if use_audio and song:
@@ -65,10 +59,60 @@ def from_dataset(model: PatternModel, data: Path, include_derived: bool, use_aud
                     sections_by_timing[key] = segment_sections(an)
                 model.add_sections(notes, sections_by_timing[key], sr)
             n += 1
-        if k == 1 or k % 20 == 0 or k == len(by_song):
-            el = time.time() - t0
-            eta = el / k * (len(by_song) - k)
-            print(f"  {k}/{len(by_song)} songs, {n} maps, {el:.0f}s elapsed, ~{eta:.0f}s left", flush=True)
+    return model, n, len(songs)
+
+
+def from_dataset(model: PatternModel, data: Path, include_derived: bool, use_audio: bool = True, workers: int = 1) -> int:
+    """Counts every map of a prepared dataset, song by song (the audio features of a song are read once), on
+    ``workers`` processes in parallel."""
+    print(f"[learn] reading {data / 'index.json'}", flush=True)
+    index = json.loads((data / "index.json").read_text(encoding="utf-8"))
+    maps = [m for m in index["maps"]
+            if not (m.get("derived") and not include_derived) and m.get("roundtrip_exact", True) and float(m.get("sr", 0.0)) > 0]
+    by_song = {}
+    for m in maps:
+        by_song.setdefault(m["song_id"], []).append(m)
+    slices = None
+    if use_audio:
+        slices = {k: tuple(v) for k, v in (index.get("feature_slices") or {}).items()}
+        if not slices:
+            from osu_mapper.hybrid.audio_features import FeatureConfig
+            slices = FeatureConfig.from_dict(index["feature_config"]).slices()
+    songs = [(index["songs"].get(sid, {}), ms) for sid, ms in by_song.items()]
+    workers = max(1, min(int(workers), len(songs)))
+    print(f"[learn] {len(maps)} maps of {len(songs)} songs on {workers} process(es)"
+          + ("" if use_audio else " (no audio: section contrast not fitted)"), flush=True)
+    n_chunks = 1 if workers == 1 else min(len(songs), workers * 4)
+    chunks = [songs[i::n_chunks] for i in range(n_chunks)]
+    jobs = [(str(data), c, slices, use_audio) for c in chunks if c]
+    t0 = time.time()
+    n = done = 0
+
+    def report(k_songs: int) -> None:
+        el = time.time() - t0
+        eta = el / max(1, k_songs) * (len(songs) - k_songs)
+        print(f"  {k_songs}/{len(songs)} songs, {n} maps, {el:.0f}s elapsed, ~{eta:.0f}s left", flush=True)
+
+    if workers == 1:
+        for c in jobs:
+            for one in c[1]:  # song by song for a fine-grained progress line
+                part, k, _ = _count_songs((c[0], [one], c[2], c[3]))
+                model.merge(part)
+                n += k
+                done += 1
+                if done == 1 or done % 20 == 0 or done == len(songs):
+                    report(done)
+        return n
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_count_songs, j) for j in jobs]
+        for f in as_completed(futures):
+            part, k, ns = f.result()
+            model.merge(part)
+            n += k
+            done += ns
+            report(done)
     return n
 
 
@@ -119,6 +163,9 @@ def main() -> None:
     ap.add_argument("--input_dir", default=None, help="folder with .osz archives / song folders")
     ap.add_argument("--out", default=str(default_pattern_path()))
     ap.add_argument("--include_derived", action="store_true", help="also count thinned (derived) maps of the dataset")
+    import os
+    ap.add_argument("--workers", type=int, default=max(1, min(16, (os.cpu_count() or 2) - 1)),
+                    help="parallel processes for --data (default: CPU cores - 1, at most 16; each needs ~0.5 GB of RAM)")
     ap.add_argument("--no_audio", action="store_true",
                     help="skip the audio part (how section density follows the music); much faster, the composer then "
                          "matches the density variation of real maps instead")
@@ -130,7 +177,7 @@ def main() -> None:
     model = PatternModel.empty()
     n = 0
     if args.data:
-        n += from_dataset(model, Path(args.data), args.include_derived, use_audio=not args.no_audio)
+        n += from_dataset(model, Path(args.data), args.include_derived, use_audio=not args.no_audio, workers=args.workers)
     if args.input_dir:
         n += from_archives(model, Path(args.input_dir))
     if n == 0:
