@@ -27,7 +27,14 @@ from osu_mapper.hybrid.data_checks import (
     audio_reference_problem,
     keysound_share,
 )
-from osu_mapper.hybrid.patterns import PatternModel, density_correlation, density_graph, density_profile
+from osu_mapper.hybrid.patterns import (
+    PatternModel,
+    density_correlation,
+    density_graph,
+    density_profile,
+    ln_quality,
+    ln_similarity,
+)
 from osu_mapper.hybrid.synthetic import map_events, synth_song
 
 try:
@@ -224,6 +231,45 @@ class TestComposer(unittest.TestCase):
         # the repeat starts a non-integer number of ms later (ticks round differently): match within 2 ms
         same = sum(1 for (t, c) in second if any((t + d, c) in first for d in (-2, -1, 0, 1, 2))) / max(1, min(len(first), len(second)))
         self.assertGreater(same, 0.5, f"only {same:.2f} of the repeated passage is mapped like the original")
+
+
+class TestLongNotes(unittest.TestCase):
+    def test_ln_quality_report(self):
+        beat = 500.0
+        tps = [RawTimingPoint(0.0, beat)]
+        notes = [Note(0, 0, 250, True), Note(250, 2, 250), Note(500, 1, 1000, True), Note(750, 3, 750), Note(1000, 2, 1000)]
+        q = ln_quality(notes, tps)
+        self.assertAlmostEqual(float(q["share"][0]), 0.4)
+        self.assertAlmostEqual(float(q["release"][0]), 1.0)           # both holds end on another press
+        self.assertAlmostEqual(float(q["length"].sum()), 1.0)
+        self.assertEqual(float(q["span"][0]), 0.5)                    # first hold covers no chord, second covers one
+        sim = ln_similarity(q, q)
+        self.assertTrue(all(abs(v - 1.0) < 1e-6 for v in sim.values()))
+
+    @unittest.skipUnless(TORCH, "torch is required for audio features")
+    def test_ln_style_and_share(self):
+        feats, slices, reds, dur, events = song(21)
+        model = PatternModel.empty()
+        for seed in range(4):  # synthetic maps: lead notes longer than a beat are long notes
+            _, r, ev = synth_song(100 + seed, 30.0, bpm_change=False)
+            notes = map_events(ev, "hard", r[0].beat_len)
+            model.add_map(notes, r, star_rating(notes, r))
+        self.assertTrue(model.has_ln_model())
+        an = analyze_song(feats, slices, reds, dur)
+        for share in (0.0, 0.2, 0.45):
+            res = compose(an, 3.0, ComposerConfig(variants=1, sr_tolerance=0.15, ln_ratio=share), log=lambda *_: None, patterns=model)
+            got = float(ln_quality(res.notes, reds)["share"][0])
+            self.assertLess(abs(got - share), 0.08, f"asked {share}, got {got:.2f}")
+            if share > 0:
+                q = ln_quality(res.notes, reds)
+                self.assertLess(float(q["release"][2]), 0.05)        # releases sit on the grid
+            by_lane = {}
+            for n in res.notes:
+                by_lane.setdefault(n.col, []).append(n)
+            for lane in by_lane.values():
+                lane.sort()
+                for a, b in zip(lane[:-1], lane[1:]):
+                    self.assertGreater(b.start, a.end if a.ln else a.start)
 
 
 class TestPitchShift(unittest.TestCase):

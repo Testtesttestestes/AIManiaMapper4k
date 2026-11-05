@@ -56,7 +56,10 @@ def main() -> None:
     ap.add_argument("--variants", type=int, default=4, help="maps composed per difficulty; the critic keeps the best")
     ap.add_argument("--sr_tolerance", type=float, default=0.05)
     ap.add_argument("--families", nargs="*", default=None, choices=list(FAMILIES), help="allowed pattern families (default: all)")
-    ap.add_argument("--ln_ratio", type=float, default=None, help="share of long notes (default: learned for the star rating x sustained sounds)")
+    ap.add_argument("--ln_ratio", type=float, default=None, help="exact share of long notes, e.g. 0.44 (overrides --ln_style)")
+    ap.add_argument("--ln_style", default=None, choices=["rice", "light", "hybrid", "ln", "full"],
+                    help="LN style: rice ~2%%, light ~10%%, hybrid ~22%%, ln ~38%%, full ~55%% long notes; where they go, how many "
+                         "per chord and how long comes from real maps of that style (default: the most common style at the SR)")
     ap.add_argument("--no_ln", action="store_true", help="taps only")
     ap.add_argument("--max_chord", type=int, default=4)
     ap.add_argument("--no_repeat_memory", action="store_true", help="map repeated sections independently")
@@ -137,7 +140,7 @@ def main() -> None:
 
         cfg = ComposerConfig(
             creativity=float(np.clip(args.creativity, 0.0, 1.0)), contrast=args.contrast,
-            ln_ratio=0.0 if args.no_ln else args.ln_ratio, max_chord=args.max_chord, variants=args.variants,
+            ln_ratio=0.0 if args.no_ln else args.ln_ratio, ln_style=args.ln_style, max_chord=args.max_chord, variants=args.variants,
             sr_tolerance=args.sr_tolerance, families=args.families, net_weight=args.net_weight,
             repeat_memory=not args.no_repeat_memory, seed=args.seed, od=args.od,
         )
@@ -163,6 +166,13 @@ def main() -> None:
                 from osu_mapper.hybrid.metrics import per_ms_report
                 r = per_ms_report(notes, ref_map.notes)
                 print(f"  reference |{density_graph(ref_map.notes, duration_ms)}|")
+                from osu_mapper.hybrid.patterns import format_ln_quality, ln_quality, ln_similarity
+                qa, qb = ln_quality(notes, timing), ln_quality(ref_map.notes, ref_map.timing_points)
+                print(f"    long notes:  {format_ln_quality(qa)}")
+                print(f"    reference:   {format_ln_quality(qb)}")
+                sim = ln_similarity(qa, qb)
+                if sim:
+                    print("    LN similarity (1 = same distribution): " + ", ".join(f"{k} {v:.2f}" for k, v in sim.items()))
                 print(f"    vs reference: density graph correlation {density_correlation(notes, ref_map.notes, duration_ms):.2f} | "
                       f"event F1 @16ms {r['event_f1@16']:.3f} | density x{r['density_ratio']:.2f}")
             m = ManiaMap(notes=notes, timing_points=timing, overall_difficulty=args.od, hp_drain=args.hp,
