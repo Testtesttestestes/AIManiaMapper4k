@@ -25,7 +25,7 @@ SETTINGS = Path.home() / ".aimaniamapper" / "composer_console.json"
 AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus")
 
 LN_CHOICES: List[Tuple[str, str, List[str]]] = [
-    ("Как обычно на этой сложности", "самый частый вариант в настоящих картах той же сложности", []),
+    ("Как обычно", "как в настоящих картах той же сложности (или как у карты-стиля)", []),
     ("Без лонгнот", "только тапы", ["--no_ln"]),
     ("Почти без лонгнот", "~2% — редкие удержания на длинных звуках", ["--ln_style", "rice"]),
     ("Немного", "~10%", ["--ln_style", "light"]),
@@ -263,7 +263,30 @@ def run_dialog() -> Optional[List[str]]:
             return int(last[key])
         return ask_choice(question, [(o[0], o[1]) for o in options], default)
 
-    title("3. Лонгноты")
+    title("3. Стиль")
+    style_argv: List[str] = []
+    opts = [("Обычный", "как в среднем по всем картам этой сложности"),
+            ("Как у карты из этого архива", "джеки, аккорды, лонгноты — как у маппера этого .osz (ноты не копируются)"),
+            ("Как у другой карты…", "указать другой .osz")]
+    if template is None or not info.get("diffs"):
+        opts = [opts[0], opts[2]]
+    st = ask_choice("Чей стиль повторять?", opts, 1)
+    chosen = opts[st - 1][0]
+    if chosen.startswith("Как у карты из этого"):
+        style_argv = ["--style_from", str(template)]
+    elif chosen.startswith("Как у другой"):
+        while True:
+            sp = Path(clean_path(ask("Файл .osz со стилем", str(last.get("style_file", "")) or None)))
+            if sp.is_file():
+                break
+            print(color(f"  Файл не найден: {sp}", "31"))
+        last["style_file"] = str(sp)
+        style_argv = ["--style_from", str(sp)]
+    argv += style_argv
+
+    title("4. Лонгноты")
+    if style_argv:
+        print(color("  Стиль задан картой: «как обычно» = столько лонгнот, сколько у неё на этой сложности.", "2"))
     ln = pick("ln", "Сколько лонгнот?", LN_CHOICES, 1)
     ln_argv = list(LN_CHOICES[ln - 1][2])
     if ln_argv == ["custom"]:
@@ -282,7 +305,7 @@ def run_dialog() -> Optional[List[str]]:
         print(f"  {LN_CHOICES[ln - 1][0]} (как в прошлый раз)")
     argv += ln_argv
 
-    title("4. Характер карты")
+    title("5. Характер карты")
     style = pick("style", "Насколько смело?", STYLE_CHOICES, 2)
     contrast = pick("contrast", "Перепады плотности между частями песни?", CONTRAST_CHOICES, 2)
     quality = pick("quality", "Сколько вариантов перебрать?", QUALITY_CHOICES, 2)
@@ -292,7 +315,7 @@ def run_dialog() -> Optional[List[str]]:
     argv += ["--creativity", STYLE_CHOICES[style - 1][2], "--contrast", CONTRAST_CHOICES[contrast - 1][2],
              "--variants", QUALITY_CHOICES[quality - 1][2]]
 
-    title("5. Дополнительно")
+    title("6. Дополнительно")
     if net:
         use_net = last.get("net", True) if use_last else ask_yes("Использовать нейросеть (подсказывает, где ноты и лонгноты)?", True)
         if not use_net:
@@ -317,6 +340,7 @@ def run_dialog() -> Optional[List[str]]:
     title("Итог")
     print(f"  Песня:      {info.get('title') or song_argv[-1]}")
     print(f"  Сложности:  {', '.join(f'{s:g}*' for s in stars)}")
+    print(f"  Стиль:      {chosen}" + (f" ({Path(style_argv[1]).name})" if style_argv else ""))
     print(f"  Лонгноты:   {LN_CHOICES[ln - 1][0]}" + (f" ({last['ln_percent']:g}%)" if LN_CHOICES[ln - 1][2] == ['custom'] else ""))
     print(f"  Характер:   {STYLE_CHOICES[style - 1][0]}, перепады: {CONTRAST_CHOICES[contrast - 1][0].lower()}, "
           f"вариантов: {QUALITY_CHOICES[quality - 1][2]}")
