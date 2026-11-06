@@ -46,6 +46,12 @@ POP = np.array([bin(m).count("1") for m in range(16)])
 DEFAULT_HAND_RUN_CONTINUE = np.array([0.22, 0.13, 0.24, 0.27])
 HAND_RUN_MS = 200.0
 HAND_RUN_BINS = 12
+# two-sided lane context: the chords before AND after. Measured on the 15 maps of 6 songs the v2 network never saw
+# (lane statistics from 48 other maps, chord size known): 2 chords before -> the human chord is the top guess for
+# 0.51 of chords, 1 before + 1 after 0.61, 2 before + 1 after 0.64; 3-8 chords before only 0.52; the network from audio
+# alone 0.31, random 0.23. Mappers place lanes knowing where the pattern goes next.
+BI_GAP_EDGES_MS = np.array([90, 150, 250], dtype=np.float64)
+N_BI_GAP = BI_GAP_EDGES_MS.size + 1
 MIN_BIN_MAPS = 10        # a star-rating bin with fewer maps is mixed with its nearest well-filled neighbour
 FAST_REPEAT_MS = 160.0   # "fast jack" limit: a gap-bin edge, so model statistics and measured maps use the same cut
 STAGGER_MS = 30          # chord-to-chord gaps below this are one chord with offset notes (or a grace note), not rhythm
@@ -137,6 +143,8 @@ class PatternModel:
     ln_style_maps: Optional[np.ndarray] = None  # [SR, STYLE] maps of each LN style
     ln_span_style: Optional[np.ndarray] = None  # [SR, STYLE, LN_SPAN_BINS] chords during a hold
     hand_runs: Optional[np.ndarray] = None   # [SR, HAND_RUN_BINS] one-hand runs of fast chords by length
+    lane_bi: Optional[np.ndarray] = None     # [SR, GAP_IN, GAP_OUT, prev, next, mask] two-sided lane context
+    lane_bi2: Optional[np.ndarray] = None    # [SR, prev2, prev, next, mask]
     ln_release: Optional[np.ndarray] = None  # [SR, STYLE, 3] LN releases: on another chord's start / on a free tick / off grid  # [SR, 3] least squares of log section density vs log audio intensity: sum xy, sum xx, n
     version: str = PATTERN_VERSION
 
@@ -177,6 +185,14 @@ class PatternModel:
             prev = np.concatenate([[0], mk[:-1]])
             prev2 = np.concatenate([[0, 0], mk[:-2]])
             np.add.at(self.lane, (s, gb, prev, prev2, mk), 0.5)
+            if self.lane_bi is None:
+                self.lane_bi = np.zeros((SR_BINS, N_BI_GAP, N_BI_GAP, 16, 16, 16), np.float32)
+                self.lane_bi2 = np.zeros((SR_BINS, 16, 16, 16, 16), np.float32)
+            nxt = np.concatenate([mk[1:], [0]])
+            bi_in = np.searchsorted(BI_GAP_EDGES_MS, gaps, side="right")
+            bi_out = np.searchsorted(BI_GAP_EDGES_MS, gnext, side="right")
+            np.add.at(self.lane_bi, (s, bi_in, bi_out, prev, nxt, mk), 0.5)
+            np.add.at(self.lane_bi2, (s, prev2, prev, nxt, mk), 0.5)
         sizes = np.clip(POP[masks] - 1, 0, 3)
         np.add.at(self.chord, (s, np.array([metric_bin(c) for c in cls]), gb, sizes), 1.0)
         np.add.at(self.rhythm_hits, (s, cls), 1.0)
@@ -446,6 +462,32 @@ class PatternModel:
         with np.errstate(divide="ignore"):
             return np.where(valid, np.log(np.maximum(out / max(1e-12, out.sum()), 1e-9)), -np.inf)
 
+    @property
+    def has_two_sided(self) -> bool:
+        return self.lane_bi is not None and float(self.lane_bi.sum()) > 0
+
+    def lane_logprob_bi(self, sr: float, prev2: int, prev: int, nxt: int, gap_in_ms: float, gap_out_ms: float, size: int,
+                        alpha: float = 4.0) -> np.ndarray:
+        """log P(mask | 2 chords before, 1 chord after, both gaps) over the 16 masks with ``size`` lanes (-inf elsewhere):
+        the forward statistics (lane_logprob) refined by the two-sided counts, each level smoothed towards the one
+        before it (a context seen a few times moves the estimate a little, one seen often decides it)."""
+        if not self.has_two_sided:
+            return self.lane_logprob(sr, gap_in_ms, prev, prev2, size)
+        valid = POP == size
+        base = np.exp(self.lane_logprob(sr, gap_in_ms, prev, prev2, size))
+        gi = int(np.searchsorted(BI_GAP_EDGES_MS, gap_in_ms, side="right"))
+        go = int(np.searchsorted(BI_GAP_EDGES_MS, gap_out_ms, side="right"))
+        out = np.zeros(16)
+        for b, wt in self._sr_weights(sr):
+            p = base.copy()
+            for c in (self.lane_bi[b, gi, go, prev & 15, nxt & 15], self.lane_bi2[b, prev2 & 15, prev & 15, nxt & 15]):
+                c = c.astype(np.float64) * valid
+                p = (c + alpha * p) / (c.sum() + alpha)
+            out += wt * p
+        out = out * valid
+        with np.errstate(divide="ignore"):
+            return np.where(valid, np.log(np.maximum(out / max(1e-12, out.sum()), 1e-9)), -np.inf)
+
     def hand_run_continue(self, sr: float, from_length: int = 3) -> np.ndarray:
         """[HAND_RUN_BINS] P(the next fast chord stays on the same hand | run length k), k = 0..; from the data when the
         pattern model has counted runs, else DEFAULT_HAND_RUN_CONTINUE. Lengths >= 4 are pooled (few long runs)."""
@@ -702,7 +744,7 @@ class PatternModel:
         return "\n".join(rows)
 
 
-OPTIONAL_ARRAYS = ("hand_runs", "repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
+OPTIONAL_ARRAYS = ("hand_runs", "lane_bi", "lane_bi2", "repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
                    "ln_ctx", "ln_members", "ln_len", "ln_style_maps", "ln_span_style", "ln_release")
 
 

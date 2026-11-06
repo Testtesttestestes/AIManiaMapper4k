@@ -427,3 +427,69 @@ class TestNetworkFit(unittest.TestCase):
         self.assertAlmostEqual(float((sz >= 3).mean()), 0.07, delta=0.01)
         self.assertAlmostEqual(float((sz >= 4).mean()), 0.01, delta=0.005)
         self.assertTrue(np.all(sz[sz >= 3] >= 3) and np.all((u[:, 0] < 0.3)[sz >= 3]))  # triples only among 2+ chords
+
+
+class TestCompareModels(unittest.TestCase):
+    def test_quality_identical_map(self):
+        import compare_models as cm
+        reds = [RawTimingPoint(0.0, 400.0)]
+        notes = [Note(200 * i, i % 4, 200 * i + (300 if i % 5 == 0 else 0), i % 5 == 0) for i in range(1, 200)]
+        q = cm.quality(notes, notes, reds, 45000)
+        self.assertAlmostEqual(q["f1_16"], 1.0)
+        self.assertAlmostEqual(q["density_corr"], 1.0, places=6)
+        self.assertEqual(q["jacks"], q["jacks_human"])
+        self.assertAlmostEqual(q["chords_l1"], 0.0)
+        q.update(sr_ok=1.0, sr_err=0.0)
+        s = cm.summarize([q])
+        self.assertAlmostEqual(s["pattern entropy (|vs human|)"], 0.0)
+        self.assertAlmostEqual(s["LN shape similarity"], 1.0, places=6)
+
+
+class TestTwoSidedLanes(unittest.TestCase):
+    def _model(self):
+        from osu_mapper.hybrid.patterns import PatternModel
+        pm = PatternModel.empty()
+        reds = [RawTimingPoint(0.0, 400.0)]
+        # a staircase 0-1-2-3-2-1-0... at 100 ms: next lane is always a neighbour
+        stairs = [0, 1, 2, 3, 2, 1]
+        for rep_ in range(6):
+            notes = [Note(1000 + 100 * i, stairs[i % 6], 1000 + 100 * i, False) for i in range(300)]
+            pm.add_map(notes, reds, 4.5)
+        return pm, reds
+
+    def test_counts_and_prior(self):
+        pm, _ = self._model()
+        self.assertTrue(pm.has_two_sided)
+        # between lane 1 (before) and lane 3 (after) the staircase has lane 2
+        lp = pm.lane_logprob_bi(4.5, 0b0001, 0b0010, 0b1000, 100, 100, 1)
+        self.assertEqual(int(np.argmax(lp)), 0b0100)
+
+    def test_rechoice_keeps_rhythm_and_fixes_pattern(self):
+        from osu_mapper.hybrid.lanes import two_sided_lanes
+        pm, reds = self._model()
+        stairs = [0, 1, 2, 3, 2, 1]
+        notes = [Note(1000 + 100 * i, stairs[i % 6], 1000 + 100 * i, False) for i in range(120)]
+        broken = [Note(n.start, (n.col + 2) % 4 if i % 7 == 3 else n.col, n.end, n.ln) for i, n in enumerate(notes)]
+        fixed = two_sided_lanes(broken, pm, 4.5, None, temperature=0.0)
+        self.assertEqual(sorted(n.start for n in fixed), sorted(n.start for n in notes))
+        # the data only has steps to a neighbour lane: the broken jumps are repaired (a mirrored staircase or a trill
+        # are as good as the original, so lanes are not compared one by one)
+        def jumps(ns):
+            ns = sorted(ns)
+            return sum(abs(x.col - y.col) != 1 for x, y in zip(ns[:-1], ns[1:]))
+        self.assertGreater(jumps(broken), 5)
+        self.assertEqual(jumps(fixed), 0)
+
+    def test_no_note_inside_a_held_long_note(self):
+        from osu_mapper.hybrid.lanes import two_sided_lanes
+        pm, reds = self._model()
+        notes = [Note(1000, 0, 1900, True)] + [Note(1100 + 100 * i, 1 + i % 3, 1100 + 100 * i, False) for i in range(20)]
+        out = two_sided_lanes(notes, pm, 4.5, None, temperature=1.0, seed=3)
+        self.assertFalse(any(n.col == 0 and 1000 < n.start <= 1900 for n in out))
+        self.assertEqual(len(out), len(notes))
+
+    def test_old_model_without_two_sided_is_untouched(self):
+        from osu_mapper.hybrid.lanes import two_sided_lanes
+        from osu_mapper.hybrid.patterns import PatternModel
+        notes = [Note(100 * i, i % 4, 100 * i, False) for i in range(1, 30)]
+        self.assertEqual(two_sided_lanes(notes, PatternModel.empty(), 3.0), notes)

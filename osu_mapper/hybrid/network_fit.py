@@ -149,6 +149,9 @@ def fit_network_map(
     repeats=None,
     ladder_mix: float = 0.5,
     hedge_fallback: Sequence[tuple] = ((60, 1.2), (60, 1.0), (40, 1.0)),
+    two_sided=None,
+    two_sided_temperature: float = 1.0,
+    two_sided_net_weight: float = 0.0,
 ) -> NetworkFit:
     """The network's map at the requested star rating (see module docstring). ``jack_target``: share of fast jacks
     (< 160 ms) to aim for, normally ``PatternModel.fast_repeat_share(target_sr)``; None keeps the network's lanes.
@@ -156,11 +159,16 @@ def fit_network_map(
     ``hedge_fallback``: (hedge_ms, hedge_sum) steps tried, in order, only when the rating is not reached at the lowest
     threshold. The hedge merges two close, weak events into one note; at the lowest threshold it also merges real
     neighbours (15 unseen maps: rating reached on 11 -> 15, mean error 0.24 -> 0.03; on the 4 maps it changed, notes
-    match the human map -0.02 on average (all 15: 0.703 -> 0.698), notes <= 30 ms from another up to 2.2 %). The other maps are not touched."""
+    match the human map -0.02 on average (all 15: 0.703 -> 0.698), notes <= 30 ms from another up to 2.2 %). The other maps are not touched.
+
+    ``two_sided``: a PatternModel with two-sided lane statistics - after the threshold fit the lanes of every chord are
+    re-chosen knowing the chords before and after (lanes.two_sided_lanes, sampled at ``two_sided_temperature``), then
+    the threshold is corrected for the new lanes; the fast-jack calibration is not needed then (the sampled lanes
+    follow the jack share of real maps by themselves)."""
     lag = network_lag(out, timing_points) if fix_lag else 0
     out = with_ladder(out, target_sr, ladder_mix)
     fit = _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
-               jack_target, log, lane_prior, hand_run_continue, repeats)
+               jack_target, log, lane_prior, hand_run_continue, repeats, two_sided, two_sided_temperature, two_sided_net_weight)
     for hm, hs in hedge_fallback:
         if fit.reached or fit.star_rating > target_sr or not knobs.hedge_ms:
             break
@@ -168,7 +176,8 @@ def fit_network_map(
         if (k2.hedge_ms, k2.hedge_sum) == (knobs.hedge_ms, knobs.hedge_sum):
             continue
         f2 = _fit(out, k2, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
-                  jack_target, None, lane_prior, hand_run_continue, repeats)
+                  jack_target, None, lane_prior, hand_run_continue, repeats, two_sided, two_sided_temperature,
+                  two_sided_net_weight)
         if abs(f2.star_rating - target_sr) < abs(fit.star_rating - target_sr):
             if log:
                 log(f"    rating {fit.star_rating:.2f} not reachable at the lowest threshold: close weak events kept apart "
@@ -178,7 +187,7 @@ def fit_network_map(
 
 
 def _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold, tolerance, iterations, lag,
-         jack_target, log, lane_prior, hand_run_continue, repeats) -> NetworkFit:
+         jack_target, log, lane_prior, hand_run_continue, repeats, two_sided=None, two_temp=1.0, two_w=0.0) -> NetworkFit:
     from .ergonomics import improve_ergonomics
     base = dataclasses.replace(knobs, onset_shift_ms=int(knobs.onset_shift_ms) - lag)
     if hand_run_continue is not None:
@@ -188,8 +197,12 @@ def _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold,
     from .renderer import release_gap_fn
     gap_fn = release_gap_fn(timing_points, base.ln_release_gap_ms, base.ln_release_gap_beats)
 
-    def decode(th: float, st: float) -> List[Note]:
+    def decode(th: float, st: float, two: bool = False) -> List[Note]:
         notes = _decode(th, st)
+        if two:
+            from .lanes import two_sided_lanes
+            notes = two_sided_lanes(notes, two_sided, target_sr, out, int(base.onset_shift_ms), net_weight=two_w,
+                                    gap_fn=gap_fn, temperature=two_temp, seed=0)
         return apply_repeats(notes, repeats, gap_fn=gap_fn) if repeats else notes
 
     def _decode(th: float, st: float) -> List[Note]:
@@ -254,6 +267,16 @@ def _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold,
     # fitted threshold and, if they moved, the threshold is fitted again
     th0 = float(np.clip(knobs.onset_threshold, min_threshold, max_threshold))
     first = fast_jack_share(decode(th0, 0.0))
+    use_two = two_sided is not None and getattr(two_sided, "has_two_sided", False)
+    if use_two:
+        strength = 1.0 if lane_prior is not None else 0.0   # left-to-right lanes are only the starting point
+        th, sr, notes = fit_threshold()
+        th, sr, notes = _two_sided_threshold(lambda x: decode(x, strength, True), th, target_sr, timing_points, od,
+                                             min_threshold, max_threshold, tolerance)
+        if log:
+            log(f"    lanes chosen from both sides (chords before and after): fast jacks {100 * fast_jack_share(notes):.0f}%"
+                + (f" (real maps {100 * jack_target:.0f}%)" if jack_target is not None else ""))
+        return NetworkFit(notes, sr, th, lag, abs(sr - target_sr) <= tolerance, strength, fast_jack_share(notes), jack_target)
     strength = calibrate_lanes(th0, 0.0)
     th, sr, notes = fit_threshold()
     again = calibrate_lanes(th, strength)
@@ -264,3 +287,32 @@ def _fit(out, knobs, timing_points, target_sr, od, min_threshold, max_threshold,
         log(f"    lanes: fast jacks {100 * first:.0f}% -> {100 * fast_jack_share(notes):.0f}% (real maps {100 * jack_target:.0f}%), "
             f"re-assignment strength {strength:.2f}")
     return NetworkFit(notes, sr, th, lag, abs(sr - target_sr) <= tolerance, strength, fast_jack_share(notes), jack_target)
+
+
+def _two_sided_threshold(decode_two, th, target_sr, timing_points, od, min_threshold, max_threshold, tolerance,
+                         window: float = 0.15, iterations: int = 6):
+    """Lanes re-chosen from both sides change the rating a little (jacks): the threshold found with the left-to-right
+    lanes is corrected by a short bisection around it."""
+    cache = {}
+
+    def run(x):
+        x = round(float(np.clip(x, min_threshold, max_threshold)), 4)
+        if x not in cache:
+            n = decode_two(x)
+            cache[x] = (star_rating(n, timing_points, od), n)
+        return cache[x]
+
+    sr, _ = run(th)
+    if abs(sr - target_sr) > tolerance:
+        lo, hi = (th, th + window) if sr > target_sr else (th - window, th)
+        for _ in range(iterations):
+            mid = 0.5 * (lo + hi)
+            s_, _ = run(mid)
+            if abs(s_ - target_sr) <= tolerance:
+                break
+            if s_ > target_sr:
+                lo = mid
+            else:
+                hi = mid
+    x, (sr, notes) = min(cache.items(), key=lambda kv: abs(kv[1][0] - target_sr))
+    return x, sr, notes

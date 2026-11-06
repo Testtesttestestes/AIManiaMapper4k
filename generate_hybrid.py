@@ -177,6 +177,11 @@ def main(argv=None) -> None:
     ap.add_argument("--repeat_memory", default="on", choices=["on", "off"],
                     help="with --fit_sr: a phrase that repeats earlier music gets the original's rhythm and chord sizes, lanes "
                          "alternating as in the original / mirrored (as mappers do; the network alone does not keep repeats)")
+    ap.add_argument("--two_sided_lanes", default="on", choices=["on", "off"],
+                    help="with --fit_sr: after the notes are placed, every chord's lanes are re-chosen knowing the chords before "
+                         "AND after (pattern model of real maps; needs patterns.npz from this version of learn_patterns.py)")
+    ap.add_argument("--two_sided_temperature", type=float, default=1.0,
+                    help="two-sided lanes: 1 = as varied as real maps (measured), lower = more typical / repetitive patterns")
     ap.add_argument("--min_threshold", type=float, default=0.15, help="with --fit_sr: lowest event threshold (below it the network hears no note)")
     ap.add_argument("--refine_steps", type=int, default=4,
                     help="with --fit_sr and a model trained with the map canvas (--canvas_prob): passes of masked diffusion - "
@@ -245,6 +250,9 @@ def main(argv=None) -> None:
             pattern_model = load_default(args.patterns)
             if pattern_model is None:
                 print("[fit] no pattern model: the network's lanes are kept (no jack correction), only the threshold is fitted")
+            elif args.two_sided_lanes == "on" and not pattern_model.has_two_sided:
+                print("[fit] the pattern model has no two-sided lane statistics (made by an older learn_patterns.py): lanes "
+                      "are chosen left to right; re-run learn_patterns.py for --two_sided_lanes")
         if args.disable_reps:
             print(f"[model] representations: {', '.join(r + (' (OFF)' if r in args.disable_reps else '') for r in predictor.model.rep_names)}")
         fcfg = predictor.feature_cfg
@@ -339,7 +347,9 @@ def main(argv=None) -> None:
                     hr = pattern_model.hand_run_continue(target) if pattern_model is not None else None
                     k_th = dataclasses.replace(knobs, onset_threshold=th)
                     fit_kw = dict(min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp, hand_run_continue=hr,
-                                  repeats=song_repeats, ladder_mix=args.ladder_mix)
+                                  repeats=song_repeats, ladder_mix=args.ladder_mix,
+                                  two_sided=pattern_model if args.two_sided_lanes == "on" else None,
+                                  two_sided_temperature=args.two_sided_temperature)
                     if args.refine_steps > 1 and getattr(predictor.model.cfg, "canvas", False):
                         # masked diffusion: later passes see the most confident notes of the earlier ones on both sides
                         from osu_mapper.hybrid.canvas import refine
@@ -363,8 +373,7 @@ def main(argv=None) -> None:
                             out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
                                                      sr_guidance=g2, style_guidance=args.style_guidance)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
-                                                   min_threshold=args.min_threshold, jack_target=jt, lane_prior=lp,
-                                                   hand_run_continue=hr, repeats=song_repeats, ladder_mix=args.ladder_mix)
+                                                   **fit_kw)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):
                                 print(f"    SR guidance {g2:g}: {fit.star_rating:.2f}* -> {fit2.star_rating:.2f}*")
                                 fit, out = fit2, out2
