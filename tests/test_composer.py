@@ -427,3 +427,19 @@ class TestNetworkFit(unittest.TestCase):
         self.assertAlmostEqual(float((sz >= 3).mean()), 0.07, delta=0.01)
         self.assertAlmostEqual(float((sz >= 4).mean()), 0.01, delta=0.005)
         self.assertTrue(np.all(sz[sz >= 3] >= 3) and np.all((u[:, 0] < 0.3)[sz >= 3]))  # triples only among 2+ chords
+
+
+class TestCompareModels(unittest.TestCase):
+    def test_quality_identical_map(self):
+        import compare_models as cm
+        reds = [RawTimingPoint(0.0, 400.0)]
+        notes = [Note(200 * i, i % 4, 200 * i + (300 if i % 5 == 0 else 0), i % 5 == 0) for i in range(1, 200)]
+        q = cm.quality(notes, notes, reds, 45000)
+        self.assertAlmostEqual(q["f1_16"], 1.0)
+        self.assertAlmostEqual(q["density_corr"], 1.0, places=6)
+        self.assertEqual(q["jacks"], q["jacks_human"])
+        self.assertAlmostEqual(q["chords_l1"], 0.0)
+        q.update(sr_ok=1.0, sr_err=0.0)
+        s = cm.summarize([q])
+        self.assertAlmostEqual(s["pattern entropy (|vs human|)"], 0.0)
+        self.assertAlmostEqual(s["LN shape similarity"], 1.0, places=6)
