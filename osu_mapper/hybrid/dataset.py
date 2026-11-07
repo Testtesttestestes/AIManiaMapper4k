@@ -144,6 +144,7 @@ class SparseTrack:
         self.stagger = track.stagger[ev].astype(np.int8)
         self.ln_flag = track.ln_flag[ev].astype(bool)
         self.ln_len = track.ln_len[ev].astype(np.int32)
+        self.pat: Optional[Dict[str, np.ndarray]] = None   # per-event pattern targets (motif_targets.py)
 
     def event_frames(self) -> np.ndarray:
         return self.frames
@@ -166,6 +167,20 @@ class SparseTrack:
             out["stagger"][rows] = self.stagger[i0:i1]
             out["ln_flag"][rows] = self.ln_flag[i0:i1]
             out["ln_len"][rows] = self.ln_len[i0:i1]
+        if self.pat is not None:
+            from .motif_targets import PATTERN_HEADS
+            for k in PATTERN_HEADS:
+                a = np.full(length, -1, dtype=np.int64)
+                if i1 > i0:
+                    a[rows] = self.pat[k][i0:i1]
+                out["pat_" + k] = a
+            prior = np.zeros((length, 16), dtype=np.float32)
+            prev = np.zeros((length, 2), dtype=np.int64)
+            if i1 > i0:
+                prior[rows] = self.pat["prior"][i0:i1]
+                prev[rows] = self.pat["prev"][i0:i1]
+            out["pat_prior"] = prior
+            out["pat_prev"] = prev
         return out
 
 
@@ -194,6 +209,9 @@ class HybridCropDataset(Dataset):
         pitch_shift_prob: float = 0.0,
         ladder_k: int = 0,
         canvas_prob: float = 0.0,
+        pattern_targets: bool = False,
+        motifs=None,
+        log=print,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -209,6 +227,16 @@ class HybridCropDataset(Dataset):
         self.epoch = 0
         self.tracks = [SparseTrack(index.track(i)) for i in self.map_indices]
         self.entries = [index.maps[i] for i in self.map_indices]
+        if pattern_targets:
+            # pattern knowledge: structure targets of every map (whole map, cached) + the motif library's prior
+            import time as _time
+            from .motif_targets import targets_for_track
+            t0 = _time.time()
+            for n_done, (tr, e) in enumerate(zip(self.tracks, self.entries), 1):
+                cache = index.root / "motif_targets" / (Path(str(e["track"])).stem + ".npz")
+                tr.pat = targets_for_track(tr, float(e.get("sr", 0.0)), motifs, cache)
+                if n_done % 200 == 0:
+                    log(f"  [patterns] targets of {n_done}/{len(self.tracks)} maps ({_time.time() - t0:.0f}s)")
         self.spans: List[Tuple[int, int]] = []
         for tr in self.tracks:
             ev = tr.event_frames()
