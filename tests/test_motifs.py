@@ -149,8 +149,7 @@ class ZoneTests(unittest.TestCase):
         self.assertEqual(break_periods(text), [(12020, 20820)])
         m = ManiaMap(notes=notes_from([0, 1, 2, 3] * 4) + notes_from([0, 1, 2, 3] * 4, start=30000), timing_points=TP)
         spans, end = rest_spans([Diff("x", text, m, 3.0, [], break_periods(text))])
-        self.assertIn((12020, 20820), spans)
-        self.assertTrue(any(a < 15000 < b for a, b in spans))  # the silent gap between the two parts
+        self.assertTrue(any(a < 15000 < b for a, b in spans))  # the silent gap between the two parts (no difficulty fills it)
         self.assertGreater(end, 30000)
 
 

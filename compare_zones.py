@@ -52,6 +52,8 @@ class Diff:
     sr: float
     lines: List[Tuple[int, str]] = field(default_factory=list)   # (time, raw hit-object line)
     breaks: List[Tuple[int, int]] = field(default_factory=list)  # [Events] break periods "2,start,end"
+    audio: str = ""
+    order: int = 0                                                # position of the file in the archive listing (sorted)
 
 
 def _sr(text: str, m: ManiaMap) -> float:
@@ -111,7 +113,9 @@ def read_diffs(path: Path) -> List[Diff]:
         m = parse_osu_mania(text)
         if m is None or len(m.notes) < 20:
             continue
-        out.append(Diff(m.metadata.get("Version", name), text, m, _sr(text, m), hit_lines(text), break_periods(text)))
+        audio = re.search(r"^AudioFilename:\s*(.*?)\s*$", text, flags=re.M)
+        out.append(Diff(m.metadata.get("Version", name), text, m, _sr(text, m), hit_lines(text), break_periods(text),
+                        audio.group(1).lower() if audio else "", order=sorted(n for n, _ in texts).index(name)))
     return sorted(out, key=lambda d: d.sr)
 
 
@@ -168,9 +172,10 @@ def bar_zones(m: ManiaMap, duration_ms: int, bars: int = 8):
 # ------------------------------------------------------------------------------------------------------------
 
 def rest_spans(hum: List[Diff], min_gap_ms: int = 3000) -> Tuple[List[Tuple[int, int]], int]:
-    """Where the human maps rest: their break periods plus every gap of >= min_gap_ms that NO human difficulty fills
-    (silence / intro / outro), and the end of the mapped song (last human note of any difficulty)."""
-    spans = [b for d in hum for b in d.breaks]
+    """Where all human maps rest: every gap of >= min_gap_ms that NO human difficulty fills (silence / intro / outro),
+    and the end of the mapped song (last human note of any difficulty). Break periods of one difficulty are added
+    per pair (``spans + human.breaks``)."""
+    spans = []
     times = np.unique(np.concatenate([[n.start for n in d.m.notes] + [n.end for n in d.m.notes] for d in hum]))
     g = np.diff(times)
     for i in np.flatnonzero(g >= min_gap_ms):
@@ -334,8 +339,16 @@ class ZoneRow:
     score: float
 
 
-def compare_song(original: Path, generated: Path, lib: Optional[MotifLibrary], use_audio: bool = True, log=print) -> List[ZoneRow]:
+def compare_song(original: Path, generated: Path, lib: Optional[MotifLibrary], use_audio: bool = True, log=print,
+                 max_sr_gap: float = 0.15) -> List[ZoneRow]:
     hum, gen = read_diffs(original), read_diffs(generated)
+    if hum:
+        # the composer maps the audio of the template's first .osu: rate edits (other audio files) are not comparable
+        audio = min(hum, key=lambda d: d.order).audio
+        other = [d.name for d in hum if d.audio != audio]
+        if other:
+            log(f"  [zones] skipped {len(other)} difficulties with another audio file (rate edits?): {', '.join(other)}")
+        hum = [d for d in hum if d.audio == audio]
     if not hum or not gen:
         log(f"  [skip] {original.name}: no 4K maps on one side")
         return []
@@ -360,12 +373,15 @@ def compare_song(original: Path, generated: Path, lib: Optional[MotifLibrary], u
 
     for g in gen:
         h = min(hum, key=lambda x: abs(x.sr - g.sr))
+        if abs(h.sr - g.sr) > max_sr_gap:
+            continue
         rests, song_end = rest_spans(hum)
         hc, ht, hh, hcp = prepare(h)
         gc, gt, gh, gcp = prepare(g)
         for a, b, label in zones:
-            hs = zone_stats(h.m, hc, ht, hh, hcp, a, b, rests, song_end)
-            gs = zone_stats(g.m, gc, gt, gh, gcp, a, b, rests, song_end)
+            rs = sorted(rests + h.breaks)
+            hs = zone_stats(h.m, hc, ht, hh, hcp, a, b, rs, song_end)
+            gs = zone_stats(g.m, gc, gt, gh, gcp, a, b, rs, song_end)
             if hs.n < 4 and gs.n < 4:
                 continue
             d = compare(hs, gs)
