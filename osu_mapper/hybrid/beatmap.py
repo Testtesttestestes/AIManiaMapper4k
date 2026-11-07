@@ -180,6 +180,29 @@ def parse_hit_object(line: str, keys: int = NUM_LANES) -> Optional[Note]:
     return Note(start=start, col=col, end=start, ln=False)
 
 
+BREAK_MIN_GAP_MS = 3500     # pauses this long get a break period (measured on 159 human maps: covered gaps >= 3.5 s,
+BREAK_LEAD_MS = 200         # uncovered ones 2-3.8 s); the break starts 200 ms after the last object ends and ends
+BREAK_TAIL_MS = 1200        # 1200 ms before the next note (both the median of the human maps, = the osu! editor rule)
+BREAK_MIN_LEN_MS = 650      # osu! ignores shorter breaks
+
+
+def break_periods_for(objects: Sequence[Tuple[int, int]], min_gap_ms: int = BREAK_MIN_GAP_MS) -> List[Tuple[int, int]]:
+    """Break periods ([Events] ``2,start,end``) for the pauses of a map, from (start, end) of its objects: during a
+    break the game shows the rest indicator and stops draining health."""
+    ev = sorted((int(a), int(max(a, b))) for a, b in objects)
+    out: List[Tuple[int, int]] = []
+    if not ev:
+        return out
+    last = ev[0][1]
+    for a, b in ev[1:]:
+        if a - last >= min_gap_ms:
+            s, e = last + BREAK_LEAD_MS, a - BREAK_TAIL_MS
+            if e - s >= BREAK_MIN_LEN_MS:
+                out.append((s, e))
+        last = max(last, b)
+    return out
+
+
 def parse_osu_mania(text: str, keys: int = NUM_LANES) -> Optional[ManiaMap]:
     """Parses .osu text. Returns None unless the map is osu!mania (Mode 3) with ``keys`` keys."""
     sections = _split_sections(text)
@@ -284,9 +307,9 @@ def map_to_osu_text(m: ManiaMap) -> str:
         "[Events]",
         "//Background and Video events",
         "//Break Periods",
-        "",
-        "[TimingPoints]",
     ]
+    lines += [f"2,{a},{b}" for a, b in break_periods_for([(n.start, n.end if n.ln else n.start) for n in m.notes])]
+    lines += ["", "[TimingPoints]"]
     for tp in sorted(m.timing_points, key=lambda t: (t.time, not t.uninherited)):
         lines.append(tp.to_osu_line())
     lines.append("")
