@@ -51,6 +51,7 @@ import numpy as np
 from .beatmap import ManiaMap, Note, RawTimingPoint, map_to_osu_text
 from .params import LANE_TABLE, N_LANE_CODES, NUM_LANES
 
+MIRROR_OF = np.array([((m & 1) << 3) | ((m & 2) << 1) | ((m & 4) >> 1) | ((m & 8) >> 3) for m in range(16)])
 MASKS_BY_SIZE: Dict[int, List[int]] = {k: [m for m in range(1, 16) if bin(m).count("1") == k] for k in range(1, 5)}
 LANES_OF = [[c for c in range(NUM_LANES) if (m >> c) & 1] for m in range(16)]
 POP = np.array([bin(m).count("1") for m in range(16)])
@@ -103,6 +104,11 @@ class ComposerConfig:
     seed: int = 0
     triplet_feel: str = "off"         # "audio": sections the audio calls triplet avoid binary ticks (and vice versa);
                                      # "off": no section-wide feel, the tempo-aware rhythm statistics decide; "binary"
+    phrase_copies: float = 1.0       # x how often real maps re-use the lanes of an earlier passage with the same rhythm
+    copy_window: int = 4             # chords of rhythm that must match to look for a copy ...
+    copy_bonus: float = 10.0         # score of the chord a copy / an audio repeat asks for
+    copy_min: int = 6                # ... and the copy must cover at least this many chords of the same rhythm
+    motif_weight: float = 1.5        # weight of the motif library's lane prediction (motifs.npz, up to 6 chords of context)
     event_cap: float = 1.5           # chords per second at most this x what real maps of this SR and tempo have (then
                                      # the difficulty grows with chords, as in chordjack / jumpstream maps); 0 = no cap
     rhythm_prior: float = 1.0        # weight of "how often real maps of this SR and tempo put a note on a tick of this divisor"
@@ -762,12 +768,25 @@ def _gumbel(rng: np.random.Generator, n: int) -> np.ndarray:
 
 class Composer:
     def __init__(self, an: SongAnalysis, sections: List[Section], cfg: ComposerConfig, hints: Optional[NetHints] = None,
-                 log: Callable[[str], None] = print, patterns=None, target_sr: float = 4.0):
+                 log: Callable[[str], None] = print, patterns=None, target_sr: float = 4.0, motifs=None):
         self.an, self.sections, self.cfg, self.hints, self.log = an, sections, cfg, hints, log
         self.patterns = patterns          # learned PatternModel (patterns.py) or None
         self.chord_boost = 1.0            # > 1 when the density alone cannot reach the requested star rating
         self.repeat_scale = 1.0           # strength of the lane-repeat (jack / anchor) penalties, calibrated to the data
         self.target_sr = float(target_sr)
+        self.lane_motifs = None
+        # how real maps re-use an earlier passage whose rhythm comes back (LZ77 parse of 1606 maps): of the chords whose
+        # rhythm repeats an earlier passage ~15 % copy its lanes exactly, ~15 % mirrored, ~13 % with a few lanes changed
+        self.copy_probs = (0.15, 0.15, 0.13)
+        form = getattr(motifs, "form", None) if motifs is not None else None
+        if form is not None and float(form.chords.sum()) > 0:
+            b = int(np.clip(math.floor(self.target_sr), 0, form.covered.shape[0] - 1))
+            cov = form.covered[max(0, b - 1): b + 2].sum(axis=0)
+            if cov.sum() > 0 and cov.size >= 4:
+                self.copy_probs = tuple(float(x) for x in cov[:3] / cov.sum())
+        if motifs is not None and cfg.motif_weight > 0 and "lanes" in getattr(motifs, "tables", {}):
+            from .motifs import LanePredictor
+            self.lane_motifs = LanePredictor(motifs, self.target_sr)
         self._candidates()
         self._bars()
 
@@ -1315,6 +1334,7 @@ class Composer:
         masks_out = np.zeros(n, dtype=np.int64)
         sec = self.sec_of[ev]
         mask_at: Dict[int, int] = {}  # time -> chord mask of everything placed so far
+        idx_at: Dict[int, int] = {}   # time -> event index
         src_of = self.an.source_time(t_all)  # original moment of repeated phrases (-1 = not a repeat)
         net_ll = self.hints.lane_logits if (self.hints is not None and self.hints.lane_logits is not None) else None
         H = an.frame_ms
@@ -1328,6 +1348,23 @@ class Composer:
                 p_lo[si], p_hi[si] = float(np.percentile(pp, 10)), float(np.percentile(pp, 90))
         ln_quota: Dict[int, float] = {}
         ln_seen: Dict[int, int] = {}
+        # phrase copies: windows of W chords with the same rhythm (gaps in beats) and chord sizes as an earlier window
+        W = max(3, int(cfg.copy_window))
+        copy_on = cfg.phrase_copies > 0 and n > 2 * W
+        if copy_on:
+            from .motifs import beat_positions, rhythm_class
+            bpos, bl_ev, _ = beat_positions(t_all, an.timing_points)
+            rcls = rhythm_class(np.diff(bpos, prepend=bpos[0] - 100.0), bl_ev)
+            key = rcls * 8 + np.asarray(sizes, dtype=np.int64)
+            key[0] = -1
+            win_hash = {}
+            starts_by_hash: Dict[Tuple[int, ...], List[int]] = {}
+            for q in range(n - W + 1):
+                hk = tuple(int(x) for x in key[q + 1:q + W]) + tuple(int(x) for x in sizes[q:q + W])
+                win_hash[q] = hk
+        copy_src, copy_kind, copy_left = -1, "", 0
+        ev_ln: Dict[int, Dict[int, int]] = {}   # event -> {lane: hold length} of the long notes it started
+        p_exact, p_mirror, p_var = (min(0.95, x * cfg.phrase_copies) for x in self.copy_probs)
 
         for i in range(n):
             t = int(t_all[i])
@@ -1360,13 +1397,44 @@ class Composer:
             # memory of the repeated section: same relative position -> same (or mirrored) chord
             remembered = None
             rel = int(src_of[i])
+            remembered_from = -1
             if rel >= 0 and cfg.repeat_memory:
                 for d in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5):
                     if rel + d in mask_at:
                         remembered = mask_at[rel + d]
+                        remembered_from = idx_at.get(rel + d, -1)
                         if s.mirror:
                             remembered = int(sum(1 << (3 - c) for c in LANES_OF[remembered]))
                         break
+            # phrase copies: the rhythm of the next W chords repeats a recent passage -> re-use (or mirror, or vary) its lanes
+            copied = None
+            copy_from = -1
+            if copy_on:
+                if copy_left <= 0 and i in win_hash:
+                    hk = win_hash[i]
+                    srcs = [j for j in starts_by_hash.get(hk, []) if j + W <= i and t_all[i] - t_all[j] <= 64 * float(bl_ev[i])]
+                    best_j, best_L = -1, 0
+                    for j in srcs[-6:]:
+                        L = W
+                        while i + L < n and j + L < i and key[i + L] == key[j + L] and sizes[i + L] == sizes[j + L]:
+                            L += 1
+                        if L > best_L:
+                            best_j, best_L = j, L
+                    if best_L >= max(W, cfg.copy_min) and remembered is None:
+                        u = rng.random()
+                        kind = "exact" if u < p_exact else ("mirror" if u < p_exact + p_mirror else ("variation" if u < p_exact + p_mirror + p_var else ""))
+                        if kind:
+                            copy_src, copy_kind, copy_left = best_j, kind, best_L
+                if i - W + 1 >= 0 and (i - W + 1) in win_hash:
+                    starts_by_hash.setdefault(win_hash[i - W + 1], []).append(i - W + 1)
+                if copy_left > 0:
+                    copy_from = copy_src
+                    src_m = int(masks_out[copy_src])
+                    copied = int(MIRROR_OF[src_m]) if copy_kind == "mirror" else src_m
+                    if copy_kind == "variation" and rng.random() < 0.35:
+                        copied = None
+                    copy_src += 1
+                    copy_left -= 1
             same_sound = bool(i > 0 and float(timbre[i] @ timbre[i - 1]) > 0.93 and abs(pitch[i] - pitch[i - 1]) < 0.5)
             prior = None
             if net_ll is not None:
@@ -1382,6 +1450,12 @@ class Composer:
             noise = _gumbel(rng, len(cands)) * (0.1 + 0.6 * cfg.creativity) * 0.6
             learned = self.patterns.lane_logprob(self.target_sr, dt, prev, prev2, max(1, k)) if self.patterns is not None else None
             fam_w = 0.5 if learned is not None else 1.0
+            motif_lp = None
+            if self.lane_motifs is not None:
+                lp_all = self.lane_motifs.logprob(hist[-6:])
+                sub = lp_all[cands]
+                motif_lp = dict(zip(cands, sub - (np.max(sub) + np.log(np.exp(sub - np.max(sub)).sum()))))
+                fam_w *= 0.5   # the library knows the figures of real maps: the hand-written families matter less
             for ci, m in enumerate(cands):
                 lanes = LANES_OF[m]
                 v = 0.0
@@ -1450,9 +1524,13 @@ class Composer:
                         v += 0.3 * (dp == dc and dp != 0)
                 v = v_before_family + fam_w * (v - v_before_family)
                 if learned is not None:
-                    v += 1.5 * float(learned[m])  # what real maps of this difficulty do after these chords
+                    v += (0.75 if motif_lp is not None else 1.5) * float(learned[m])  # what real maps do after these chords
+                if motif_lp is not None:
+                    v += cfg.motif_weight * float(motif_lp[m])  # how real maps continue the last up to 6 chords
+                if copied is not None and m == copied:
+                    v += cfg.copy_bonus
                 if remembered is not None and m == remembered:
-                    v += 4.0
+                    v += cfg.copy_bonus
                 if prior is not None:
                     v += 0.5 * cfg.net_weight * float(prior[m])
                 v += noise[ci]
@@ -1471,22 +1549,41 @@ class Composer:
                     hold_note[c] = None
             masks_out[i] = m
             mask_at[t] = m
+            idx_at[t] = i
             # long notes
             quota = ln_target[si]
             ln_seen[si] = ln_seen.get(si, 0) + 1
             planned_lanes: set = set()
+            ln_len_over: Dict[int, int] = {}
             if ln_plan is not None and ln_plan[0][i] > 0:
                 lanes_m = list(LANES_OF[m])
                 rng.shuffle(lanes_m)
                 planned_lanes = set(lanes_m[: int(ln_plan[0][i])])
+            ln_src, flip = -1, False
+            if copied is not None and m == copied and copy_from >= 0:
+                ln_src, flip = copy_from, copy_kind == "mirror"
+            elif remembered is not None and m == remembered and remembered_from >= 0:
+                ln_src, flip = remembered_from, bool(s.mirror)
+            if ln_src >= 0 and ln_plan is not None:
+                # a copied passage copies its long notes too: same (or mirrored) lanes, same length in beats
+                src_ln = ev_ln.get(ln_src, {})
+                bl_i = float(an.tick_beat[min(an.tick_beat.size - 1, int(np.searchsorted(an.ticks, t)))]) if an.tick_beat.size else 1.0
+                bl_s = float(an.tick_beat[min(an.tick_beat.size - 1, int(np.searchsorted(an.ticks, t_all[ln_src])))]) if an.tick_beat.size else 1.0
+                planned_lanes = set()
+                for c0, length0 in src_ln.items():
+                    c1 = 3 - c0 if flip else c0
+                    if (m >> c1) & 1:
+                        planned_lanes.add(c1)
+                        ln_len_over[c1] = int(round(length0 * bl_i / max(1.0, bl_s)))
             for c in LANES_OF[m]:
                 make_ln = False
                 if ln_plan is not None:
                     if c in planned_lanes:
-                        length = int(ln_plan[1][i])
+                        length = int(ln_len_over.get(c, ln_plan[1][i]))
                         if span_limit is not None and i + span_limit + 1 < n:
                             length = min(length, int(t_all[i + span_limit + 1] - t) - gap_fn(int(t_all[i + span_limit + 1])))
                         if length >= 40:
+                            ev_ln.setdefault(i, {})[c] = length
                             notes.append(Note(t, c, t + length, True))
                             hold_note[c] = len(notes) - 1
                             busy_until[c] = t + length
@@ -1502,6 +1599,7 @@ class Composer:
                         # hold over at most as many chords as real maps of this SR usually do
                         length = min(length, int(t_all[i + span_limit + 1] - t) - gap_fn(int(t_all[i + span_limit + 1])))
                     if length >= 60:
+                        ev_ln.setdefault(i, {})[c] = length
                         notes.append(Note(t, c, t + length, True))
                         hold_note[c] = len(notes) - 1
                         busy_until[c] = t + length
@@ -1689,6 +1787,16 @@ class Composer:
                 ev = self._copy_repeats(ev)  # speed-ups of the original are repeated too
             ev = self._drop_silent(ev)
         sizes = self.chord_sizes(ev, L, rng)
+        if self.cfg.repeat_memory and self.an.repeats and ev.size:
+            # a repeated phrase repeats its chord sizes too (in time order, so a repeat of a repeat follows the copy)
+            te = self.t[ev]
+            src = self.an.source_time(te)
+            for i in np.flatnonzero(src >= 0):
+                j = int(np.searchsorted(te, src[i]))
+                for jj in (j - 1, j):
+                    if 0 <= jj < i and abs(int(te[jj]) - int(src[i])) <= 6:
+                        sizes[i] = sizes[jj]
+                        break
         if burst.size:
             sizes[np.isin(ev, burst)] = 1   # speed-ups are single-note runs (a stair at double tempo)
             nb = np.isin(ev, burst)
@@ -1764,11 +1872,12 @@ def compose(
     sections: Optional[List[Section]] = None,
     log: Callable[[str], None] = print,
     patterns=None,
+    motifs=None,
 ) -> ComposeResult:
     """Composes the best of ``cfg.variants`` maps whose star rating matches ``target_sr``."""
     cfg = cfg or ComposerConfig()
     secs = sections if sections is not None else segment_sections(an)
-    comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr)
+    comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr, motifs=motifs)
     # how often real maps (or the chosen style) repeat a lane within 150 ms at this star rating
     jack_target = patterns.fast_repeat_share(target_sr) if (patterns is not None and hasattr(patterns, "fast_repeat_share")) else None
     best: Optional[ComposeResult] = None

@@ -493,3 +493,36 @@ class TestTwoSidedLanes(unittest.TestCase):
         from osu_mapper.hybrid.patterns import PatternModel
         notes = [Note(100 * i, i % 4, 100 * i, False) for i in range(1, 30)]
         self.assertEqual(two_sided_lanes(notes, PatternModel.empty(), 3.0), notes)
+
+
+class SilenceAndFadeTests(unittest.TestCase):
+    """Absolute silence and fade-outs (composer._bars / fade_out_start)."""
+
+    def _an(self, power):
+        from osu_mapper.hybrid.composer import SongAnalysis
+
+        F = power.size
+        an = SongAnalysis(10, F, F * 10, np.zeros(F * 10), np.full(F, 0.5), np.full(F, 0.5), np.zeros(F), np.zeros(F),
+                          np.zeros((F, 16)), np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0), np.zeros(0),
+                          np.zeros(0), np.zeros(0, np.int64), 4, [])
+        an.power = power
+        return an
+
+    def test_quiet_part_is_not_silence_but_26db_down_is(self):
+        p = np.concatenate([np.full(3000, 10.0), np.full(1000, 8.0), np.full(1000, 2.0)])  # loud, -8.7 dB, -35 dB
+        sil = self._an(p).silent_frames(26.0)
+        self.assertFalse(sil[:4000].any())
+        self.assertTrue(sil[4000:].all())
+
+    def test_fade_out_end_detected(self):
+        from osu_mapper.hybrid.composer import fade_out_start
+
+        loud = np.full(20000, 10.0)
+        fade = np.linspace(10.0, 0.0, 1200)      # 12 s fade to silence
+        an = self._an(np.concatenate([loud, fade, np.zeros(300)]))
+        cut = fade_out_start(an)
+        self.assertIsNotNone(cut)
+        # 0.5 below the start of the fade: ~0.6 s into the 12 s fade
+        self.assertTrue(200_000 <= cut <= 201_500, cut)
+        abrupt = fade_out_start(self._an(np.concatenate([loud, np.zeros(300)])))
+        self.assertTrue(abrupt is None or abrupt >= 199_000)   # an abrupt stop cuts nothing before the stop

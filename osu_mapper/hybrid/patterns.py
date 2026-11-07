@@ -810,6 +810,10 @@ def default_pattern_path() -> Path:
 
 def load_default(path: Optional[str] = None, log=print) -> Optional[PatternModel]:
     p = Path(path) if path else default_pattern_path()
+    if not path and not p.exists():  # the model shipped with the repository
+        q = Path(__file__).resolve().parents[2] / "test_NN" / "patterns.npz"
+        if q.exists() and q.stat().st_size > 1024:
+            p = q
     if not p.exists():
         if path:
             raise FileNotFoundError(f"pattern model '{p}' not found (python learn_patterns.py --data dataset_hybrid)")

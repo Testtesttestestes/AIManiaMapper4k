@@ -155,3 +155,31 @@ class ZoneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PredictorAndBreakTests(unittest.TestCase):
+    def test_lane_predictor_continues_a_known_figure(self):
+        from osu_mapper.hybrid.motifs import LanePredictor
+
+        corpus = Corpus()
+        rng = np.random.default_rng(3)
+        stair = [0, 1, 2, 3] * 3
+        for s in range(5):
+            corpus.add(f"s{s}", 2000 + s, notes_from(random_cols(rng, 10) + stair + random_cols(rng, 10)), TP, 4.2)
+        lib = build_library(corpus, min_sets=4, max_len=8, log=lambda *_: None)
+        p = LanePredictor(lib, 4.2)
+        lp = p.logprob([1, 2, 4])          # 0 1 2 -> 3
+        self.assertEqual(int(np.argmax(lp)), 8)
+        lp = p.logprob([8, 4, 2])          # mirrored: 3 2 1 -> 0
+        self.assertEqual(int(np.argmax(lp)), 1)
+
+    def test_break_periods_written(self):
+        from osu_mapper.hybrid.beatmap import ManiaMap, break_periods_for, map_to_osu_text, parse_osu_mania
+
+        notes = notes_from([0, 1, 2, 3] * 4) + notes_from([0, 1, 2, 3] * 4, start=20000)
+        last = max(n.start for n in notes if n.start < 20000)
+        self.assertEqual(break_periods_for([(n.start, n.end) for n in notes]), [(last + 200, 20000 - 1200)])
+        self.assertEqual(break_periods_for([(0, 0), (3000, 3000)]), [])          # 3 s: no break, like human maps
+        text = map_to_osu_text(ManiaMap(notes=notes, timing_points=TP))
+        self.assertIn(f"2,{last + 200},{20000 - 1200}", text)
+        self.assertIsNotNone(parse_osu_mania(text))

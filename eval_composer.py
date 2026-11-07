@@ -90,7 +90,7 @@ def _grams(masks: np.ndarray, n: int) -> set:
     return out
 
 
-def measure(human: Diff, notes: List[Note], an, rests, song_end: int, sr: float) -> Dict[str, float]:
+def measure(human: Diff, notes: List[Note], an, rests, song_end: int, sr: float, lib=None) -> Dict[str, float]:
     hm, tp = human.m, human.m.timing_points
     H, C = chord_seq(hm.notes, tp), chord_seq(notes, tp)
     if C.size < 8:
@@ -135,11 +135,15 @@ def measure(human: Diff, notes: List[Note], an, rests, song_end: int, sr: float)
         A, B = _grams(H.masks, n), _grams(C.masks, n)
         d[f"lane{n}"] = len(A & B) / max(1, len(A))
     d["sr_err"] = abs(sr - human.sr)
+    if lib is not None and "lanes" in lib.tables:
+        from osu_mapper.hybrid.motifs import covered_share
+        d["cov8_h"] = covered_share(th["lanes"][0], th["lanes"][1], lib.tables["lanes"], 8)
+        d["cov8_c"] = covered_share(tc["lanes"][0], tc["lanes"][1], lib.tables["lanes"], 8)
     return d
 
 
 def run_song(job) -> List[dict]:
-    osz, cache, per_song, cfg_kw, patterns_path, motifs_path, save = job
+    osz, cache, per_song, cfg_kw, patterns_path, motifs_path, save, use_motifs = job
     import os
 
     for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -161,7 +165,7 @@ def run_song(job) -> List[dict]:
     lib = None
     if motifs_path and Path(motifs_path).exists():
         from osu_mapper.hybrid.motifs import MotifLibrary
-        lib = MotifLibrary.load(motifs_path)
+        lib = MotifLibrary.load(motifs_path, levels=["lanes"])
     rests, song_end = rest_spans(read_diffs(osz))
     out = []
     for h in hum:
@@ -171,8 +175,8 @@ def run_song(job) -> List[dict]:
             kw.setdefault("ln_ratio", float(np.mean([n.ln for n in h.m.notes])))
         cfg = ComposerConfig(**kw)
         res = compose(an, h.sr, cfg, sections=[dataclasses.replace(s) for s in sections], log=lambda *_: None,
-                      patterns=pat, **({"motifs": lib} if lib is not None else {}))
-        d = measure(h, res.notes, an, sorted(rests + h.breaks), song_end, res.star_rating)
+                      patterns=pat, motifs=lib if use_motifs else None)
+        d = measure(h, res.notes, an, sorted(rests + h.breaks), song_end, res.star_rating, lib)
         d.update(song=osz.stem, diff=h.name, sr=h.sr, secs=time.time() - t0)
         out.append(d)
         if save:
@@ -189,7 +193,7 @@ def run_song(job) -> List[dict]:
 
 def table(rows: List[dict]) -> str:
     cols = ["dens_r", "lag_bars", "nps_ratio", "rhythm_js", "q4_h", "q4_c", "on_human", "human_hit", "jack_h", "jack_c",
-            "ln_h", "ln_c", "copies_h", "copies_c", "rest", "lane4", "lane6", "sr_err"]
+            "ln_h", "ln_c", "copies_h", "copies_c", "rest", "lane4", "lane6", "cov8_h", "cov8_c", "sr_err"]
     out = ["| song | diff | sr | " + " | ".join(cols) + " |", "|" + "---|" * (len(cols) + 3)]
     for r in rows:
         out.append(f"| {r['song'][:14]} | {r['diff'][:18]} | {r['sr']:.2f} | " + " | ".join(f"{r.get(c, float('nan')):.2f}" for c in cols) + " |")
@@ -206,7 +210,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--patterns", default="test_NN/patterns.npz")
     ap.add_argument("--motifs", default="test_NN/motifs.npz")
-    ap.add_argument("--no_motifs", action="store_true")
+    ap.add_argument("--no_motifs", action="store_true", help="compose without the motif library (still used to measure)")
     ap.add_argument("--save_maps", default=None)
     ap.add_argument("--out", default=None, help="write the rows as JSON")
     ap.add_argument("--label", default="")
@@ -219,7 +223,7 @@ def main() -> None:
     for kv in args.set:
         k, v = kv.split("=", 1)
         cfg_kw[k] = type(getattr(__import__("osu_mapper.hybrid.composer", fromlist=["ComposerConfig"]).ComposerConfig(), k))(v)
-    jobs = [(str(s), args.cache, args.per_song, cfg_kw, args.patterns, None if args.no_motifs else args.motifs, args.save_maps)
+    jobs = [(str(s), args.cache, args.per_song, cfg_kw, args.patterns, args.motifs, args.save_maps, not args.no_motifs)
             for s in songs]
     rows = []
     t0 = time.time()

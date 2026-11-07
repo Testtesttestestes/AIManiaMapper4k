@@ -576,15 +576,17 @@ class MotifLibrary:
         np.savez_compressed(p, **d)
 
     @classmethod
-    def load(cls, path: str | Path) -> "MotifLibrary":
+    def load(cls, path: str | Path, levels: Optional[Sequence[str]] = None) -> "MotifLibrary":
         z = np.load(path, allow_pickle=False)
         tables = {}
         for lv in LEVELS:
+            if levels is not None and lv not in levels:
+                continue
             if f"{lv}__lengths" not in z:
                 continue
             tables[lv] = MotifTable(lv, *(z[f"{lv}__{k}"] for k in (
                 "lengths", "offsets", "flat", "count", "sets", "nmaps", "sr_hist", "phase_hist", "beats", "closed", "hashes")))
-        cov = {lv: z[f"cov__{lv}"] for lv in LEVELS if f"cov__{lv}" in z}
+        cov = {lv: z[f"cov__{lv}"] for lv in LEVELS if f"cov__{lv}" in z and (levels is None or lv in levels)}
         return cls(tables, FormStats.from_arrays(z), cov, z["maps_per_bin"], int(z["n_maps"]), int(z["n_sets"]), str(z["version"]))
 
     # --- queries -----------------------------------------------------------------------------------------
@@ -827,3 +829,108 @@ def name_motif(level: str, tokens: Sequence[int]) -> str:
             mono = np.all(np.diff(c) >= -0.01) or np.all(np.diff(c) <= 0.01)
             tags.append("split stairs" if mono else "light jumpstream")
     return " ".join(tags)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# prediction for a generator
+# ---------------------------------------------------------------------------------------------------------
+
+class LanePredictor:
+    """Next chord (lane mask) from the chords before it, PPM-style over the library's ``lanes`` motifs.
+
+    For a target star rating every motif of 2..``max_order``+1 chords is counted in both orientations, weighted by how
+    many maps of that star rating (+-1 bin) use it. ``logprob(history)`` blends the longest known context with the
+    shorter ones (Witten-Bell escapes), so a stair, a split, a trill answered by its mirror or a 6-chord figure of real
+    maps continues the way real maps continue it."""
+
+    def __init__(self, lib: MotifLibrary, sr: float, max_order: int = 6, level: str = "lanes"):
+        t = lib.tables[level]
+        self.max_order = int(max_order)
+        b = int(np.clip(math.floor(sr), 0, SR_BINS - 1))
+        w = np.zeros(SR_BINS)
+        for x, ww in ((b, 1.0), (b - 1, 0.35), (b + 1, 0.35)):
+            if 0 <= x < SR_BINS:
+                w[x] = ww
+        frac = (t.sr_hist.astype(np.float64) @ w) / np.maximum(1.0, t.nmaps.astype(np.float64))
+        weight = t.count.astype(np.float64) * (frac + 0.03)
+        self.table: Dict[Tuple[int, ...], np.ndarray] = {}
+        self.raw: Dict[Tuple[int, ...], float] = {}
+        keep = np.flatnonzero((t.lengths >= 2) & (t.lengths <= self.max_order + 1))
+        for k in keep:
+            seq = t.tokens(int(k)).astype(np.int64)
+            wk = float(weight[k])
+            if wk <= 0:
+                continue
+            for s_ in ((seq, MIRROR_MASK[seq]) if not np.array_equal(seq, MIRROR_MASK[seq]) else (seq,)):
+                ctx = tuple(int(x) for x in s_[:-1])
+                arr = self.table.get(ctx)
+                if arr is None:
+                    arr = np.zeros(16)
+                    self.table[ctx] = arr
+                arr[int(s_[-1])] += wk
+                self.raw[ctx] = self.raw.get(ctx, 0.0) + float(t.count[k])
+
+    def logprob(self, history: Sequence[int]) -> np.ndarray:
+        """log P(next mask) for all 16 masks (index 0 unused)."""
+        probs = np.zeros(16)
+        mass = 1.0
+        h = [int(x) for x in history[-self.max_order:]]
+        for order in range(len(h), 0, -1):
+            cnt = self.table.get(tuple(h[len(h) - order:]))
+            if cnt is None:
+                continue
+            tot = float(cnt.sum())
+            if tot <= 0:
+                continue
+            distinct = float((cnt > 0).sum())
+            esc = distinct / (self.raw.get(tuple(h[len(h) - order:]), tot) + distinct)   # Witten-Bell on occurrences
+            probs += mass * (1.0 - esc) * cnt / tot
+            mass *= esc
+        probs[1:] += mass / 15.0
+        probs[0] = 1e-12
+        return np.log(np.maximum(probs, 1e-12))
+
+
+def covered_share(tokens: np.ndarray, mirrored: Optional[np.ndarray], table: MotifTable, length: int = 8) -> float:
+    """Share of the chords of one map that lie inside an occurrence of a library motif of ``length`` chords."""
+    tk = np.asarray(tokens, dtype=np.int64)
+    L = int(length)
+    if tk.size < L or len(table) == 0:
+        return 0.0
+    with np.errstate(over="ignore"):
+        h = np.zeros(tk.size - L + 1, dtype=np.uint64)
+        hm = np.zeros_like(h)
+        for j in range(L):
+            h = h * _P + (tk[j:tk.size - L + 1 + j].astype(np.uint64) + np.uint64(1)) * _P2
+            if mirrored is not None:
+                hm = hm * _P + (np.asarray(mirrored)[j:tk.size - L + 1 + j].astype(np.uint64) + np.uint64(1)) * _P2
+    c = np.minimum(h, hm) if mirrored is not None else h
+    hs = table.hashes
+    pos = np.clip(np.searchsorted(hs, c), 0, hs.size - 1)
+    hit = hs[pos] == c
+    cov = np.zeros(tk.size + 1, dtype=np.int64)
+    st = np.flatnonzero(hit)
+    np.add.at(cov, st, 1)
+    np.add.at(cov, st + L, -1)
+    return float((np.cumsum(cov)[:-1] > 0).mean())
+
+
+def load_default_motifs(path: Optional[str] = None, log=print, levels: Sequence[str] = ("lanes",)) -> Optional[MotifLibrary]:
+    """The motif library for the composer: ``path``, else checkpoints/hybrid/motifs.npz, else test_NN/motifs.npz.
+    None (with a note) when there is none or the file is a Git LFS pointer that was not downloaded."""
+    root = Path(__file__).resolve().parents[2]
+    cands = [Path(path)] if path else [Path("checkpoints/hybrid/motifs.npz"), root / "checkpoints/hybrid/motifs.npz",
+                                       root / "test_NN/motifs.npz"]
+    for p in cands:
+        if not p.exists():
+            continue
+        if p.stat().st_size < 1024:
+            log(f"[motifs] {p} is a Git LFS pointer (git lfs pull), motif library not used")
+            continue
+        lib = MotifLibrary.load(p, levels=levels)
+        log(f"[motifs] {p}: {lib.n_maps} maps of {lib.n_sets} sets")
+        return lib
+    if path:
+        raise FileNotFoundError(f"motif library '{path}' not found (python mine_patterns.py)")
+    log("[motifs] no motif library (python mine_patterns.py): lanes from the pattern model only")
+    return None
