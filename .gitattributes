@@ -1,3 +1,4 @@
 *.osz filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
 test_NN/hybrid_best.pt filter=lfs diff=lfs merge=lfs -text
+test_NN/motifs.npz filter=lfs diff=lfs merge=lfs -text
