@@ -113,6 +113,9 @@ class ComposerConfig:
                                      # the difficulty grows with chords, as in chordjack / jumpstream maps); 0 = no cap
     rhythm_prior: float = 1.0        # weight of "how often real maps of this SR and tempo put a note on a tick of this divisor"
     burst_rate: float = 1.0          # speed-ups (1/8, 1/16 runs) x how often real maps of the target SR have them
+    song_energy: bool = True         # with network hints: candidates scored by loudness against the whole song
+    family_chords: float = 0.3       # how much a section's pattern family changes its chord rate (stream 0.45x .. chordjack 1.9x)
+    family_density: float = 1.0      # how much a section's pattern family changes its note count (0 = not at all)
     bar_follow: float = 0.7          # 0..1: note density follows the loudness of every bar (1) or only of the section (0)
     silence_db: float = 26.0         # bars this far below the loud parts of the song are silence: no notes at all
     release_gap_ms: int = 40
@@ -926,6 +929,9 @@ class Composer:
         self.pos = (t - starts[so]) / np.maximum(1.0, ends[so] - starts[so]) - 0.5
         sec_loud = np.array([s.loud for s in self.sections])
         self.energy = np.clip((self.loud - sec_loud[so]) * 3.0, -1.0, 1.0)
+        # loudness against the whole song: with short sections the section-relative energy loses the contrast between
+        # verse and chorus, which matters when one pool of notes is shared by the whole song (network hints)
+        self.energy_song = np.clip((self.loud - float(np.median(self.loud))) * 3.0, -1.0, 1.0)
 
     # --- pattern families ---------------------------------------------------------------------------
     def plan_families(self, L: float, rng: np.random.Generator) -> None:
@@ -1074,7 +1080,7 @@ class Composer:
             idx = np.flatnonzero(sec_of == si)
             if idx.size == 0 or shape[si] <= 0:
                 continue
-            fam_d = FAMILY_SHAPE[s.family][0]
+            fam_d = FAMILY_SHAPE[s.family][0] ** cfg.family_density
             budget = int(round(s.dur_s * eps * shape[si] * fam_d))
             if cap_rate is not None:
                 budget = min(budget, int(round(s.dur_s * cap_rate * shape[si])))
@@ -1085,7 +1091,8 @@ class Composer:
             if budget <= 0:
                 continue
             sc = base[idx].copy()
-            sc = sc + 0.8 * s.ramp * self.pos[idx] + 0.5 * self.energy[idx]
+            energy = self.energy_song[idx] if (global_pick and cfg.song_energy) else self.energy[idx]
+            sc = sc + 0.8 * s.ramp * self.pos[idx] + 0.5 * energy
             div = self.div[idx]
             # binary vs triplet feel of the section; where the network is sure about a note of the other kind (a 1/12
             # fill in a straight section), it wins
@@ -1285,7 +1292,7 @@ class Composer:
             cap = min(self.cfg.max_chord, pm.max_chord(self.target_sr) + (1 if (self.cfg.creativity >= 0.7 or self.chord_boost > 1.0) else 0))
         # families and intensity move chords between sections; with a pattern model the song-wide chord share
         # stays exactly what real maps of this star rating have (the multipliers are mean-preserving)
-        mults = np.array([FAMILY_SHAPE[s.family][1] * (0.6 + 0.8 * s.intensity) for s in self.sections])
+        mults = np.array([FAMILY_SHAPE[s.family][1] ** self.cfg.family_chords * (0.6 + 0.8 * s.intensity) for s in self.sections])
         counts = np.bincount(sec, minlength=len(self.sections)).astype(np.float64)
         if self.patterns is not None and counts.sum() > 0:
             mults = mults / max(1e-6, float((mults * counts).sum() / counts.sum()))
