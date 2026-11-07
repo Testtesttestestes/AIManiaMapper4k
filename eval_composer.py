@@ -41,6 +41,33 @@ MEASURES = ("dens_r", "lag_bars", "nps_ratio", "rhythm_js", "q4_h", "q4_c", "on_
             "ln_h", "ln_c", "chords_h", "chords_c", "copies_h", "copies_c", "rest", "lane4", "lane6", "sr_err")
 
 
+def song_analysis_net(osz: Path, checkpoint: str, cache: str = "eval_cache"):
+    """(SongAnalysis, sections, predictor, inputs) with the network, the way generate_composer.py does it."""
+    from generate_hybrid import read_template
+    from osu_mapper.hybrid.audio_features import load_audio
+    from osu_mapper.hybrid.composer import analyze_song, segment_sections
+    from osu_mapper.hybrid.inference import HybridPredictor, prepare_song_inputs
+
+    predictor = HybridPredictor.from_checkpoint(Path(checkpoint), device="cpu")
+    fcfg = predictor.feature_cfg
+    with tempfile.TemporaryDirectory() as work:
+        audio, timing, _ = read_template(osz, Path(work))
+        wave = load_audio(audio, fcfg.sample_rate)
+    dur = int(round(wave.size * 1000.0 / fcfg.sample_rate))
+    import torch
+
+    cf = Path(cache) / f"{osz.stem}_net.pt"
+    if cf.exists():
+        inputs = torch.load(cf, map_location="cpu", weights_only=False)
+    else:
+        inputs = prepare_song_inputs(wave, fcfg, timing if any(t.uninherited for t in timing) else None, keep_reps=True,
+                                     device="cpu")
+        Path(cache).mkdir(parents=True, exist_ok=True)
+        torch.save(inputs, cf)
+    an = analyze_song(inputs.feats, fcfg.slices(), timing, dur, fcfg.frame_ms)
+    return an, segment_sections(an), predictor, inputs
+
+
 def song_analysis(osz: Path, cache: Path):
     """(SongAnalysis, sections) of a template .osz; the audio features are cached as .npz."""
     from generate_hybrid import read_template
@@ -143,7 +170,7 @@ def measure(human: Diff, notes: List[Note], an, rests, song_end: int, sr: float,
 
 
 def run_song(job) -> List[dict]:
-    osz, cache, per_song, cfg_kw, patterns_path, motifs_path, save, use_motifs = job
+    osz, cache, per_song, cfg_kw, patterns_path, motifs_path, save, use_motifs, checkpoint = job
     import os
 
     for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -160,7 +187,11 @@ def run_song(job) -> List[dict]:
     if per_song and len(hum) > per_song:  # spread over the star ratings, always including the hardest
         idx = np.unique(np.round(np.linspace(len(hum) - 1, 0, per_song)).astype(int))
         hum = [hum[i] for i in sorted(idx)]
-    an, sections = song_analysis(osz, Path(cache))
+    predictor = inputs = None
+    if checkpoint:
+        an, sections, predictor, inputs = song_analysis_net(osz, checkpoint, cache)
+    else:
+        an, sections = song_analysis(osz, Path(cache))
     pat = load_default(patterns_path, log=lambda *_: None)
     lib = None
     if motifs_path and Path(motifs_path).exists():
@@ -174,7 +205,13 @@ def run_song(job) -> List[dict]:
         if kw.pop("match_ln", True):  # the LN style is the mapper's choice, not the music's: give the human's LN share
             kw.setdefault("ln_ratio", float(np.mean([n.ln for n in h.m.notes])))
         cfg = ComposerConfig(**kw)
-        res = compose(an, h.sr, cfg, sections=[dataclasses.replace(s) for s in sections], log=lambda *_: None,
+        hints = None
+        if predictor is not None:
+            from osu_mapper.hybrid.composer import NetHints
+            from osu_mapper.hybrid.inference import style_from_dict
+            style, smask = style_from_dict({})
+            hints = NetHints.from_outputs(predictor.predict(inputs, h.sr, style, smask))
+        res = compose(an, h.sr, cfg, hints=hints, sections=[dataclasses.replace(s) for s in sections], log=lambda *_: None,
                       patterns=pat, motifs=lib if use_motifs else None)
         d = measure(h, res.notes, an, sorted(rests + h.breaks), song_end, res.star_rating, lib)
         d.update(song=osz.stem, diff=h.name, sr=h.sr, secs=time.time() - t0)
@@ -212,6 +249,7 @@ def main() -> None:
     ap.add_argument("--motifs", default="test_NN/motifs.npz")
     ap.add_argument("--no_motifs", action="store_true", help="compose without the motif library (still used to measure)")
     ap.add_argument("--save_maps", default=None)
+    ap.add_argument("--checkpoint", default=None, help="hybrid network: compose with its hints, as the console does")
     ap.add_argument("--out", default=None, help="write the rows as JSON")
     ap.add_argument("--label", default="")
     ap.add_argument("--no_match_ln", action="store_true", help="let the composer pick the LN style itself")
@@ -223,7 +261,8 @@ def main() -> None:
     for kv in args.set:
         k, v = kv.split("=", 1)
         cfg_kw[k] = type(getattr(__import__("osu_mapper.hybrid.composer", fromlist=["ComposerConfig"]).ComposerConfig(), k))(v)
-    jobs = [(str(s), args.cache, args.per_song, cfg_kw, args.patterns, args.motifs, args.save_maps, not args.no_motifs)
+    jobs = [(str(s), args.cache, args.per_song, cfg_kw, args.patterns, args.motifs, args.save_maps, not args.no_motifs,
+             args.checkpoint)
             for s in songs]
     rows = []
     t0 = time.time()

@@ -356,6 +356,13 @@ class PatternModel:
     def ln_chord_prob(self, sr: float, style: int, gap_next_beats: float, gap_prev_beats: float, size: int, metric: int) -> float:
         """P(this chord has a long note | rhythm context) for maps of this star rating and LN style."""
         gn, gp, k = beat_gap_bin(gap_next_beats), beat_gap_bin(gap_prev_beats), int(np.clip(size - 1, 0, 3))
+        cache = self.__dict__.setdefault("_c_lnp", {})
+        key = (float(sr), int(style), gn, gp, k, int(metric))
+        if key not in cache:
+            cache[key] = self._ln_chord_prob(sr, style, gn, gp, k, int(metric))
+        return cache[key]
+
+    def _ln_chord_prob(self, sr: float, style: int, gn: int, gp: int, k: int, metric: int) -> float:
         p = 0.0
         wsum = 0.0
         for b, wt in self._sr_weights(sr):
@@ -420,7 +427,7 @@ class PatternModel:
                 continue
             a = getattr(self, k, None)
             setattr(self, k, b.copy() if a is None else a + b)
-        for cache in ("_m_uni", "_m_gap", "_m_prev", "_overlap"):
+        for cache in ("_m_uni", "_m_gap", "_m_prev", "_overlap", "_c_lnp", "_c_lane"):
             self.__dict__.pop(cache, None)
 
     def with_style(self, style: "PatternModel", strength: float = 20.0) -> "PatternModel":
@@ -482,6 +489,14 @@ class PatternModel:
     def lane_logprob(self, sr: float, gap_ms: float, prev: int, prev2: int, size: int, alpha: float = 4.0) -> np.ndarray:
         """log P(mask | context) over all 16 masks, restricted to masks with ``size`` lanes (-inf elsewhere)."""
         g = gap_bin(gap_ms)
+        cache = self.__dict__.setdefault("_c_lane", {})
+        key = (float(sr), g, int(prev), int(prev2), int(size), float(alpha))
+        out = cache.get(key)
+        if out is None:
+            out = cache[key] = self._lane_logprob(sr, g, prev, prev2, size, alpha)
+        return out.copy()
+
+    def _lane_logprob(self, sr: float, g: int, prev: int, prev2: int, size: int, alpha: float) -> np.ndarray:
         valid = POP == size
         out = np.zeros(16)
         if not hasattr(self, "_m_uni"):
@@ -820,6 +835,18 @@ def load_default(path: Optional[str] = None, log=print) -> Optional[PatternModel
         return None
     m = PatternModel.load(p)
     log(f"[patterns] {p}: {int(m.maps.sum())} maps")
+    if m.rhythm_hits_bpm is None:
+        # an older model without the tempo-aware rhythm table: borrow it from the model shipped in test_NN
+        q = Path(__file__).resolve().parents[2] / "test_NN" / "patterns.npz"
+        if q.exists() and q.stat().st_size > 1024 and q.resolve() != p.resolve():
+            try:
+                t = PatternModel.load(q)
+            except ValueError:
+                t = None
+            if t is not None and t.rhythm_hits_bpm is not None:
+                m.rhythm_hits_bpm, m.rhythm_beats_bpm = t.rhythm_hits_bpm, t.rhythm_beats_bpm
+                log(f"[patterns] no tempo-aware rhythm table in {p.name}: taken from {q} (to add it to yours: python "
+                    f"learn_patterns.py --update_rhythm_bpm \"{p}\" --input_dir \"sample beatmaps\" --out \"{p}\")")
     return m
 
 
