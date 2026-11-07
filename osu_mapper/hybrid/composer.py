@@ -101,6 +101,12 @@ class ComposerConfig:
     repeat_memory: bool = True       # repeated sections reuse the earlier mapping
     mirror_repeats: Optional[bool] = None      # None = decided per repeat by the seed
     seed: int = 0
+    triplet_feel: str = "off"         # "audio": sections the audio calls triplet avoid binary ticks (and vice versa);
+                                     # "off": no section-wide feel, the tempo-aware rhythm statistics decide; "binary"
+    event_cap: float = 1.5           # chords per second at most this x what real maps of this SR and tempo have (then
+                                     # the difficulty grows with chords, as in chordjack / jumpstream maps); 0 = no cap
+    rhythm_prior: float = 1.0        # weight of "how often real maps of this SR and tempo put a note on a tick of this divisor"
+    burst_rate: float = 1.0          # speed-ups (1/8, 1/16 runs) x how often real maps of the target SR have them
     bar_follow: float = 0.7          # 0..1: note density follows the loudness of every bar (1) or only of the section (0)
     silence_db: float = 26.0         # bars this far below the loud parts of the song are silence: no notes at all
     release_gap_ms: int = 40
@@ -1004,9 +1010,16 @@ class Composer:
             base = base + cfg.net_rhythm * w_net * np.log(q / (1.0 - q))
         if self.patterns is not None:
             # how often real maps of this difficulty put a note on a tick of this divisor
-            use = self.patterns.tick_usage(self.target_sr)
+            from .patterns import main_bpm
+            use = self.patterns.tick_usage(self.target_sr, main_bpm(self.an.timing_points, self.an.duration_ms))
+            use = use.copy()
+            # the statistics count off-grid notes as one tick per beat; the song offers many off-grid candidates per beat
+            # (attack peaks between ticks): per candidate the probability is that much smaller
+            n_off = float((self.div == OFF_GRID).sum())
+            beats = max(1.0, float(self.an.beats.size))
+            use[6] = float(np.clip(use[6] / max(1.0, n_off / beats), 1e-4, 0.999))
             cls = DIV_TO_CLASS[np.clip(self.div, 0, 16)]
-            base = base + 0.45 * np.log(use[cls] / (1.0 - use[cls]))
+            base = base + cfg.rhythm_prior * np.log(use[cls] / (1.0 - use[cls]))
         base = base + 0.05 * self.cfg.creativity * rng.standard_normal(t.size)
         shape = self.section_shape()
         if getattr(self, "bar_edges", None) is not None:
@@ -1023,12 +1036,20 @@ class Composer:
         chosen_t: List[np.ndarray] = []  # times chosen so far (sections are processed in order)
         groups = []
         global_pick = self.hints is not None and cfg.net_shape * cfg.net_weight >= 0.5
+        cap_rate = None
+        if cfg.event_cap > 0 and self.patterns is not None and hasattr(self.patterns, "events_per_beat"):
+            from .patterns import main_bpm
+            bpm = main_bpm(self.an.timing_points, self.an.duration_ms)
+            if bpm is not None:
+                cap_rate = cfg.event_cap * self.patterns.events_per_beat(self.target_sr, bpm) * bpm / 60.0
         for si, s in enumerate(self.sections):
             idx = np.flatnonzero(sec_of == si)
             if idx.size == 0 or shape[si] <= 0:
                 continue
             fam_d = FAMILY_SHAPE[s.family][0]
             budget = int(round(s.dur_s * eps * shape[si] * fam_d))
+            if cap_rate is not None:
+                budget = min(budget, int(round(s.dur_s * cap_rate * shape[si])))
             # notes need something to hit: a section gets at most ~1.25x as many notes as it has audible attacks
             # (plus what the network is confident about); filler on silent ticks is what makes maps feel random
             audible = int((self.audible[idx] | (self.net[idx] >= 0.5)).sum())
@@ -1040,9 +1061,13 @@ class Composer:
             div = self.div[idx]
             # binary vs triplet feel of the section; where the network is sure about a note of the other kind (a 1/12
             # fill in a straight section), it wins
-            other = np.isin(div, BINARY_FINE) if s.triplet else np.isin(div, list(TRIPLET))
-            sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
-            sc = sc - 0.8 * other * (1.0 - sure)
+            # measured on 9 songs (316 sections): the audio "triplet" flag matched the sections humans map in triplets
+            # 2 times out of 75 - by default no section-wide feel, the tempo-aware statistics of real maps decide
+            if cfg.triplet_feel != "off":
+                trip = s.triplet and cfg.triplet_feel == "audio"
+                other = np.isin(div, BINARY_FINE) if trip else np.isin(div, list(TRIPLET))
+                sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
+                sc = sc - 0.8 * other * (1.0 - sure)
             if cfg.repeat_memory and chosen_t and self.an.repeats:
                 # remember the rhythm of the earlier occurrence of a repeated phrase
                 src = np.sort(np.concatenate(chosen_t))
@@ -1148,7 +1173,9 @@ class Composer:
         if floor is None:
             floor = max(38.0, _level_params(min(1.6, L + 0.35))[1])
         floor = max(25.0, floor * (1.0 - 0.4 * self.cfg.creativity))
-        often = 1.0 + 3.0 * self.cfg.creativity
+        often = self.cfg.burst_rate * (1.0 + 3.0 * self.cfg.creativity)
+        if often <= 0:
+            return ev
         te = t[ev]
         gaps = np.diff(te)
         added: List[int] = []

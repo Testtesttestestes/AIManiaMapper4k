@@ -157,6 +157,44 @@ def from_archives(model: PatternModel, folder: Path) -> int:
     return n
 
 
+def update_rhythm_bpm(model: PatternModel, folder: Path) -> int:
+    """(Re)counts only the tempo-aware rhythm table of an existing model from .osu files (folders of .osu or .osz)."""
+    import numpy as np
+
+    from osu_mapper.hybrid.beatmap import parse_osu_mania
+    from osu_mapper.hybrid.inference import star_rating_of
+    from osu_mapper.hybrid.patterns import chord_events, div_class, sr_bin
+
+    model.rhythm_hits_bpm = None
+    model.rhythm_beats_bpm = None
+    texts = [p.read_bytes().decode("utf-8", errors="replace") for p in sorted(folder.rglob("*.osu"))]
+    for osz in sorted(folder.rglob("*.osz")):
+        try:
+            with zipfile.ZipFile(osz) as z:
+                texts += [z.read(e).decode("utf-8", errors="replace") for e in z.namelist() if e.lower().endswith(".osu")]
+        except (zipfile.BadZipFile, OSError):
+            continue
+    seen, n = set(), 0
+    for k, text in enumerate(texts, 1):
+        m = parse_osu_mania(text)
+        if m is None or len(m.notes) < 20:
+            continue
+        key = hash(tuple(sorted(m.canonical_notes())))
+        if key in seen:
+            continue
+        seen.add(key)
+        times, _, _ = chord_events(m.notes)
+        if times.size < 8:
+            continue
+        reds = sorted((tp for tp in m.timing_points if tp.uninherited and tp.beat_len > 0), key=lambda r: r.time)
+        cls = np.array([div_class(float(t), reds) for t in times], dtype=np.int64)
+        model.add_rhythm_bpm(times, cls, m.timing_points, sr_bin(star_rating_of(m.notes, m.timing_points, m.overall_difficulty)))
+        n += 1
+        if k % 500 == 0:
+            print(f"  {k}/{len(texts)} difficulties", flush=True)
+    return n
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=None, help="prepared dataset folder (prepare_hybrid_dataset.py)")
@@ -169,8 +207,19 @@ def main() -> None:
     ap.add_argument("--no_audio", action="store_true",
                     help="skip the audio part (how section density follows the music); much faster, the composer then "
                          "matches the density variation of real maps instead")
+    ap.add_argument("--update_rhythm_bpm", default=None, metavar="MODEL",
+                    help="only (re)count the tempo-aware rhythm table of an existing model from --input_dir "
+                         "(.osz or .osu files) and save it to --out")
     args = ap.parse_args()
     print("[learn] starting (CPU only, no GPU needed)", flush=True)
+    if args.update_rhythm_bpm:
+        if not args.input_dir:
+            sys.exit("--update_rhythm_bpm needs --input_dir")
+        model = PatternModel.load(args.update_rhythm_bpm)
+        n = update_rhythm_bpm(model, Path(args.input_dir))
+        model.save(args.out)
+        print(f"[done] tempo-aware rhythm of {n} maps -> {args.out}")
+        return
     if not args.data and not args.input_dir:
         sys.exit("give --data dataset_hybrid or --input_dir \"sample beatmaps\"")
     t0 = time.time()
