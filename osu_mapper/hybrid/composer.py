@@ -133,6 +133,7 @@ class Section:
     triplet: bool = False
     repeat_of: Optional[int] = None  # section that contains the original passage
     repeat_src_ms: Optional[int] = None  # where the original passage starts (aligned with this section's start)
+    repeat_phrase: Optional[Tuple[int, int]] = None  # (start of the first repeated phrase, start of its original)
     similarity: float = 0.0
     family: str = "stream"
     mirror: bool = False
@@ -154,8 +155,14 @@ class ComposeResult:
         rows = []
         for i, s in enumerate(self.sections):
             src = f"#{s.repeat_of}, " if s.repeat_of is not None else ""
-            rep = (f" = repeat of {s.repeat_src_ms / 1000:.1f}s ({src}similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
-                   if s.repeat_src_ms is not None else "")
+            if s.repeat_phrase is not None:
+                a, b = s.repeat_phrase
+                rep = (f" = {a / 1000:.1f}s repeats {b / 1000:.1f}s ({src}similarity {s.similarity:.2f})"
+                       f"{' mirrored' if s.mirror else ''}")
+            elif s.repeat_src_ms is not None:
+                rep = f" = repeat of {s.repeat_src_ms / 1000:.1f}s ({src}similarity {s.similarity:.2f}){' mirrored' if s.mirror else ''}"
+            else:
+                rep = ""
             n = sum(1 for x in self.notes if s.start_ms <= x.start < s.end_ms)
             ramp = " build-up" if s.ramp > 0.25 else (" fade" if s.ramp < -0.25 else "")
             rows.append(f"  #{i:<2d} {s.start_ms / 1000:7.1f}-{s.end_ms / 1000:7.1f}s  intensity {s.intensity:.2f}  "
@@ -606,7 +613,9 @@ def find_repeats(an: SongAnalysis, sections: List[Section], V: np.ndarray, min_s
         src_sec = [int(np.searchsorted(starts_ms, r[2], side="right") - 1) for r in inside]
         j = max(set(src_sec), key=src_sec.count)
         s.similarity = float(np.mean([r[3] for r in inside]))
-        s.repeat_src_ms = inside[0][2] - (inside[0][0] - s.start_ms)
+        first = next((r for r, q in zip(inside, src_sec) if q == j), inside[0])
+        s.repeat_src_ms = first[2] - (first[0] - s.start_ms)
+        s.repeat_phrase = (int(first[0]), int(first[2]))
         if covered >= 0.6 and 0 <= j < i:
             s.repeat_of = j
 
@@ -786,7 +795,7 @@ class Composer:
                 self.copy_probs = tuple(float(x) for x in cov[:3] / cov.sum())
         if motifs is not None and cfg.motif_weight > 0 and "lanes" in getattr(motifs, "tables", {}):
             from .motifs import LanePredictor
-            self.lane_motifs = LanePredictor(motifs, self.target_sr)
+            self.lane_motifs = LanePredictor.cached(motifs, self.target_sr)
         self._candidates()
         self._bars()
 
@@ -1100,6 +1109,9 @@ class Composer:
             if self.hints is not None:
                 # a note the network is sure about may sit closer to its neighbours (real 1/8 and 1/16 runs)
                 gv = gv * (1.0 - 0.8 * np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net))
+            if global_pick and getattr(self, "bar_edges", None) is not None and cfg.bar_follow > 0:
+                # one pool for the whole song (the network decides where): louder bars still get more of it
+                sc = sc + 1.5 * cfg.bar_follow * np.log(np.maximum(self._bar_shape_cache[self.bar_of_t[idx]], 1e-3))
             groups.append((idx, sc, budget, gv))
             if not global_pick:
                 if getattr(self, "bar_edges", None) is not None and cfg.bar_follow > 0:
