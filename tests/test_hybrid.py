@@ -801,3 +801,56 @@ class TestEndToEndSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPatternKnowledge(unittest.TestCase):
+    """Pattern heads and the motif-library prior (motif_targets.py, losses.pattern_loss / prior_loss)."""
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_targets_heads_and_losses(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import SparseTrack
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+        from osu_mapper.hybrid.motif_targets import PATTERN_HEADS, targets_for_track
+
+        # a 16-chord phrase played twice: the second time is an exact copy of the first
+        rng = random.Random(3)
+        phrase = [rng.randrange(4) for _ in range(16)]
+        notes = [Note(1000 + 125 * i, c, 1000 + 125 * i, False) for i, c in enumerate(phrase + phrase)]
+        tp = [RawTimingPoint(1000.0, 500.0)]
+        track = solve_map(notes, timing_points=tp, num_frames=600)
+        sp = SparseTrack(track)
+        pat = targets_for_track(sp, 4.0, None)
+        self.assertEqual(pat["shape"].shape[0], len(phrase) * 2)
+        self.assertTrue((pat["copy"][17:] == 1).all())               # exact copy (kind 1) from chord 17 on
+        self.assertTrue((pat["rhythm"][1:] == 5).all())              # 1/4 gaps (class 5)
+        self.assertEqual(int(pat["prev"][3, 0]), 1 << phrase[2])
+        sp.pat = dict(pat)
+        sp.pat["prior"] = np.zeros_like(pat["prior"])
+        sp.pat["prior"][1:, 1 << 2] = 1.0                          # a "library" that always wants lane 2
+        crop = sp.crop_arrays(0, 512)
+        batch = {k: torch.from_numpy(np.stack([v])) for k, v in crop.items()}
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", pattern_heads=True))
+        batch.update(valid=torch.ones(1, 512), style=torch.rand(1, STYLE_DIM), style_mask=torch.ones(1, STYLE_DIM))
+        out = model(torch.randn(1, 512, fcfg.total_dim()), torch.zeros(1, 512, 13), torch.tensor([[4.0]]),
+                    batch["style"], batch["style_mask"], torch.randn(1, 30, fcfg.total_dim()), None)
+        self.assertEqual(out["pattern_logits"].shape[-1], sum(PATTERN_HEADS.values()))
+        loss, logs = compute_losses(out, batch, LossWeights(patterns=1.0, prior=1.0), 10)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("pat_copy", logs)
+        self.assertEqual(int(logs["prior_events"]), len(phrase) * 2 - 1)
+        loss.backward()
+        self.assertIsNotNone(model.pattern_head.weight.grad)
+        # the prior pulls the lane head: a lane distribution that puts everything on lane 2 has (near) zero prior loss
+        from osu_mapper.hybrid.losses import prior_loss
+        from osu_mapper.hybrid.params import code_for_mask, N_LANE_CODES
+        ev = batch["time_class"] > 0
+        good = torch.full((1, 512, N_LANE_CODES), -30.0)
+        good[..., code_for_mask(1 << 2)] = 30.0
+        self.assertLess(float(prior_loss(good, batch, ev)[0]), 1e-3)
+        bad = torch.full((1, 512, N_LANE_CODES), -30.0)
+        bad[..., code_for_mask(1 << 0)] = 30.0
+        self.assertGreater(float(prior_loss(bad, batch, ev)[0]), 5.0)
