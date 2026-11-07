@@ -105,6 +105,10 @@ class BeatmapPackager:
         lines.append("[Events]")
         lines.append("//Background and Video events")
         lines.append("//Break Periods")
+        from osu_mapper.hybrid.beatmap import break_periods_for
+
+        for a, b in break_periods_for([(ho.start_time, ho.end_time if ho.is_ln else ho.start_time) for ho in hit_objects]):
+            lines.append(f"2,{a},{b}")
         lines.append("//Storyboard Layer 0 (Fail)")
         lines.append("//Storyboard Layer 1 (Pass)")
         lines.append("//Storyboard Layer 2 (Foreground)")

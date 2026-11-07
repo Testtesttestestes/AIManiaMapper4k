@@ -65,6 +65,9 @@ def main(argv=None) -> None:
     ap.add_argument("--checkpoint", "-c", default="checkpoints/hybrid/hybrid_best.pt", help="hybrid network (optional)")
     ap.add_argument("--no_model", action="store_true", help="do not use the network even if the checkpoint exists")
     ap.add_argument("--patterns", default=None, help="learned pattern model (default checkpoints/hybrid/patterns.npz)")
+    ap.add_argument("--motifs", default=None, help="motif library (mine_patterns.py; default checkpoints/hybrid/motifs.npz, "
+                                                   "else test_NN/motifs.npz)")
+    ap.add_argument("--no_motifs", action="store_true", help="do not use the motif library")
     ap.add_argument("--output", "-o", default="output_beatmaps/composer_map.osz")
     ap.add_argument("--title", default=None)
     ap.add_argument("--artist", default=None)
@@ -131,6 +134,8 @@ def main(argv=None) -> None:
         else:
             print("[model] no network: notes come from the audio analysis and the learned patterns")
         patterns = load_default(args.patterns)
+        from osu_mapper.hybrid.motifs import load_default_motifs
+        motifs = None if args.no_motifs else load_default_motifs(args.motifs)
         if patterns is None:
             print("[patterns] no pattern model (python learn_patterns.py --data dataset_hybrid): built-in defaults are used, "
                   "chords / jacks / density will not be calibrated to real maps")
@@ -197,7 +202,7 @@ def main(argv=None) -> None:
                 hints = NetHints.from_outputs(out)
             print(f"[{target:.2f}*] composing {cfg.variants} variant(s)")
             res = compose(an, target, cfg, hints=hints, sections=[dataclasses.replace(s) for s in sections],
-                          log=print, patterns=patterns)
+                          log=print, patterns=patterns, motifs=motifs)
             notes = res.notes
             version = f"{args.version + ' ' if args.version else ''}Composer {target:.2f}*"
             print(res.plan_text())

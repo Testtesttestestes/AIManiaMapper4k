@@ -51,6 +51,7 @@ import numpy as np
 from .beatmap import ManiaMap, Note, RawTimingPoint, map_to_osu_text
 from .params import LANE_TABLE, N_LANE_CODES, NUM_LANES
 
+MIRROR_OF = np.array([((m & 1) << 3) | ((m & 2) << 1) | ((m & 4) >> 1) | ((m & 8) >> 3) for m in range(16)])
 MASKS_BY_SIZE: Dict[int, List[int]] = {k: [m for m in range(1, 16) if bin(m).count("1") == k] for k in range(1, 5)}
 LANES_OF = [[c for c in range(NUM_LANES) if (m >> c) & 1] for m in range(16)]
 POP = np.array([bin(m).count("1") for m in range(16)])
@@ -101,6 +102,19 @@ class ComposerConfig:
     repeat_memory: bool = True       # repeated sections reuse the earlier mapping
     mirror_repeats: Optional[bool] = None      # None = decided per repeat by the seed
     seed: int = 0
+    triplet_feel: str = "off"         # "audio": sections the audio calls triplet avoid binary ticks (and vice versa);
+                                     # "off": no section-wide feel, the tempo-aware rhythm statistics decide; "binary"
+    phrase_copies: float = 1.0       # x how often real maps re-use the lanes of an earlier passage with the same rhythm
+    copy_window: int = 4             # chords of rhythm that must match to look for a copy ...
+    copy_bonus: float = 10.0         # score of the chord a copy / an audio repeat asks for
+    copy_min: int = 6                # ... and the copy must cover at least this many chords of the same rhythm
+    motif_weight: float = 1.5        # weight of the motif library's lane prediction (motifs.npz, up to 6 chords of context)
+    event_cap: float = 1.5           # chords per second at most this x what real maps of this SR and tempo have (then
+                                     # the difficulty grows with chords, as in chordjack / jumpstream maps); 0 = no cap
+    rhythm_prior: float = 1.0        # weight of "how often real maps of this SR and tempo put a note on a tick of this divisor"
+    burst_rate: float = 1.0          # speed-ups (1/8, 1/16 runs) x how often real maps of the target SR have them
+    bar_follow: float = 0.7          # 0..1: note density follows the loudness of every bar (1) or only of the section (0)
+    silence_db: float = 26.0         # bars this far below the loud parts of the song are silence: no notes at all
     release_gap_ms: int = 40
     release_gap_beats: float = 0.25
     od: float = 8.0
@@ -195,6 +209,22 @@ class SongAnalysis:
     onset_peaks: Optional[np.ndarray] = None   # ms of sharp attacks (local maxima), shifted by peak_lag
     peak_lag: int = 0                          # how much later than the mapper's grid an attack peak comes (ms)
     flux: Optional[np.ndarray] = None          # [F] superflux onset strength (z, per song)
+    power: Optional[np.ndarray] = None         # [F] log power (natural log), absolute: silence / loudness per bar
+
+    def power_top(self) -> float:
+        """Log power of the loud parts of the song (95th percentile of the frames)."""
+        if self.power is None or self.power.size == 0:
+            return 0.0
+        if getattr(self, "_power_top", None) is None:
+            self._power_top = float(np.percentile(self.power, 95))
+        return self._power_top
+
+    def silent_frames(self, silence_db: float = 26.0) -> np.ndarray:
+        """[F] True where the audio is ``silence_db`` below the loud parts of the song. Measured on 9 songs: bars that
+        no human difficulty maps sit 26-36 dB below the song's loud parts, mapped bars at most ~28 dB below."""
+        if self.power is None:
+            return self.loud < 0.02
+        return self.power < self.power_top() - silence_db / (10.0 / math.log(10.0))
 
     def source_time(self, t: np.ndarray) -> np.ndarray:
         """Time of the same moment in the original of a repeated phrase (-1 where t is not in a repeat)."""
@@ -213,6 +243,36 @@ class SongAnalysis:
         for d in range(-radius, radius + 1, 2):
             out = np.maximum(out, env[np.clip(t + d, 0, M - 1)])
         return out
+
+
+def fade_out_start(an: "SongAnalysis", silence_db: float = 26.0, drop: float = 0.5, max_fade_s: float = 25.0) -> Optional[int]:
+    """Where the mapping of a song with a fade-out ends.
+
+    A fade-out is a monotonic fall of the loudness into silence at the end of the audio; reverb and cymbal noise in
+    it still look like attacks. Human maps stop when the fade has fallen ``drop`` (log power, ~2 dB) below its start
+    (Blackmagik Blazing: humans end at 262.6 s, this gives 262.5 s). None when the song does not end with a fade."""
+    if an.power is None or an.power.size < 300:
+        return None
+    H = an.frame_ms
+    step = max(1, 100 // H)
+    p = np.convolve(an.power, np.ones(100 // H) / (100 // H), mode="same")[::step]   # 1 s smoothing, 100 ms steps
+    top = an.power_top()
+    thr = top - silence_db / (10.0 / math.log(10.0))
+    loud = np.flatnonzero(p >= thr)
+    if loud.size == 0:
+        return None
+    e = int(loud[-1])
+    full = np.flatnonzero(p[:e + 1] >= top - 0.25)          # the last moment at full loudness before the silence
+    if full.size == 0:
+        return None
+    i = int(full[-1])
+    seg = p[i:e + 1]
+    if (e - i) * step * H > max_fade_s * 1000 or seg.size < 10 or p[i] - p[e] < 2.0:
+        return None
+    if float(np.mean(np.diff(seg) <= 0.02)) < 0.7:          # mostly falling: a fade, not a quiet mapped outro
+        return None
+    after = np.flatnonzero(p[i:e + 1] < p[i] - drop)
+    return int((i + int(after[0])) * step * H) if after.size else None
 
 
 def _reds(timing_points: Sequence[RawTimingPoint]) -> List[RawTimingPoint]:
@@ -333,6 +393,8 @@ def analyze_song(
                       ticks, tdiv, tmetric, tbeat, np.zeros(ticks.size), beats[beats < duration_ms], meter, tps)
     if onset is not None:
         an.flux = onset[:, -1].astype(np.float64)
+    if spec is not None:
+        an.power = spec[:, 0].astype(np.float64)
     raw = an.attack_at(ticks)
     an.tick_attack = _rank01(raw)
     med = float(np.median(attack))
@@ -396,44 +458,60 @@ def _beat_vectors(an: SongAnalysis) -> np.ndarray:
     return v
 
 
-def segment_sections(an: SongAnalysis, target_sec: float = 12.0, min_bars: int = 4, max_bars: int = 16) -> List[Section]:
+def segment_sections(an: SongAnalysis, target_sec: float = 8.0, min_bars: int = 2, max_bars: int = 16) -> List[Section]:
+    """Sections of the song at beat precision.
+
+    Novelty (how different the sound after a beat is from the sound before it, over 1 and 2 bars) is measured at
+    every beat, not only on bar lines: a drum entry or a drop one beat before the bar (pickup) starts its section
+    on that beat. Boundaries on a bar line get a small bonus (most changes are there), sections are at least
+    ``min_bars`` long; about one section per ``target_sec`` seconds plus every clearly stronger change."""
     beats, bar = an.beats, max(1, an.bar_beats)
     if beats.size < 2 * bar:
         return [Section(0, an.duration_ms)]
     V = _beat_vectors(an)
     nb = V.shape[0]
-    bar_idx = np.arange(0, nb, bar)
-    w = 2 * bar
     cs = np.vstack([np.zeros((1, V.shape[1])), np.cumsum(V, axis=0)])
-    nov = np.zeros(bar_idx.size)
-    for i, b in enumerate(bar_idx):
-        a0, a1, b1 = max(0, b - w), b, min(nb, b + w)
-        if a1 - a0 < bar or b1 - a1 < bar:
-            continue
-        left = (cs[a1] - cs[a0]) / (a1 - a0)
-        right = (cs[b1] - cs[a1]) / (b1 - a1)
-        nov[i] = np.linalg.norm(left - right)
+    nov = np.zeros(nb)
+    for w in (bar, 2 * bar):
+        for b in range(nb):
+            a0, a1, b1 = max(0, b - w), b, min(nb, b + w)
+            if a1 - a0 < max(2, w // 2) or b1 - a1 < max(2, w // 2):
+                continue
+            left = (cs[a1] - cs[a0]) / (a1 - a0)
+            right = (cs[b1] - cs[a1]) / (b1 - a1)
+            nov[b] += 0.5 * float(np.linalg.norm(left - right))
+    # where the change is: the beat of the biggest step inside +-1 beat (short windows of 2 beats)
+    step = np.zeros(nb)
+    for b in range(2, nb - 2):
+        step[b] = float(np.linalg.norm(V[b:b + 2].mean(axis=0) - V[b - 2:b].mean(axis=0)))
+    score = nov * (1.0 + 0.15 * (np.arange(nb) % bar == 0)) + 0.25 * step
     beat_ms = float(np.median(np.diff(beats)))
     n_target = max(1, int(round(an.duration_ms / 1000.0 / target_sec)))
+    min_gap = min_bars * bar
+    pos = score[score > 0]
+    strong = float(np.median(pos) + 2.0 * np.median(np.abs(pos - np.median(pos)))) if pos.size else np.inf
     chosen = [0]
-    for i in np.argsort(-nov):
-        if len(chosen) >= n_target or nov[i] <= 0:
+    for i in np.argsort(-score):
+        if score[i] <= 0:
             break
-        if all(abs(int(i) - c) >= min_bars for c in chosen):
+        if len(chosen) >= n_target and score[i] < strong:
+            break
+        if all(abs(int(i) - c) >= min_gap for c in chosen):
             chosen.append(int(i))
     chosen = sorted(chosen)
     bounds: List[int] = []
-    for k, c in enumerate(chosen):  # split sections longer than max_bars
-        nxt = chosen[k + 1] if k + 1 < len(chosen) else bar_idx.size
+    for k, c in enumerate(chosen):  # split sections longer than max_bars (on bar lines)
+        nxt = chosen[k + 1] if k + 1 < len(chosen) else nb
         bounds.append(c)
-        n_split = (nxt - c - 1) // max_bars
-        for s in range(1, n_split + 1):
-            bounds.append(c + s * (nxt - c) // (n_split + 1))
-    bounds = sorted(set(bounds))
+        n_split = (nxt - c - 1) // (max_bars * bar)
+        for q in range(1, n_split + 1):
+            x = c + q * (nxt - c) // (n_split + 1)
+            bounds.append(int(round(x / bar)) * bar)
+    bounds = sorted(set(b for b in bounds if 0 <= b < nb))
     out: List[Section] = []
     for k, bi in enumerate(bounds):
-        start = 0 if k == 0 else int(beats[bar_idx[bi]])
-        end = int(beats[bar_idx[bounds[k + 1]]]) if k + 1 < len(bounds) else an.duration_ms
+        start = 0 if k == 0 else int(beats[bi])
+        end = int(beats[bounds[k + 1]]) if k + 1 < len(bounds) else an.duration_ms
         if end - start >= beat_ms:
             out.append(Section(start, end))
     out[-1].end_ms = an.duration_ms
@@ -482,9 +560,12 @@ def _describe_sections(an: SongAnalysis, sections: List[Section], V: np.ndarray)
     flux = np.array(flux_m)
     raw = 0.5 * np.array([s.sustain for s in sections]) + 0.3 * np.array(loud_m) + 0.2 / (1.0 + np.exp(-flux))
     rel = raw / max(1e-6, raw.max())
+    silent = an.silent_frames()
     for s, v in zip(sections, rel):
         s.intensity = float(np.clip(v, 0.05, 1.0))
-        if s.loud < 0.08:  # near silence relative to the song: a break
+        f0, f1 = s.start_ms // H, max(s.start_ms // H + 1, s.end_ms // H)
+        # silence is absolute (26 dB below the loud parts): the quietest part of a song is not a break by itself
+        if float(silent[f0:f1].mean()) > 0.6:
             s.intensity = 0.0
     find_repeats(an, sections, V)
 
@@ -624,7 +705,8 @@ def _nested_sizes(u: np.ndarray, r: np.ndarray) -> np.ndarray:
     return out
 
 
-def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, gaps: np.ndarray) -> List[int]:
+def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, gaps: np.ndarray,
+                 taken0: Optional[np.ndarray] = None) -> List[int]:
     """Lazy greedy selection of ``budget`` candidates by score. A candidate close to already chosen notes is not
     forbidden, its score just drops the closer it gets (``gaps`` = comfortable gap per candidate); the budget alone sets
     the density, so the star rating changes smoothly with the level instead of jumping when the gap crosses the song's
@@ -634,7 +716,7 @@ def _greedy_pick(t: np.ndarray, idx: np.ndarray, sc: np.ndarray, budget: int, ga
     heap = [(-float(sc[q]), q) for q in range(idx.size)]
     heapq.heapify(heap)
     taken: List[int] = []
-    taken_t = np.empty(0, dtype=np.int64)
+    taken_t = np.sort(np.asarray(taken0, dtype=np.int64)) if taken0 is not None else np.empty(0, dtype=np.int64)
 
     def penalty(tk: int, g: float) -> float:
         if not taken_t.size:
@@ -686,13 +768,82 @@ def _gumbel(rng: np.random.Generator, n: int) -> np.ndarray:
 
 class Composer:
     def __init__(self, an: SongAnalysis, sections: List[Section], cfg: ComposerConfig, hints: Optional[NetHints] = None,
-                 log: Callable[[str], None] = print, patterns=None, target_sr: float = 4.0):
+                 log: Callable[[str], None] = print, patterns=None, target_sr: float = 4.0, motifs=None):
         self.an, self.sections, self.cfg, self.hints, self.log = an, sections, cfg, hints, log
         self.patterns = patterns          # learned PatternModel (patterns.py) or None
         self.chord_boost = 1.0            # > 1 when the density alone cannot reach the requested star rating
         self.repeat_scale = 1.0           # strength of the lane-repeat (jack / anchor) penalties, calibrated to the data
         self.target_sr = float(target_sr)
+        self.lane_motifs = None
+        # how real maps re-use an earlier passage whose rhythm comes back (LZ77 parse of 1606 maps): of the chords whose
+        # rhythm repeats an earlier passage ~15 % copy its lanes exactly, ~15 % mirrored, ~13 % with a few lanes changed
+        self.copy_probs = (0.15, 0.15, 0.13)
+        form = getattr(motifs, "form", None) if motifs is not None else None
+        if form is not None and float(form.chords.sum()) > 0:
+            b = int(np.clip(math.floor(self.target_sr), 0, form.covered.shape[0] - 1))
+            cov = form.covered[max(0, b - 1): b + 2].sum(axis=0)
+            if cov.sum() > 0 and cov.size >= 4:
+                self.copy_probs = tuple(float(x) for x in cov[:3] / cov.sum())
+        if motifs is not None and cfg.motif_weight > 0 and "lanes" in getattr(motifs, "tables", {}):
+            from .motifs import LanePredictor
+            self.lane_motifs = LanePredictor(motifs, self.target_sr)
         self._candidates()
+        self._bars()
+
+    # --- bars: loudness of every bar, silence ------------------------------------------------------
+    def _bars(self) -> None:
+        """Bar edges, the loudness of every bar relative to the loud parts of the song and silent bars.
+
+        Measured on 9 songs x all human difficulties: the human note density of a bar follows its log power with
+        exponent ~0.84 (density ~ power^0.84, Spearman 0.56 on average against 0.49 for the section intensity) - a
+        drum entry raises the density in the very bar it starts, not at the next section boundary."""
+        an, H = self.an, self.an.frame_ms
+        bb = max(1, an.bar_beats)
+        b = an.beats[::bb] if an.beats.size else np.zeros(0, np.int64)
+        edges = np.unique(np.concatenate([[0], b[b > 0], [an.duration_ms]])).astype(np.int64)
+        self.bar_edges = edges
+        nb = edges.size - 1
+        silent_f = an.silent_frames(self.cfg.silence_db)
+        lp = np.zeros(nb)
+        sil = np.zeros(nb, dtype=bool)
+        for i in range(nb):
+            f0, f1 = int(edges[i] // H), max(int(edges[i] // H) + 1, int(edges[i + 1] // H))
+            f1 = min(f1, an.num_frames)
+            if f0 >= f1:
+                sil[i] = True
+                continue
+            if an.power is not None:
+                lp[i] = float(an.power[f0:f1].mean())
+            sil[i] = float(silent_f[f0:f1].mean()) > 0.5
+        self.bar_silent = sil
+        top = an.power_top() if an.power is not None else 0.0
+        self.bar_rel = lp - top if an.power is not None else np.zeros(nb)
+        self.bar_of_t = np.clip(np.searchsorted(edges, self.t, side="right") - 1, 0, max(0, nb - 1))
+        # silent moments at 10 ms resolution: no candidate there at all (intros, outros, the end of the audio)
+        f = np.clip(self.t // H, 0, an.num_frames - 1)
+        self.t_silent = silent_f[f] & ~self.audible
+        self.fade_cut = fade_out_start(an, self.cfg.silence_db)
+        if self.fade_cut is not None:
+            self.t_silent |= self.t >= self.fade_cut
+            self.bar_silent |= self.bar_edges[:-1] >= self.fade_cut
+
+    def bar_shape(self) -> np.ndarray:
+        """Relative density of every bar (duration-weighted mean 1): the section's share (form, contrast, network)
+        refined by the bar's own loudness."""
+        sec = self.section_shape()
+        edges = self.bar_edges
+        mid = 0.5 * (edges[:-1] + edges[1:])
+        so = np.clip(np.searchsorted([x.start_ms for x in self.sections], mid, side="right") - 1, 0, len(self.sections) - 1)
+        base = sec[so]
+        w = float(np.clip(self.cfg.bar_follow, 0.0, 1.0)) if self.an.power is not None else 0.0
+        local = np.exp(0.84 * self.cfg.contrast * np.clip(self.bar_rel, -8.0, 1.0))
+        dur = np.maximum(1.0, np.diff(edges).astype(np.float64))
+        act = ~self.bar_silent
+        if act.any():
+            local = local / max(1e-6, (local[act] * dur[act]).sum() / dur[act].sum())
+        shape = np.where(base > 0, np.maximum(base, 1e-3) ** (1.0 - w) * np.maximum(local, 1e-3) ** w, 0.0)
+        shape[self.bar_silent] = 0.0
+        return shape / max(1e-6, (shape * dur).sum() / dur.sum())
 
     def jack_min(self, L: float) -> float:
         """Fastest normal lane repeat: the 1st percentile of real maps at the target star rating (dataset
@@ -878,22 +1029,46 @@ class Composer:
             base = base + cfg.net_rhythm * w_net * np.log(q / (1.0 - q))
         if self.patterns is not None:
             # how often real maps of this difficulty put a note on a tick of this divisor
-            use = self.patterns.tick_usage(self.target_sr)
+            from .patterns import main_bpm
+            use = self.patterns.tick_usage(self.target_sr, main_bpm(self.an.timing_points, self.an.duration_ms))
+            use = use.copy()
+            # the statistics count off-grid notes as one tick per beat; the song offers many off-grid candidates per beat
+            # (attack peaks between ticks): per candidate the probability is that much smaller
+            n_off = float((self.div == OFF_GRID).sum())
+            beats = max(1.0, float(self.an.beats.size))
+            use[6] = float(np.clip(use[6] / max(1.0, n_off / beats), 1e-4, 0.999))
             cls = DIV_TO_CLASS[np.clip(self.div, 0, 16)]
-            base = base + 0.45 * np.log(use[cls] / (1.0 - use[cls]))
+            base = base + cfg.rhythm_prior * np.log(use[cls] / (1.0 - use[cls]))
         base = base + 0.05 * self.cfg.creativity * rng.standard_normal(t.size)
         shape = self.section_shape()
+        if getattr(self, "bar_edges", None) is not None:
+            self._bar_shape_cache = self.bar_shape()
+            # a section's budget follows the bar-refined shape too (sections themselves are long and coarse)
+            dur_b = np.diff(self.bar_edges).astype(np.float64)
+            shape = shape.copy()
+            for si, sec_ in enumerate(self.sections):
+                ov = np.clip(np.minimum(self.bar_edges[1:], sec_.end_ms) - np.maximum(self.bar_edges[:-1], sec_.start_ms), 0, None)
+                if ov.sum() > 0 and shape[si] > 0:
+                    shape[si] = float((self._bar_shape_cache * ov).sum() / ov.sum())
         chosen = np.zeros(t.size, dtype=bool)
         sec_of = self.sec_of
         chosen_t: List[np.ndarray] = []  # times chosen so far (sections are processed in order)
         groups = []
         global_pick = self.hints is not None and cfg.net_shape * cfg.net_weight >= 0.5
+        cap_rate = None
+        if cfg.event_cap > 0 and self.patterns is not None and hasattr(self.patterns, "events_per_beat"):
+            from .patterns import main_bpm
+            bpm = main_bpm(self.an.timing_points, self.an.duration_ms)
+            if bpm is not None:
+                cap_rate = cfg.event_cap * self.patterns.events_per_beat(self.target_sr, bpm) * bpm / 60.0
         for si, s in enumerate(self.sections):
             idx = np.flatnonzero(sec_of == si)
             if idx.size == 0 or shape[si] <= 0:
                 continue
             fam_d = FAMILY_SHAPE[s.family][0]
             budget = int(round(s.dur_s * eps * shape[si] * fam_d))
+            if cap_rate is not None:
+                budget = min(budget, int(round(s.dur_s * cap_rate * shape[si])))
             # notes need something to hit: a section gets at most ~1.25x as many notes as it has audible attacks
             # (plus what the network is confident about); filler on silent ticks is what makes maps feel random
             audible = int((self.audible[idx] | (self.net[idx] >= 0.5)).sum())
@@ -905,9 +1080,13 @@ class Composer:
             div = self.div[idx]
             # binary vs triplet feel of the section; where the network is sure about a note of the other kind (a 1/12
             # fill in a straight section), it wins
-            other = np.isin(div, BINARY_FINE) if s.triplet else np.isin(div, list(TRIPLET))
-            sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
-            sc = sc - 0.8 * other * (1.0 - sure)
+            # measured on 9 songs (316 sections): the audio "triplet" flag matched the sections humans map in triplets
+            # 2 times out of 75 - by default no section-wide feel, the tempo-aware statistics of real maps decide
+            if cfg.triplet_feel != "off":
+                trip = s.triplet and cfg.triplet_feel == "audio"
+                other = np.isin(div, BINARY_FINE) if trip else np.isin(div, list(TRIPLET))
+                sure = np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net) if self.hints is not None else 0.0
+                sc = sc - 0.8 * other * (1.0 - sure)
             if cfg.repeat_memory and chosen_t and self.an.repeats:
                 # remember the rhythm of the earlier occurrence of a repeated phrase
                 src = np.sort(np.concatenate(chosen_t))
@@ -923,7 +1102,32 @@ class Composer:
                 gv = gv * (1.0 - 0.8 * np.clip(self.net[idx], 0.0, 1.0) * min(1.0, w_net))
             groups.append((idx, sc, budget, gv))
             if not global_pick:
-                taken = _greedy_pick(t, idx, sc, budget, gv)
+                if getattr(self, "bar_edges", None) is not None and cfg.bar_follow > 0:
+                    # the section's budget is shared out over its bars by their loudness: the density changes in the
+                    # bar where the music changes (a drum entry), not at the next section boundary
+                    bars = self.bar_of_t[idx]
+                    bshape = self._bar_shape_cache
+                    ub = np.unique(bars)
+                    wb = np.array([bshape[b] * float(min(self.bar_edges[b + 1], s.end_ms) - max(self.bar_edges[b], s.start_ms))
+                                   for b in ub])
+                    want = budget * wb / max(1e-9, wb.sum())
+                    carry = 0.0
+                    prev_t = np.concatenate(chosen_t) if chosen_t else np.empty(0, np.int64)
+                    taken_all: List[int] = []
+                    for b, nb_want in zip(ub, want):
+                        sel = bars == b
+                        nb_i = int(math.floor(nb_want + carry + 0.5))
+                        carry += nb_want - nb_i
+                        aud = int((self.audible[idx[sel]] | (self.net[idx[sel]] >= 0.5)).sum())
+                        nb_i = min(nb_i, int(round(aud * (1.25 + 0.5 * cfg.creativity))) + 1)
+                        if nb_i <= 0:
+                            continue
+                        near = np.concatenate([prev_t[-8:], t[taken_all[-8:]]]) if taken_all or prev_t.size else None
+                        tk = _greedy_pick(t, idx[sel], sc[sel], nb_i, gv[sel], near)
+                        taken_all += tk
+                    taken = taken_all
+                else:
+                    taken = _greedy_pick(t, idx, sc, budget, gv)
                 chosen[taken] = True
                 chosen_t.append(t[taken])
         if global_pick and groups:
@@ -946,7 +1150,14 @@ class Composer:
         ev = ev[keep]
         if cfg.repeat_memory and self.an.repeats:
             ev = self._copy_repeats(ev)
-        return ev, base
+        return self._drop_silent(ev), base
+
+    def _drop_silent(self, ev: np.ndarray) -> np.ndarray:
+        """No note in silence: silent bars (intro / outro / after the music ends) and silent moments without an attack."""
+        if getattr(self, "bar_silent", None) is None or ev.size == 0:
+            return ev
+        bad = self.bar_silent[self.bar_of_t[ev]] | self.t_silent[ev]
+        return ev[~bad]
 
     def _copy_repeats(self, ev: np.ndarray) -> np.ndarray:
         """A repeated phrase gets the rhythm of its original (copy-paste, as mappers do); phrases are processed in
@@ -981,7 +1192,9 @@ class Composer:
         if floor is None:
             floor = max(38.0, _level_params(min(1.6, L + 0.35))[1])
         floor = max(25.0, floor * (1.0 - 0.4 * self.cfg.creativity))
-        often = 1.0 + 3.0 * self.cfg.creativity
+        often = self.cfg.burst_rate * (1.0 + 3.0 * self.cfg.creativity)
+        if often <= 0:
+            return ev
         te = t[ev]
         gaps = np.diff(te)
         added: List[int] = []
@@ -1121,6 +1334,7 @@ class Composer:
         masks_out = np.zeros(n, dtype=np.int64)
         sec = self.sec_of[ev]
         mask_at: Dict[int, int] = {}  # time -> chord mask of everything placed so far
+        idx_at: Dict[int, int] = {}   # time -> event index
         src_of = self.an.source_time(t_all)  # original moment of repeated phrases (-1 = not a repeat)
         net_ll = self.hints.lane_logits if (self.hints is not None and self.hints.lane_logits is not None) else None
         H = an.frame_ms
@@ -1134,6 +1348,23 @@ class Composer:
                 p_lo[si], p_hi[si] = float(np.percentile(pp, 10)), float(np.percentile(pp, 90))
         ln_quota: Dict[int, float] = {}
         ln_seen: Dict[int, int] = {}
+        # phrase copies: windows of W chords with the same rhythm (gaps in beats) and chord sizes as an earlier window
+        W = max(3, int(cfg.copy_window))
+        copy_on = cfg.phrase_copies > 0 and n > 2 * W
+        if copy_on:
+            from .motifs import beat_positions, rhythm_class
+            bpos, bl_ev, _ = beat_positions(t_all, an.timing_points)
+            rcls = rhythm_class(np.diff(bpos, prepend=bpos[0] - 100.0), bl_ev)
+            key = rcls * 8 + np.asarray(sizes, dtype=np.int64)
+            key[0] = -1
+            win_hash = {}
+            starts_by_hash: Dict[Tuple[int, ...], List[int]] = {}
+            for q in range(n - W + 1):
+                hk = tuple(int(x) for x in key[q + 1:q + W]) + tuple(int(x) for x in sizes[q:q + W])
+                win_hash[q] = hk
+        copy_src, copy_kind, copy_left = -1, "", 0
+        ev_ln: Dict[int, Dict[int, int]] = {}   # event -> {lane: hold length} of the long notes it started
+        p_exact, p_mirror, p_var = (min(0.95, x * cfg.phrase_copies) for x in self.copy_probs)
 
         for i in range(n):
             t = int(t_all[i])
@@ -1166,13 +1397,44 @@ class Composer:
             # memory of the repeated section: same relative position -> same (or mirrored) chord
             remembered = None
             rel = int(src_of[i])
+            remembered_from = -1
             if rel >= 0 and cfg.repeat_memory:
                 for d in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5):
                     if rel + d in mask_at:
                         remembered = mask_at[rel + d]
+                        remembered_from = idx_at.get(rel + d, -1)
                         if s.mirror:
                             remembered = int(sum(1 << (3 - c) for c in LANES_OF[remembered]))
                         break
+            # phrase copies: the rhythm of the next W chords repeats a recent passage -> re-use (or mirror, or vary) its lanes
+            copied = None
+            copy_from = -1
+            if copy_on:
+                if copy_left <= 0 and i in win_hash:
+                    hk = win_hash[i]
+                    srcs = [j for j in starts_by_hash.get(hk, []) if j + W <= i and t_all[i] - t_all[j] <= 64 * float(bl_ev[i])]
+                    best_j, best_L = -1, 0
+                    for j in srcs[-6:]:
+                        L = W
+                        while i + L < n and j + L < i and key[i + L] == key[j + L] and sizes[i + L] == sizes[j + L]:
+                            L += 1
+                        if L > best_L:
+                            best_j, best_L = j, L
+                    if best_L >= max(W, cfg.copy_min) and remembered is None:
+                        u = rng.random()
+                        kind = "exact" if u < p_exact else ("mirror" if u < p_exact + p_mirror else ("variation" if u < p_exact + p_mirror + p_var else ""))
+                        if kind:
+                            copy_src, copy_kind, copy_left = best_j, kind, best_L
+                if i - W + 1 >= 0 and (i - W + 1) in win_hash:
+                    starts_by_hash.setdefault(win_hash[i - W + 1], []).append(i - W + 1)
+                if copy_left > 0:
+                    copy_from = copy_src
+                    src_m = int(masks_out[copy_src])
+                    copied = int(MIRROR_OF[src_m]) if copy_kind == "mirror" else src_m
+                    if copy_kind == "variation" and rng.random() < 0.35:
+                        copied = None
+                    copy_src += 1
+                    copy_left -= 1
             same_sound = bool(i > 0 and float(timbre[i] @ timbre[i - 1]) > 0.93 and abs(pitch[i] - pitch[i - 1]) < 0.5)
             prior = None
             if net_ll is not None:
@@ -1188,6 +1450,12 @@ class Composer:
             noise = _gumbel(rng, len(cands)) * (0.1 + 0.6 * cfg.creativity) * 0.6
             learned = self.patterns.lane_logprob(self.target_sr, dt, prev, prev2, max(1, k)) if self.patterns is not None else None
             fam_w = 0.5 if learned is not None else 1.0
+            motif_lp = None
+            if self.lane_motifs is not None:
+                lp_all = self.lane_motifs.logprob(hist[-6:])
+                sub = lp_all[cands]
+                motif_lp = dict(zip(cands, sub - (np.max(sub) + np.log(np.exp(sub - np.max(sub)).sum()))))
+                fam_w *= 0.5   # the library knows the figures of real maps: the hand-written families matter less
             for ci, m in enumerate(cands):
                 lanes = LANES_OF[m]
                 v = 0.0
@@ -1256,9 +1524,13 @@ class Composer:
                         v += 0.3 * (dp == dc and dp != 0)
                 v = v_before_family + fam_w * (v - v_before_family)
                 if learned is not None:
-                    v += 1.5 * float(learned[m])  # what real maps of this difficulty do after these chords
+                    v += (0.75 if motif_lp is not None else 1.5) * float(learned[m])  # what real maps do after these chords
+                if motif_lp is not None:
+                    v += cfg.motif_weight * float(motif_lp[m])  # how real maps continue the last up to 6 chords
+                if copied is not None and m == copied:
+                    v += cfg.copy_bonus
                 if remembered is not None and m == remembered:
-                    v += 4.0
+                    v += cfg.copy_bonus
                 if prior is not None:
                     v += 0.5 * cfg.net_weight * float(prior[m])
                 v += noise[ci]
@@ -1277,22 +1549,41 @@ class Composer:
                     hold_note[c] = None
             masks_out[i] = m
             mask_at[t] = m
+            idx_at[t] = i
             # long notes
             quota = ln_target[si]
             ln_seen[si] = ln_seen.get(si, 0) + 1
             planned_lanes: set = set()
+            ln_len_over: Dict[int, int] = {}
             if ln_plan is not None and ln_plan[0][i] > 0:
                 lanes_m = list(LANES_OF[m])
                 rng.shuffle(lanes_m)
                 planned_lanes = set(lanes_m[: int(ln_plan[0][i])])
+            ln_src, flip = -1, False
+            if copied is not None and m == copied and copy_from >= 0:
+                ln_src, flip = copy_from, copy_kind == "mirror"
+            elif remembered is not None and m == remembered and remembered_from >= 0:
+                ln_src, flip = remembered_from, bool(s.mirror)
+            if ln_src >= 0 and ln_plan is not None:
+                # a copied passage copies its long notes too: same (or mirrored) lanes, same length in beats
+                src_ln = ev_ln.get(ln_src, {})
+                bl_i = float(an.tick_beat[min(an.tick_beat.size - 1, int(np.searchsorted(an.ticks, t)))]) if an.tick_beat.size else 1.0
+                bl_s = float(an.tick_beat[min(an.tick_beat.size - 1, int(np.searchsorted(an.ticks, t_all[ln_src])))]) if an.tick_beat.size else 1.0
+                planned_lanes = set()
+                for c0, length0 in src_ln.items():
+                    c1 = 3 - c0 if flip else c0
+                    if (m >> c1) & 1:
+                        planned_lanes.add(c1)
+                        ln_len_over[c1] = int(round(length0 * bl_i / max(1.0, bl_s)))
             for c in LANES_OF[m]:
                 make_ln = False
                 if ln_plan is not None:
                     if c in planned_lanes:
-                        length = int(ln_plan[1][i])
+                        length = int(ln_len_over.get(c, ln_plan[1][i]))
                         if span_limit is not None and i + span_limit + 1 < n:
                             length = min(length, int(t_all[i + span_limit + 1] - t) - gap_fn(int(t_all[i + span_limit + 1])))
                         if length >= 40:
+                            ev_ln.setdefault(i, {})[c] = length
                             notes.append(Note(t, c, t + length, True))
                             hold_note[c] = len(notes) - 1
                             busy_until[c] = t + length
@@ -1308,6 +1599,7 @@ class Composer:
                         # hold over at most as many chords as real maps of this SR usually do
                         length = min(length, int(t_all[i + span_limit + 1] - t) - gap_fn(int(t_all[i + span_limit + 1])))
                     if length >= 60:
+                        ev_ln.setdefault(i, {})[c] = length
                         notes.append(Note(t, c, t + length, True))
                         hold_note[c] = len(notes) - 1
                         busy_until[c] = t + length
@@ -1493,7 +1785,18 @@ class Composer:
             ev = np.unique(np.concatenate([ev, burst]))
             if self.cfg.repeat_memory and self.an.repeats:
                 ev = self._copy_repeats(ev)  # speed-ups of the original are repeated too
+            ev = self._drop_silent(ev)
         sizes = self.chord_sizes(ev, L, rng)
+        if self.cfg.repeat_memory and self.an.repeats and ev.size:
+            # a repeated phrase repeats its chord sizes too (in time order, so a repeat of a repeat follows the copy)
+            te = self.t[ev]
+            src = self.an.source_time(te)
+            for i in np.flatnonzero(src >= 0):
+                j = int(np.searchsorted(te, src[i]))
+                for jj in (j - 1, j):
+                    if 0 <= jj < i and abs(int(te[jj]) - int(src[i])) <= 6:
+                        sizes[i] = sizes[jj]
+                        break
         if burst.size:
             sizes[np.isin(ev, burst)] = 1   # speed-ups are single-note runs (a stair at double tempo)
             nb = np.isin(ev, burst)
@@ -1569,11 +1872,12 @@ def compose(
     sections: Optional[List[Section]] = None,
     log: Callable[[str], None] = print,
     patterns=None,
+    motifs=None,
 ) -> ComposeResult:
     """Composes the best of ``cfg.variants`` maps whose star rating matches ``target_sr``."""
     cfg = cfg or ComposerConfig()
     secs = sections if sections is not None else segment_sections(an)
-    comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr)
+    comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr, motifs=motifs)
     # how often real maps (or the chosen style) repeat a lane within 150 ms at this star rating
     jack_target = patterns.fast_repeat_share(target_sr) if (patterns is not None and hasattr(patterns, "fast_repeat_share")) else None
     best: Optional[ComposeResult] = None

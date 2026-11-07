@@ -65,6 +65,34 @@ LN_STYLE_NAMES = ("rice", "light", "hybrid", "ln", "full")
 LN_STYLE_SHARE = (0.02, 0.10, 0.22, 0.38, 0.55)            # typical LN share of each style (for presets)
 BEAT_GAP_EDGES = np.array([0.13, 0.2, 0.3, 0.4, 0.6, 0.9, 1.4, 2.5])  # gaps in beats: 1/8 .. 2+ beats
 N_BGAP = BEAT_GAP_EDGES.size + 1
+# tempo bins of the BPM-aware rhythm statistics: measured on 1606 maps, the divisor a mapper uses depends on the tempo as
+# much as on the star rating (4*: 1/8 is 35 % of the gaps below 100 BPM, 2 % at 190-220 BPM)
+BPM_EDGES = np.array([100, 130, 160, 190, 220, 260], dtype=np.float64)
+N_BPM = BPM_EDGES.size + 1
+
+
+def main_bpm(timing_points: Sequence[RawTimingPoint], end_ms: Optional[float] = None) -> Optional[float]:
+    """Tempo that lasts longest (folded into 80-320 BPM), None without red lines."""
+    reds = sorted((tp for tp in timing_points if tp.uninherited and 1.0 < tp.beat_len < 10_000.0), key=lambda r: r.time)
+    if not reds:
+        return None
+    end = float(end_ms) if end_ms is not None else reds[-1].time + 60_000.0
+    dur: Dict[float, float] = {}
+    for a, b in zip(reds, reds[1:] + [None]):
+        d = max(0.0, (b.time if b is not None else max(end, a.time)) - a.time)
+        dur[round(a.beat_len, 2)] = dur.get(round(a.beat_len, 2), 0.0) + d
+    bpm = 60000.0 / max(dur, key=dur.get)
+    while bpm < 80:
+        bpm *= 2
+    while bpm > 320:
+        bpm /= 2
+    return bpm
+
+
+def bpm_bin(bpm: float) -> int:
+    return int(np.searchsorted(BPM_EDGES, float(bpm)))
+
+
 LN_LEN_BEATS = np.array([0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
 N_LN_LEN = LN_LEN_BEATS.size
 
@@ -145,6 +173,8 @@ class PatternModel:
     hand_runs: Optional[np.ndarray] = None   # [SR, HAND_RUN_BINS] one-hand runs of fast chords by length
     lane_bi: Optional[np.ndarray] = None     # [SR, GAP_IN, GAP_OUT, prev, next, mask] two-sided lane context
     lane_bi2: Optional[np.ndarray] = None    # [SR, prev2, prev, next, mask]
+    rhythm_hits_bpm: Optional[np.ndarray] = None   # [SR, BPM, DIV] notes on ticks of each divisor class, per tempo bin
+    rhythm_beats_bpm: Optional[np.ndarray] = None  # [SR, BPM] beats covered
     ln_release: Optional[np.ndarray] = None  # [SR, STYLE, 3] LN releases: on another chord's start / on a free tick / off grid  # [SR, 3] least squares of log section density vs log audio intensity: sum xy, sum xx, n
     version: str = PATTERN_VERSION
 
@@ -200,6 +230,7 @@ class PatternModel:
             span = float(times[-1] - times[0])
             beat = float(np.median([r.beat_len for r in reds]))
             self.rhythm_beats[s] += span / max(1.0, beat)
+        self.add_rhythm_bpm(times, cls, timing_points, s)
         # how fast real maps of this difficulty go at all (bursts of 1/8, 1/12, 1/16)
         if self.event_gap is None:
             self.event_gap = np.zeros((SR_BINS, REPEAT_BINS), np.float64)
@@ -244,6 +275,17 @@ class PatternModel:
         np.add.at(self.ln, (s, gnb, 1), n_ln)
         np.add.at(self.ln, (s, gnb, 0), POP[masks] - n_ln)
         self._add_ln_style(notes, times, masks, lns, reds, cls, s)
+
+    def add_rhythm_bpm(self, times: np.ndarray, cls: np.ndarray, timing_points: Sequence[RawTimingPoint], s: int) -> None:
+        bpm = main_bpm(timing_points, float(times[-1])) if times.size else None
+        if bpm is None:
+            return
+        if self.rhythm_hits_bpm is None:
+            self.rhythm_hits_bpm = np.zeros((SR_BINS, N_BPM, N_DIV), np.float64)
+            self.rhythm_beats_bpm = np.zeros((SR_BINS, N_BPM), np.float64)
+        b = bpm_bin(bpm)
+        np.add.at(self.rhythm_hits_bpm[s, b], cls, 1.0)
+        self.rhythm_beats_bpm[s, b] += float(times[-1] - times[0]) * bpm / 60000.0
 
     def _ensure_ln(self) -> None:
         if self.ln_ctx is None:
@@ -541,13 +583,26 @@ class PatternModel:
             p += wt * c / c.sum()
         return p / p.sum()
 
-    def tick_usage(self, sr: float) -> np.ndarray:
-        """P(a tick of each divisor class carries a note) at this star rating."""
+    def tick_usage(self, sr: float, bpm: Optional[float] = None) -> np.ndarray:
+        """P(a tick of each divisor class carries a note) at this star rating (and tempo, when the model has the
+        BPM-aware table: the tempo bin is mixed in by how many beats of real maps it has)."""
         u = np.zeros(N_DIV)
         for b, wt in self._sr_weights(sr):
             beats = max(1.0, self.rhythm_beats[b])
-            u += wt * np.clip(self.rhythm_hits[b] / (beats * DIV_TICKS_PER_BEAT), 1e-4, 0.999)
+            g = np.clip(self.rhythm_hits[b] / (beats * DIV_TICKS_PER_BEAT), 1e-4, 0.999)
+            if bpm is not None and self.rhythm_hits_bpm is not None:
+                k = bpm_bin(bpm)
+                bb = float(self.rhythm_beats_bpm[b, k])
+                if bb > 0:
+                    t = np.clip(self.rhythm_hits_bpm[b, k] / (bb * DIV_TICKS_PER_BEAT), 1e-4, 0.999)
+                    w = bb / (bb + 3000.0)
+                    g = np.exp(w * np.log(t) + (1.0 - w) * np.log(g))
+            u += wt * g
         return u
+
+    def events_per_beat(self, sr: float, bpm: Optional[float] = None) -> float:
+        """Average chords per beat of real maps at this star rating (and tempo)."""
+        return float((self.tick_usage(sr, bpm) * DIV_TICKS_PER_BEAT).sum())
 
     def repeat_floor(self, sr: float, quantile: float = 0.01, after_ln: bool = False) -> Optional[float]:
         """Lane-repeat gap (ms) that only ``quantile`` of the repeats in real maps of this difficulty are faster than."""
@@ -745,7 +800,8 @@ class PatternModel:
 
 
 OPTIONAL_ARRAYS = ("hand_runs", "lane_bi", "lane_bi2", "repeat_gap", "ln_span", "density_cv", "intensity_fit", "event_gap",
-                   "ln_ctx", "ln_members", "ln_len", "ln_style_maps", "ln_span_style", "ln_release")
+                   "ln_ctx", "ln_members", "ln_len", "ln_style_maps", "ln_span_style", "ln_release",
+                   "rhythm_hits_bpm", "rhythm_beats_bpm")
 
 
 def default_pattern_path() -> Path:
@@ -754,6 +810,10 @@ def default_pattern_path() -> Path:
 
 def load_default(path: Optional[str] = None, log=print) -> Optional[PatternModel]:
     p = Path(path) if path else default_pattern_path()
+    if not path and not p.exists():  # the model shipped with the repository
+        q = Path(__file__).resolve().parents[2] / "test_NN" / "patterns.npz"
+        if q.exists() and q.stat().st_size > 1024:
+            p = q
     if not p.exists():
         if path:
             raise FileNotFoundError(f"pattern model '{p}' not found (python learn_patterns.py --data dataset_hybrid)")
