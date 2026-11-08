@@ -921,3 +921,17 @@ class TestRateAugmentation(unittest.TestCase):
         self.assertAlmostEqual(float(plain), float(same), places=5)
         skew, _ = compute_losses(out, dict(batch, loss_weight=torch.tensor([[1.0], [3.0]])), LossWeights(), 10)
         self.assertNotAlmostEqual(float(plain), float(skew), places=4)
+
+
+class TestSRCalibration(unittest.TestCase):
+    def test_inverse_of_the_measured_curve(self):
+        from osu_mapper.hybrid.inference import calibrated_request
+
+        curve = {"requests": [2, 3, 4, 5, 6, 7, 8], "achieved": [2.61, 3.72, 4.36, 4.78, 5.03, 5.13, 5.15]}
+        ask, sat = calibrated_request(4.36, curve)
+        self.assertAlmostEqual(ask, 4.0, places=6)
+        ask, sat = calibrated_request(3.0, curve)                 # the raw maps overshoot at low requests: ask lower
+        self.assertTrue(2.0 < ask < 3.0 and not sat)
+        ask, sat = calibrated_request(7.0, curve)                 # saturated network: largest request, flagged
+        self.assertEqual((ask, sat), (8.0, True))
+        self.assertEqual(calibrated_request(5.0, None), (5.0, False))

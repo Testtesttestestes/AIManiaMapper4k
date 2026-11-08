@@ -56,6 +56,9 @@ def main() -> None:
     ap.add_argument("--cache", default="eval_cache")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--write_calibration", default=None, metavar="JSON",
+                    help="save the requested -> achieved curve of the raw maps; generate_hybrid.py --sr_calibration JSON "
+                         "then asks the network for the rating at which it really gives the requested one")
     args = ap.parse_args()
 
     from osu_mapper.hybrid.inference import HybridPredictor, star_rating_of
@@ -99,6 +102,11 @@ def main() -> None:
               f"{np.mean([x['ceiling'] < req - 0.2 for x in r]):.0%}")
     if args.out:
         Path(args.out).write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    if args.write_calibration:
+        curve = {"checkpoint": str(ckpt), "requests": reqs,
+                 "achieved": [float(np.mean([x["raw"] for x in rows if x["request"] == r])) for r in reqs]}
+        Path(args.write_calibration).write_text(json.dumps(curve, indent=1), encoding="utf-8")
+        print(f"[diagnose] calibration -> {args.write_calibration}")
 
 
 if __name__ == "__main__":

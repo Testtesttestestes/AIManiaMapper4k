@@ -135,7 +135,8 @@ class HybridPredictor:
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
         pred.sr_range = ckpt.get("sr_range")
         pred.disabled_reps = tuple(disable_reps)
-        pred.threshold_by_sr = {int(k): float(v) for k, v in (ckpt.get("decode_threshold_by_sr") or {}).items()}  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
+        pred.threshold_by_sr = {int(k): float(v) for k, v in (ckpt.get("decode_threshold_by_sr") or {}).items()}
+        pred.sr_calibration = ckpt.get("sr_calibration")  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
         return pred
 
     @torch.no_grad()
@@ -298,3 +299,21 @@ def star_rating_of(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint
 def estimated_timing_points(reps: Dict[str, np.ndarray], frame_ms: int) -> List[RawTimingPoint]:
     bpm, offset = estimate_tempo(reps, frame_ms)
     return [RawTimingPoint(time=float(offset), beat_len=60000.0 / bpm, meter=4, volume=70, uninherited=True)]
+
+
+def calibrated_request(target: float, curve: Optional[Dict[str, list]]) -> Tuple[float, bool]:
+    """The star rating to ask the network for so that its raw map has ``target`` stars, from a measured
+    requested -> achieved curve (sr_diagnose.py --write_calibration). Returns (request, saturated): saturated when
+    the target is above everything the network reached (then the largest measured request)."""
+    if not curve or len(curve.get("requests", [])) < 2:
+        return float(target), False
+    req = np.asarray(curve["requests"], dtype=np.float64)
+    ach = np.maximum.accumulate(np.asarray(curve["achieved"], dtype=np.float64))   # monotone
+    o = np.argsort(req)
+    req, ach = req[o], ach[o]
+    if target >= ach[-1] - 1e-6:
+        return float(req[-1]), bool(target > ach[-1] + 0.05)
+    if target <= ach[0]:
+        return float(max(0.5, req[0] - (ach[0] - target))), False
+    keep = np.concatenate([[True], np.diff(ach) > 1e-6])
+    return float(np.interp(target, ach[keep], req[keep])), False
