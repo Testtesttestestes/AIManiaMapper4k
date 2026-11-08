@@ -42,6 +42,7 @@ class LossWeights:
     jack: float = 0.0      # fast transitions (< 160 ms): P(the chosen lane code hits a lane of the previous chord) vs the map
     ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
     patterns: float = 0.0  # pattern knowledge: rhythm / shape / hand / flow / copy of every event (needs the pattern heads)
+    error: float = 0.0     # break and fix: which visible canvas frames are wrong (needs the error head)
     prior: float = 0.0     # motif library: lane distribution of real maps after the last 6 chords (distillation)
 
     def to_dict(self) -> Dict[str, float]:
@@ -102,7 +103,12 @@ def compute_losses(
 
     bidx = torch.arange(B, device=tc.device).view(B, 1).expand(B, T)
     # masked diffusion: frames given on the canvas are not predicted (time, lanes, members count only masked frames)
-    valid_pred = valid * (batch["canvas_state"] == 0).float() if "canvas_state" in batch else valid
+    if "canvas_train" in batch:      # masked frames, or every frame of a "break and fix" crop
+        valid_pred = valid * batch["canvas_train"].float()
+    elif "canvas_state" in batch:
+        valid_pred = valid * (batch["canvas_state"] == 0).float()
+    else:
+        valid_pred = valid
     logs: Dict[str, float] = {}
 
     # --- time (per-ms) -------------------------------------------------------------------------
@@ -228,6 +234,22 @@ def compute_losses(
             loss_ladder = out["importance"].float().sum() * 0.0 + out["ladder_c"].sum() * 0.0
         total = total + weights.ladder * loss_ladder
         logs["ladder"] = float(loss_ladder.detach())
+
+    # --- break and fix: the critic -------------------------------------------------------------
+    # every visible canvas frame: is it what the map has there? (correct maps too: "nothing to fix" teaches stopping)
+    if weights.error > 0 and "error_logits" in out and "canvas_wrong" in batch:
+        vis = (batch["canvas_state"] != 0).float() * valid
+        if vis.sum() > 0:
+            y = batch["canvas_wrong"].float()
+            pos = (y * vis).sum().clamp(min=1.0)
+            neg = ((1 - y) * vis).sum().clamp(min=1.0)
+            wts = vis * (y * (0.5 / pos) + (1 - y) * (0.5 / neg)) * vis.sum()   # wrong and right frames weigh the same
+            bce = F.binary_cross_entropy_with_logits(out["error_logits"].float(), y, reduction="none")
+            loss_err = (bce * wts).sum() / wts.sum().clamp(min=1e-8)
+        else:
+            loss_err = out["error_logits"].float().sum() * 0.0
+        total = total + weights.error * loss_err
+        logs["error"] = float(loss_err.detach())
 
     # --- pattern knowledge (motif_targets.py) ----------------------------------------------------
     if weights.patterns > 0 and "pattern_logits" in out and "pat_shape" in batch:

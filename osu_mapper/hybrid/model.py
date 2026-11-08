@@ -59,6 +59,7 @@ class HybridModelConfig:
     event_prior: float = 0.03
     canvas: bool = False              # masked discrete diffusion: a partially known map of the window as input (canvas.py)
     importance_head: bool = False     # difficulty ladder: per-frame importance + monotone threshold per star rating
+    error_head: bool = False          # break and fix: P(a visible canvas frame is wrong) - the self-correction critic
     pattern_heads: bool = False       # pattern knowledge: rhythm / shape / hand / flow / copy heads (motif_targets.py)
 
     def to_dict(self) -> Dict[str, object]:
@@ -238,6 +239,8 @@ class HybridParamNet(nn.Module):
         self.ln_bucket_head = nn.Linear(d, M * cfg.n_ln_buckets)
         self.ln_resid_head = nn.Linear(d, M)
         self.style_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.style_dim))
+        if cfg.error_head:
+            self.error_head = nn.Linear(d, 1)
         if cfg.pattern_heads:
             from .motif_targets import PATTERN_HEADS
             self.pattern_head = nn.Linear(d, sum(PATTERN_HEADS.values()))
@@ -349,6 +352,8 @@ class HybridParamNet(nn.Module):
             extra = {"importance": self.importance_head(u).squeeze(-1), "ladder_c0": self.ladder_c0, "ladder_c": self.ladder_c}
         if cfg.pattern_heads:
             extra["pattern_logits"] = self.pattern_head(u)
+        if cfg.error_head:
+            extra["error_logits"] = self.error_head(u).squeeze(-1)
         return {
             **extra,
             "time_logits": self.time_head(u),

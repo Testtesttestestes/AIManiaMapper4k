@@ -191,6 +191,10 @@ def main(argv=None) -> None:
                          "this star rating' (learnt from songs with several difficulties) in the event probability; 0 = off")
     ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
+    ap.add_argument("--correct_steps", type=int, default=3,
+                    help="self-correction after the map is made (model trained with --corrupt_prob): the error head marks "
+                         "wrong-looking frames, they are predicted again, a correction is kept only if the critic finds the map "
+                         "less wrong; 0 = off")
     ap.add_argument("--sr_calibration", default=None, metavar="JSON",
                     help="requested -> achieved curve of this checkpoint (sr_diagnose.py --write_calibration): the network "
                          "is asked for the rating at which its own map really has the requested stars (default: the curve "
@@ -377,6 +381,15 @@ def main(argv=None) -> None:
                             steps=args.refine_steps, log=print, first=out)
                     else:
                         fit = fit_network_map(out, k_th, timing, target, args.od, log=print, **fit_kw)
+                    if args.correct_steps > 0 and getattr(predictor.model.cfg, "error_head", False):
+                        from osu_mapper.hybrid.canvas import correct
+                        g_ = guidance
+                        out, fit = correct(
+                            lambda cv: predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv),
+                            lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
+                            out, fit, out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
+                            steps=args.correct_steps, log=print)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")

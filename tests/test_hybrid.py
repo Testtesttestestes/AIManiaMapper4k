@@ -935,3 +935,81 @@ class TestSRCalibration(unittest.TestCase):
         ask, sat = calibrated_request(7.0, curve)                 # saturated network: largest request, flagged
         self.assertEqual((ask, sat), (8.0, True))
         self.assertEqual(calibrated_request(5.0, None), (5.0, False))
+
+
+class TestBreakAndFix(unittest.TestCase):
+    """Break-and-fix canvas crops, the error head and self-correction (canvas.corrupt_canvas / correct)."""
+
+    def test_corruption_marks_exactly_the_changed_frames(self):
+        from osu_mapper.hybrid.canvas import EMPTY, canvas_from_targets, corrupt_canvas
+
+        track = solve_map(random_map(random.Random(2), 80))
+        tgt = track.crop_arrays(0, 1024)
+        st, ms, ln = canvas_from_targets(tgt, np.ones(1024, bool))
+        rng = np.random.default_rng(0)
+        st2, ms2, ln2, wrong = corrupt_canvas(st, ms, ln, rng, strength=1.0)
+        self.assertTrue(wrong.any())
+        changed = (st2 != st) | ((st2 >= 2) & ((ms2 != ms) | np.any(ln2 != ln, axis=1)))
+        np.testing.assert_array_equal(changed, wrong)
+        same, _, _, w0 = corrupt_canvas(st, ms, ln, rng, strength=0.0)
+        self.assertFalse(w0.any())
+        np.testing.assert_array_equal(same, st)
+        self.assertTrue(((st2 == EMPTY) | (st2 >= 2)).all())
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_error_loss_trains_the_error_head(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.canvas import canvas_from_targets, corrupt_canvas
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        track = solve_map(random_map(random.Random(3), 60))
+        tgt = track.crop_arrays(0, 256)
+        st, ms, ln = canvas_from_targets(tgt, np.ones(256, bool))
+        st, ms, ln, wrong = corrupt_canvas(st, ms, ln, np.random.default_rng(1), strength=1.0)
+        batch = {k: torch.from_numpy(v[None]) for k, v in tgt.items()}
+        batch.update(valid=torch.ones(1, 256), style=torch.zeros(1, STYLE_DIM), style_mask=torch.zeros(1, STYLE_DIM),
+                     canvas_state=torch.from_numpy(st[None]), canvas_ms=torch.from_numpy(ms[None]), canvas_ln=torch.from_numpy(ln[None]),
+                     canvas_wrong=torch.from_numpy(wrong[None].astype(np.float32)), canvas_train=torch.ones(1, 256))
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", canvas=True, error_head=True))
+        out = model(torch.randn(1, 256, fcfg.total_dim()), torch.zeros(1, 256, 13), torch.tensor([[4.0]]),
+                    batch["style"], batch["style_mask"], torch.randn(1, 30, fcfg.total_dim()), None,
+                    canvas=(batch["canvas_state"], batch["canvas_ms"], batch["canvas_ln"]))
+        loss, logs = compute_losses(out, batch, LossWeights(error=1.0), 10)
+        self.assertIn("error", logs)
+        loss.backward()
+        self.assertIsNotNone(model.error_head.weight.grad)
+        self.assertGreater(float(model.error_head.weight.grad.abs().sum()), 0.0)
+
+    def test_correction_keeps_only_improvements(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.canvas import correct
+        from osu_mapper.hybrid.renderer import HeadOutputs
+
+        F = 300
+        def head(err):
+            tp = np.zeros((F, 11), np.float32)
+            tp[:, 0] = 1.0
+            return HeadOutputs(tp, np.zeros((F, 25), np.float32), np.zeros((F, 4), np.int64), np.zeros((F, 4), np.float32),
+                               np.zeros((F, 4), np.int64), np.zeros((F, 4), np.float32), error_probs=err)
+        notes0 = [Note(100 * i, i % 4, 100 * i, False) for i in range(1, 25)]
+        calls = {"n": 0}
+
+        def predict(cv):
+            calls["n"] += 1
+            e = np.zeros(F, np.float32)
+            n_ev = int((cv[0] >= 2).sum())
+            e[(cv[0] >= 2)] = 0.9 if n_ev > 20 else 0.1      # the critic dislikes maps with more than 20 notes
+            return head(e)
+
+        def fit(o):
+            k = fit.k = getattr(fit, "k", 24) - 3              # every correction removes 3 notes
+            return SimpleNamespace(notes=notes0[:k], lag_ms=0, threshold=0.5)
+
+        out, res = correct(predict, fit, head(None), SimpleNamespace(notes=notes0, lag_ms=0, threshold=0.5), F, 10,
+                           lambda r: 0, steps=10)
+        self.assertLessEqual(len(res.notes), 20)               # corrected until the critic is satisfied
+        self.assertLess(calls["n"], 30)                        # and stopped (no endless corrections)

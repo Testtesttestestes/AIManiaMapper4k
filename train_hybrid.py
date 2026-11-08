@@ -272,6 +272,11 @@ def main() -> None:
                          "last 6 chords (needs --motifs); 0 = off")
     ap.add_argument("--motifs", default=None, help="motif library (mine_patterns.py; default checkpoints/hybrid/motifs.npz, "
                                                    "else test_NN/motifs.npz)")
+    ap.add_argument("--corrupt_prob", type=float, default=0.3,
+                    help="break and fix: share of canvas crops where almost the whole map is shown but partly broken (notes "
+                         "removed / added / moved, wrong lanes, jacks, wrong chords, LN flips); the network predicts every frame "
+                         "and its error head learns which shown frames are wrong (the self-correction critic); 0 = off")
+    ap.add_argument("--error_weight", type=float, default=0.3, help="loss: error head of break-and-fix crops")
     ap.add_argument("--canvas_prob", type=float, default=0.5,
                     help="masked discrete diffusion: share of crops that get part of their own map as input (the rest are "
                          "fully masked = the plain network); adds the canvas input; 0 = off (see osu_mapper/hybrid/canvas.py)")
@@ -395,6 +400,9 @@ def main() -> None:
     if args.canvas_prob > 0 and not cfg.canvas and not args.eval_only:
         cfg.canvas = True
         new_head = new_head or resume_ckpt is not None
+    if args.corrupt_prob > 0 and args.error_weight > 0 and args.canvas_prob > 0 and not cfg.error_head and not args.eval_only:
+        cfg.error_head = True
+        new_head = new_head or resume_ckpt is not None
     if args.pattern_weight > 0 and not cfg.pattern_heads and not args.eval_only:
         cfg.pattern_heads = True
         new_head = new_head or resume_ckpt is not None
@@ -462,7 +470,8 @@ def main() -> None:
     train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
 
     weights = LossWeights(density=args.density_weight, pair=args.pair_weight, ladder=args.ladder_weight, jack=args.jack_weight,
-                          patterns=args.pattern_weight, prior=args.prior_weight)
+                          patterns=args.pattern_weight, prior=args.prior_weight,
+                          error=args.error_weight if args.corrupt_prob > 0 else 0.0)
     if args.pair_prob > 0 and args.batch_size % 2:
         print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
         args.pair_prob = 0.0
@@ -477,7 +486,8 @@ def main() -> None:
                                  pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0,
                                  canvas_prob=args.canvas_prob,
                                  pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
-                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare)
+                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare,
+                                 corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -609,7 +619,10 @@ def main() -> None:
                           f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f} "
                           f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)"
                           + (f" ladder {avg['ladder']:.3f}" if "ladder" in avg else "")
-                          + (f" jack {avg['jack']:.3f}" if "jack" in avg else ""), flush=True)
+                          + (f" jack {avg['jack']:.3f}" if "jack" in avg else "")
+                          + (f" error {avg['error']:.3f}" if "error" in avg else "")
+                          + (f" patterns {avg['patterns']:.3f}" if "patterns" in avg else "")
+                          + (f" prior {avg['prior']:.3f}" if "prior" in avg else ""), flush=True)
                     run, n_run = {}, 0
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait

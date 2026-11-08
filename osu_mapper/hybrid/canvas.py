@@ -75,6 +75,67 @@ def sample_known(T: int, rng: np.random.Generator, frame_ms: int = 10) -> np.nda
     return known
 
 
+def corrupt_canvas(state: np.ndarray, ms: np.ndarray, ln: np.ndarray, rng: np.random.Generator, frame_ms: int = 10,
+                   strength: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """"Break" a visible canvas the way a bad map is wrong; the network has to find and fix it (the targets stay the
+    real map). Returns (state, ms, ln, wrong[T]) where ``wrong`` marks every frame that now differs from the map.
+
+    Breakages (each event / frame independently, ``strength`` scales all rates, random 0.3..1 by default): a note
+    removed; an extra note on an empty frame (also in silence); a note moved 1..3 frames (wrong snap); other lanes of the
+    same size or the previous chord's lanes (a jack); a lane added / removed (wrong chord); long note <-> tap; the
+    millisecond inside the frame jittered."""
+    st, m_, l_ = state.copy(), ms.copy(), ln.copy()
+    T = st.shape[0]
+    k = float(rng.uniform(0.3, 1.0) if strength is None else strength)
+    ev = np.flatnonzero(st >= 2)
+    prev_mask = 0
+    for f in ev:
+        if st[f] < 2:            # already moved away / removed by an earlier breakage
+            continue
+        mask = int(st[f]) - 1
+        u = rng.random()
+        if u < 0.08 * k:                                         # removed
+            st[f], m_[f], l_[f] = EMPTY, 0, 0.0
+        elif u < 0.14 * k:                                       # moved 1..3 frames
+            d = int(rng.choice([-3, -2, -1, 1, 2, 3]))
+            g = f + d
+            if 0 <= g < T and st[g] == EMPTY:
+                st[g], m_[g], l_[g] = st[f], m_[f], l_[f]
+                st[f], m_[f], l_[f] = EMPTY, 0, 0.0
+        elif u < 0.24 * k:                                       # other lanes, same size (or a jack on the previous chord)
+            n = len(mask_lanes(mask))
+            if prev_mask and len(mask_lanes(prev_mask)) == n and rng.random() < 0.4:
+                new = prev_mask
+            else:
+                cands = [x for x in range(1, 16) if bin(x).count("1") == n and x != mask]
+                new = int(rng.choice(cands)) if cands else mask
+            st[f] = event_state(new)
+            l_[f] = 0.0
+        elif u < 0.29 * k:                                       # wrong chord size
+            if rng.random() < 0.5 and bin(mask).count("1") > 1:
+                lanes = mask_lanes(mask)
+                new = mask & ~(1 << int(rng.choice(lanes)))
+            else:
+                free = [c for c in range(NUM_LANES) if not (mask >> c) & 1]
+                new = mask | (1 << int(rng.choice(free))) if free else mask
+            st[f] = event_state(new)
+        elif u < 0.33 * k:                                       # long note <-> tap
+            lanes = mask_lanes(mask)
+            c = int(rng.choice(lanes))
+            l_[f, c] = 1.0 - l_[f, c]
+        elif u < 0.43 * k:                                       # millisecond jitter
+            m_[f] = int(np.clip(m_[f] + rng.choice([-3, -2, -1, 1, 2, 3]), 0, frame_ms - 1))
+        prev_mask = mask
+    empty = np.flatnonzero(st == EMPTY)
+    if empty.size:
+        n_add = int(rng.binomial(max(1, ev.size), 0.06 * k))
+        for f in rng.choice(empty, size=min(n_add, empty.size), replace=False):
+            st[f] = event_state(int(rng.integers(1, 16)) if rng.random() < 0.3 else 1 << int(rng.integers(0, NUM_LANES)))
+            m_[f] = int(rng.integers(0, frame_ms))
+    wrong = (st != state) | ((st >= 2) & ((m_ != ms) | np.any(l_ != ln, axis=1)))
+    return st, m_, l_, wrong
+
+
 def empty_canvas(n_frames: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return np.zeros(n_frames, np.int64), np.zeros(n_frames, np.int64), np.zeros((n_frames, NUM_LANES), np.float32)
 
@@ -208,3 +269,79 @@ def _force(out, state, ms, ln, frozen, code_for_mask):
             if m < rows["ln_logits"].shape[1]:
                 rows["ln_logits"][f, m] = 12.0 if ln[f, c] > 0.5 else -12.0
     return dataclasses.replace(out, time_probs=tp, **rows)
+
+
+def canvas_from_notes(notes: Sequence[Note], shift_ms: int, frame_ms: int, n_frames: int,
+                      p_event: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The whole map on the canvas: events where it has notes, every other frame known empty."""
+    state = np.full(n_frames, EMPTY, np.int64)
+    ms = np.zeros(n_frames, np.int64)
+    ln = np.zeros((n_frames, NUM_LANES), np.float32)
+    for f, m_, mask, lnb in _note_frames(notes, shift_ms, frame_ms, n_frames, p_event):
+        state[f], ms[f], ln[f] = event_state(mask), m_, lnb
+    return state, ms, ln
+
+
+def correct(
+    predict: Callable[[Tuple[np.ndarray, np.ndarray, np.ndarray]], object],
+    fit: Callable[[object], object],
+    out,
+    res,
+    n_frames: int,
+    frame_ms: int,
+    shift_of: Callable[[object], int],
+    steps: int = 3,
+    threshold: float = 0.5,
+    max_share: float = 0.1,
+    log=None,
+):
+    """Self-correction with the error head ("critic"), after the map is made.
+
+    Every step shows the whole fitted map on the canvas; the error head marks the frames it believes are wrong
+    (P > ``threshold``, at most ``max_share`` of the map's events per step, the most suspicious first). Those frames are
+    masked, everything else stays fixed, the network predicts them again and the map is fitted again. The new map is
+    kept only if the critic finds it less wrong (sum of error probabilities over the map's frames); the loop stops when
+    nothing is suspicious, when a step does not improve, or after ``steps``. It never oscillates: the result is always the
+    best map seen ("not this, the real one!" stops as soon as a correction is not better)."""
+    from .params import code_for_mask
+
+    def critique(r):
+        cv = canvas_from_notes(r.notes, shift_of(r), frame_ms, n_frames, 1.0 - out.time_probs[:, 0])
+        o = predict(cv)
+        if o.error_probs is None:
+            return None, cv, o
+        e = o.error_probs.astype(np.float64)
+        return float(e.sum()), cv, o
+
+    score, cv, crit = critique(res)
+    if score is None:
+        if log:
+            log("    correct: the model has no error head (train with --corrupt_prob), skipped")
+        return out, res
+    best = (score, out, res)
+    for s in range(1, max(1, int(steps)) + 1):
+        e = crit.error_probs
+        n_ev = int((cv[0] >= 2).sum())
+        sus = np.flatnonzero(e > threshold)
+        if sus.size == 0:
+            if log:
+                log(f"    correct {s}: nothing suspicious, done")
+            break
+        cap = max(1, int(round(max_share * max(1, n_ev))))
+        sus = sus[np.argsort(-e[sus])][:cap]
+        state, ms, ln = cv[0].copy(), cv[1].copy(), cv[2].copy()
+        state[sus], ms[sus], ln[sus] = MASK, 0, 0.0
+        o = predict((state, ms, ln))
+        fixed = state != MASK
+        frozen = {k: v.copy() for k, v in _rows(crit).items()}
+        o = _force(o, state, ms, ln, frozen, code_for_mask)
+        r = fit(o)
+        sc, cv2, crit2 = critique(r)
+        if log:
+            log(f"    correct {s}: {sus.size} suspicious frames re-predicted, critic {best[0]:.1f} -> {sc:.1f}"
+                + ("" if sc < best[0] else " (worse: kept the previous map, done)"))
+        if sc >= best[0]:
+            break
+        best = (sc, o, r)
+        cv, crit = cv2, crit2
+    return best[1], best[2]

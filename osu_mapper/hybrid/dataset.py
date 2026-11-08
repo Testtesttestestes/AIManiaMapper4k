@@ -317,6 +317,7 @@ class HybridCropDataset(Dataset):
         log=print,
         rate_aug: float = 0.0,
         sr_rare: float = 0.0,
+        corrupt_prob: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -329,6 +330,7 @@ class HybridCropDataset(Dataset):
         self.pitch_shift_prob = float(pitch_shift_prob) if self.augment else 0.0
         self.ladder_k = int(ladder_k)
         self.canvas_prob = float(canvas_prob)
+        self.corrupt_prob = float(corrupt_prob)
         self.epoch = 0
         self.tracks = [SparseTrack(index.track(i)) for i in self.map_indices]
         self.entries = [index.maps[i] for i in self.map_indices]
@@ -488,10 +490,21 @@ class HybridCropDataset(Dataset):
         for key, arr in tgt.items():
             item[key] = torch.from_numpy(arr)
         if self.canvas_prob > 0:
-            from .canvas import canvas_from_targets, sample_known
-            known = sample_known(self.crop, rng, track.frame_ms) if rng.random() < self.canvas_prob else np.zeros(self.crop, bool)
-            cs, cm, cl = canvas_from_targets(tgt, known)
+            from .canvas import MASK, canvas_from_targets, corrupt_canvas, sample_known
+            wrong = np.zeros(self.crop, bool)
+            if self.corrupt_prob > 0 and rng.random() < self.corrupt_prob:
+                # "break and fix": almost the whole map is shown, part of it broken; every frame is predicted
+                known = rng.random(self.crop) >= rng.uniform(0.0, 0.3)
+                cs, cm, cl = canvas_from_targets(tgt, known)
+                cs, cm, cl, wrong = corrupt_canvas(cs, cm, cl, rng, track.frame_ms)
+                train_rows = np.ones(self.crop, np.float32)
+            else:
+                known = sample_known(self.crop, rng, track.frame_ms) if rng.random() < self.canvas_prob else np.zeros(self.crop, bool)
+                cs, cm, cl = canvas_from_targets(tgt, known)
+                train_rows = (cs == MASK).astype(np.float32)
             item["canvas_state"], item["canvas_ms"], item["canvas_ln"] = torch.from_numpy(cs), torch.from_numpy(cm), torch.from_numpy(cl)
+            item["canvas_wrong"] = torch.from_numpy(wrong.astype(np.float32))
+            item["canvas_train"] = torch.from_numpy(train_rows)
         if ladder is not None:
             item["ladder_presence"] = torch.from_numpy(ladder[0])
             item["ladder_sr"] = torch.from_numpy(ladder[1])
