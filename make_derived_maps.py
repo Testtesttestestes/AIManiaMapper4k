@@ -52,16 +52,17 @@ def main() -> None:
     index_path = root / "index.json"
     data: Dict[str, Any] = json.loads(index_path.read_text(encoding="utf-8"))
     real = [m for m in data["maps"] if not m.get("derived")]
-    old = [m for m in data["maps"] if m.get("derived")]
+    selfmade = [m for m in data["maps"] if m.get("self")]          # make_self_maps.py: kept as they are
+    old = [m for m in data["maps"] if m.get("derived") and not m.get("self")]
     for m in old:
         (root / m["track"]).unlink(missing_ok=True)
     if old:
         print(f"removed {len(old)} previous derived maps")
     shutil.copy2(index_path, index_path.with_suffix(".json.bak"))
     if args.remove:
-        data["maps"] = real
+        data["maps"] = real + selfmade
         _write(index_path, data)
-        print(f"index: {len(real)} real maps")
+        print(f"index: {len(real)} real maps" + (f" + {len(selfmade)} self-generated" if selfmade else ""))
         return
 
     fcfg = FeatureConfig.from_dict(data["feature_config"])
@@ -119,7 +120,7 @@ def main() -> None:
             made.append(sr)
         print(f"[{n_par}/{len(parents)}] {par.get('version', '')[:40]:<40} SR {float(par['sr']):.2f} -> "
               + (" ".join(f"{s:.2f}" for s in made) if made else "-"), flush=True)
-    data["maps"] = real + derived
+    data["maps"] = real + derived + selfmade
     _write(index_path, data)
     bins = np.bincount([int(min(d["sr"], 9.99)) for d in derived], minlength=10) if derived else np.zeros(10, int)
     real_bins = np.bincount([int(min(float(m.get("sr", 0)), 9.99)) for m in real if float(m.get("sr", 0)) > 0], minlength=10)

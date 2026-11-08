@@ -117,7 +117,8 @@ class ComposerConfig:
     family_chords: float = 0.3       # how much a section's pattern family changes its chord rate (stream 0.45x .. chordjack 1.9x)
     family_density: float = 1.0      # how much a section's pattern family changes its note count (0 = not at all)
     bar_follow: float = 0.7          # 0..1: note density follows the loudness of every bar (1) or only of the section (0)
-    silence_db: float = 26.0         # bars this far below the loud parts of the song are silence: no notes at all
+    silence_std: float = 6.0         # bars this far below the loud parts of the song are silence: no notes at all (in
+                                     # standard deviations of the song's log power - the features are normalized per song)
     release_gap_ms: int = 40
     release_gap_beats: float = 0.25
     od: float = 8.0
@@ -219,7 +220,7 @@ class SongAnalysis:
     onset_peaks: Optional[np.ndarray] = None   # ms of sharp attacks (local maxima), shifted by peak_lag
     peak_lag: int = 0                          # how much later than the mapper's grid an attack peak comes (ms)
     flux: Optional[np.ndarray] = None          # [F] superflux onset strength (z, per song)
-    power: Optional[np.ndarray] = None         # [F] log power (natural log), absolute: silence / loudness per bar
+    power: Optional[np.ndarray] = None         # [F] log power, standardized per song (like every feature): silence / loudness per bar
 
     def power_top(self) -> float:
         """Log power of the loud parts of the song (95th percentile of the frames)."""
@@ -229,12 +230,14 @@ class SongAnalysis:
             self._power_top = float(np.percentile(self.power, 95))
         return self._power_top
 
-    def silent_frames(self, silence_db: float = 26.0) -> np.ndarray:
-        """[F] True where the audio is ``silence_db`` below the loud parts of the song. Measured on 9 songs: bars that
-        no human difficulty maps sit 26-36 dB below the song's loud parts, mapped bars at most ~28 dB below."""
+    def silent_frames(self, silence_std: float = 6.0) -> np.ndarray:
+        """[F] True where the log power is ``silence_std`` standard deviations (of this song) below its loud parts (95th
+        percentile). The features are standardized per song, so this is relative to the song, not decibels. Measured on 9
+        songs: bars that no human difficulty maps sit 6-8.4 below the loud parts, mapped bars mostly within 1.5 (a few
+        quiet mapped intros down to 6.5)."""
         if self.power is None:
             return self.loud < 0.02
-        return self.power < self.power_top() - silence_db / (10.0 / math.log(10.0))
+        return self.power < self.power_top() - float(silence_std)
 
     def source_time(self, t: np.ndarray) -> np.ndarray:
         """Time of the same moment in the original of a repeated phrase (-1 where t is not in a repeat)."""
@@ -255,11 +258,11 @@ class SongAnalysis:
         return out
 
 
-def fade_out_start(an: "SongAnalysis", silence_db: float = 26.0, drop: float = 0.5, max_fade_s: float = 25.0) -> Optional[int]:
+def fade_out_start(an: "SongAnalysis", silence_std: float = 6.0, drop: float = 0.5, max_fade_s: float = 25.0) -> Optional[int]:
     """Where the mapping of a song with a fade-out ends.
 
     A fade-out is a monotonic fall of the loudness into silence at the end of the audio; reverb and cymbal noise in
-    it still look like attacks. Human maps stop when the fade has fallen ``drop`` (log power, ~2 dB) below its start
+    it still look like attacks. Human maps stop when the fade has fallen ``drop`` (standardized log power) below its start
     (Blackmagik Blazing: humans end at 262.6 s, this gives 262.5 s). None when the song does not end with a fade."""
     if an.power is None or an.power.size < 300:
         return None
@@ -267,7 +270,7 @@ def fade_out_start(an: "SongAnalysis", silence_db: float = 26.0, drop: float = 0
     step = max(1, 100 // H)
     p = np.convolve(an.power, np.ones(100 // H) / (100 // H), mode="same")[::step]   # 1 s smoothing, 100 ms steps
     top = an.power_top()
-    thr = top - silence_db / (10.0 / math.log(10.0))
+    thr = top - float(silence_std)
     loud = np.flatnonzero(p >= thr)
     if loud.size == 0:
         return None
@@ -574,7 +577,8 @@ def _describe_sections(an: SongAnalysis, sections: List[Section], V: np.ndarray)
     for s, v in zip(sections, rel):
         s.intensity = float(np.clip(v, 0.05, 1.0))
         f0, f1 = s.start_ms // H, max(s.start_ms // H + 1, s.end_ms // H)
-        # silence is absolute (26 dB below the loud parts): the quietest part of a song is not a break by itself
+        # silence is a fixed distance below the loud parts (6 std of the song's log power), not a rank: the quietest part of a
+        # song is not a break by itself
         if float(silent[f0:f1].mean()) > 0.6:
             s.intensity = 0.0
     find_repeats(an, sections, V)
@@ -807,7 +811,7 @@ class Composer:
         """Bar edges, the loudness of every bar relative to the loud parts of the song and silent bars.
 
         Measured on 9 songs x all human difficulties: the human note density of a bar follows its log power with
-        exponent ~0.84 (density ~ power^0.84, Spearman 0.56 on average against 0.49 for the section intensity) - a
+        slope ~0.84 (log density ~ 0.84 x standardized log power, Spearman 0.56 on average against 0.49 for the section intensity) - a
         drum entry raises the density in the very bar it starts, not at the next section boundary."""
         an, H = self.an, self.an.frame_ms
         bb = max(1, an.bar_beats)
@@ -815,7 +819,7 @@ class Composer:
         edges = np.unique(np.concatenate([[0], b[b > 0], [an.duration_ms]])).astype(np.int64)
         self.bar_edges = edges
         nb = edges.size - 1
-        silent_f = an.silent_frames(self.cfg.silence_db)
+        silent_f = an.silent_frames(self.cfg.silence_std)
         lp = np.zeros(nb)
         sil = np.zeros(nb, dtype=bool)
         for i in range(nb):
@@ -834,7 +838,7 @@ class Composer:
         # silent moments at 10 ms resolution: no candidate there at all (intros, outros, the end of the audio)
         f = np.clip(self.t // H, 0, an.num_frames - 1)
         self.t_silent = silent_f[f] & ~self.audible
-        self.fade_cut = fade_out_start(an, self.cfg.silence_db)
+        self.fade_cut = fade_out_start(an, self.cfg.silence_std)
         if self.fade_cut is not None:
             self.t_silent |= self.t >= self.fade_cut
             self.bar_silent |= self.bar_edges[:-1] >= self.fade_cut

@@ -508,9 +508,9 @@ class SilenceAndFadeTests(unittest.TestCase):
         an.power = power
         return an
 
-    def test_quiet_part_is_not_silence_but_26db_down_is(self):
-        p = np.concatenate([np.full(3000, 10.0), np.full(1000, 8.0), np.full(1000, 2.0)])  # loud, -8.7 dB, -35 dB
-        sil = self._an(p).silent_frames(26.0)
+    def test_quiet_part_is_not_silence_but_far_below_is(self):
+        p = np.concatenate([np.full(3000, 10.0), np.full(1000, 8.0), np.full(1000, 2.0)])  # loud, 2 and 8 below it
+        sil = self._an(p).silent_frames(6.0)
         self.assertFalse(sil[:4000].any())
         self.assertTrue(sil[4000:].all())
 
