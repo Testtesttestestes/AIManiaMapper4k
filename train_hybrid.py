@@ -240,7 +240,11 @@ def main() -> None:
     ap.add_argument("--preset", default="base", choices=sorted(PRESETS))
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--steps_per_epoch", type=int, default=1000)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", default="16",
+                    help="crops per GPU and step, or 'auto': the largest batch whose training step fits --mem_fraction of the "
+                         "card (probed with real crops and every loss of the run)")
+    ap.add_argument("--mem_fraction", type=float, default=0.9,
+                    help="--batch_size auto: share of the GPU memory to fill (lower it if other programs need the card)")
     ap.add_argument("--crop_sec", type=float, default=20.48, help="training window length (also the inference window)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--min_lr", type=float, default=1e-5)
@@ -493,7 +497,9 @@ def main() -> None:
                           patterns=args.pattern_weight, prior=args.prior_weight,
                           error=args.error_weight if args.corrupt_prob > 0 else 0.0,
                           plan=args.plan_weight if (args.plan_prob > 0 and args.pattern_weight > 0) else 0.0)
-    if args.pair_prob > 0 and args.batch_size % 2:
+    auto_batch = str(args.batch_size).lower() == "auto"
+    args.batch_size = 16 if auto_batch else int(args.batch_size)
+    if args.pair_prob > 0 and args.batch_size % 2 and not auto_batch:
         print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
         args.pair_prob = 0.0
     total_steps = (start_epoch + args.epochs) * args.steps_per_epoch if resume_ckpt is None else max(int(resume_ckpt.get("total_steps", 0)), (start_epoch + args.epochs) * args.steps_per_epoch)
@@ -510,6 +516,27 @@ def main() -> None:
                                  rate_aug=args.rate_aug, sr_rare=args.sr_rare, rate_max=args.rate_max,
                                  corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0,
                                  plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0)
+    if auto_batch:
+        from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
+        probe_items = [train_ds[i] for i in range(12)]
+        frac = args.mem_fraction * (0.75 if (args.dpo_weight > 0 and index.data.get("dpo_pairs") and not distributed) else 1.0)
+
+        def probe_step(bs: int) -> None:
+            b = to_device(repeat_batch(probe_items, bs, collate_hybrid), dev)
+            with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
+                o = forward_batch(model, b)
+            l, _ = compute_losses(o, b, weights, cfg.frame_ms, sigma_ms=args.sigma_start, event_weight=args.event_weight)
+            l.backward()
+            model.zero_grad(set_to_none=True)
+            del o, l, b
+
+        found_bs = find_batch_size(probe_step, model, dev, frac, distributed=distributed, log=print)
+        if found_bs is None:
+            print("[batch] auto needs a CUDA GPU: using 16")
+        else:
+            args.batch_size = found_bs
+            train_ds.samples_per_epoch = args.steps_per_epoch * args.batch_size
+        print(f"[train] batch={args.batch_size} x {world} GPU(s) = {args.batch_size * world}")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:

@@ -744,12 +744,16 @@ python train_hybrid.py --data dataset_hybrid --preset base --pitch_shift 0.5 --g
 python audit_dataset_compatibility.py --clean --apply                 # 1. только нужное для обучения
 python prepare_hybrid_dataset.py --input_dir "sample beatmaps" --output_dir dataset_hybrid
 python make_derived_maps.py --data dataset_hybrid                     # (по желанию) облегчённые версии
-torchrun --standalone --nproc_per_node=3 train_hybrid.py --data dataset_hybrid --preset base --batch_size 16 --workers 4
+torchrun --standalone --nproc_per_node=3 train_hybrid.py --data dataset_hybrid --preset base --batch_size auto --workers 4
 python sr_diagnose.py -c checkpoints/hybrid/hybrid_best.pt --songs "sample beatmaps" --max_songs 30 --write_calibration sr_cal.json
 python make_self_maps.py --data dataset_hybrid --checkpoint checkpoints/hybrid/hybrid_best.pt   # лучшие по награде + пары
 python train_hybrid.py --data dataset_hybrid --resume --epochs 5 --dpo_weight 0.1               # 2-й раунд с DPO (одна GPU)
 python train_hybrid.py --data dataset_hybrid --resume --epochs 3 --lr 5e-5 --finetune_min_sr 5  # (по желанию) хвост сложных
 ```
+`--batch_size auto` подбирает батч под память: пробные шаги на настоящих отрезках со всеми потерями прогона, пиковая
+память как прямая от батча, батч на `--mem_fraction 0.9` карты (минус чужие программы, плюс состояние Adam и буферы
+DDP), проверка настоящим шагом, при нехватке памяти −15 %; на нескольких GPU решает самая маленькая карта. Если памяти
+занято мало, а обучение всё равно медленное, узкое место — загрузка данных: прибавьте `--workers`.
 `make_self_maps.py` и второй раунд можно повторять: каждая следующая сеть делает кандидатов лучше. Самосгенерированные
 карты помечены `self` (только обучение, не валидация, доля как у производных), `--remove` их убирает.
 

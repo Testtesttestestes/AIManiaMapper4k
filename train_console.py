@@ -175,10 +175,20 @@ def step_train(last: Dict[str, object], resume: bool = False) -> Optional[List[s
             steps = ask_int("Шагов в эпохе", int(last.get("steps", 1000)))
             last.update(epochs=epochs, steps=steps)
         argv_tail += ["--preset", preset, "--epochs", str(epochs), "--steps_per_epoch", str(steps)]
-        b = ask_int(f"Размер батча на видеокарту (для {mem:.0f} ГБ подойдёт {batch}; чётный)", int(last.get("batch", batch)), 2, 512)
-        b += b % 2
-        last["batch"] = b
-        argv_tail += ["--batch_size", str(b)]
+        if found and ask_choice("Размер батча", [("Подобрать автоматически", "рекомендуется: пробные шаги перед обучением, "
+                                                   "занимает ~90 % памяти каждой видеокарты"),
+                                                  ("Задать самому…", f"для {mem:.0f} ГБ примерно {batch}")],
+                                1 if last.get("batch_auto", True) else 2) == 1:
+            last["batch_auto"] = True
+            frac = ask_float("Какую долю памяти занять (0.5-0.95)", float(last.get("mem_fraction", 0.9)))
+            last["mem_fraction"] = frac
+            argv_tail += ["--batch_size", "auto", "--mem_fraction", f"{frac:g}"]
+        else:
+            last["batch_auto"] = False
+            b = ask_int(f"Размер батча на видеокарту (для {mem:.0f} ГБ подойдёт {batch}; чётный)", int(last.get("batch", batch)), 2, 512)
+            b += b % 2
+            last["batch"] = b
+            argv_tail += ["--batch_size", str(b)]
     workers = ask_int("Процессов загрузки данных", int(last.get("workers", min(4, max(0, (os.cpu_count() or 2) - 1)))), 0, 32)
     last["workers"] = workers
     argv_tail += ["--workers", str(workers)]

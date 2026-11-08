@@ -1122,3 +1122,33 @@ class TestAugTag(unittest.TestCase):
         ds.rate_aug = 1.0
         ds.rate_srs = [{f"{r:g}": 3.0 + 4 * (r - 1) for r in (1.1, 1.2, 1.3, 1.4, 1.5)}]
         self.assertTrue({ds._choose_rate(0, i) for i in range(0, 400, 2)} <= {1.1, 1.2, 1.3})
+
+
+class TestAutoBatch(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_fills_the_card_and_backs_off_on_oom(self):
+        from unittest import mock
+
+        from osu_mapper.hybrid import autobatch
+
+        GB = 2 ** 30
+        state = {"peak": 0}
+        base, per, total, other = 1.0 * GB, 0.25 * GB, 8 * GB, 0.5 * GB
+
+        def step(bs):
+            need = base + per * bs
+            if need > total - other:
+                raise torch.cuda.OutOfMemoryError("fake")
+            state["peak"] = need
+
+        model = torch.nn.Linear(10, 10)
+        with mock.patch.object(torch.cuda, "mem_get_info", return_value=(total - other, total)), \
+             mock.patch.object(torch.cuda, "memory_reserved", return_value=0), \
+             mock.patch.object(torch.cuda, "empty_cache"), mock.patch.object(torch.cuda, "synchronize"), \
+             mock.patch.object(torch.cuda, "reset_peak_memory_stats"), \
+             mock.patch.object(torch.cuda, "max_memory_allocated", side_effect=lambda *_: state["peak"]):
+            bs = autobatch.find_batch_size(step, model, torch.device("cuda", 0), fraction=0.9, log=lambda *_: None)
+        # 90 % of 8 GB minus 0.5 GB of other programs = 6.7 GB; (6.7 - 1.0) / 0.25 = 22.8 -> 22 (even)
+        self.assertEqual(bs, 22)
+        self.assertLessEqual(base + per * bs, 0.9 * total - other)
+        self.assertIsNone(autobatch.find_batch_size(step, model, torch.device("cpu"), log=lambda *_: None))
