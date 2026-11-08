@@ -854,3 +854,301 @@ class TestPatternKnowledge(unittest.TestCase):
         bad = torch.full((1, 512, N_LANE_CODES), -30.0)
         bad[..., code_for_mask(1 << 0)] = 30.0
         self.assertGreater(float(prior_loss(bad, batch, ev)[0]), 5.0)
+
+
+class TestRateAugmentation(unittest.TestCase):
+    """Rate augmentation (dataset.SparseTrack._crop_rate, HybridCropDataset._choose_rate) and per-crop loss weights."""
+
+    def test_sped_up_crop_matches_a_sped_up_map(self):
+        from osu_mapper.hybrid.dataset import SparseTrack
+
+        rng = random.Random(5)
+        notes, t = [], 1000
+        for _ in range(60):
+            t += rng.choice([60, 90, 125, 250])
+            c = rng.randrange(4)
+            ln = rng.random() < 0.2
+            notes.append(Note(t, c, t + 300 if ln else t, ln))
+        notes = sorted({(n.start, n.col): n for n in notes}.values(), key=lambda n: (n.start, n.col))
+        track = solve_map(notes, num_frames=2000)
+        sp = SparseTrack(track)
+        start, length, rate = 150, 400, 1.25
+        crop = sp.crop_arrays(start, length, rate)
+        self.assertIsNotNone(crop)
+        s0 = start * 10
+        want = sorted(Note(s0 + (n.start - s0) * 4 // 5 - s0, n.col, 0, n.ln) for n in notes
+                      if s0 <= n.start and (n.start - s0) * 4 // 5 < length * 10)
+        got_frames = np.flatnonzero(crop["time_class"] > 0)
+        got_ms = got_frames * 10 + crop["time_class"][got_frames] - 1
+        self.assertEqual(sorted(set(got_ms.tolist())), sorted({w.start for w in want}))
+        # chords keep their lanes, LN lengths are divided by the rate
+        for f in got_frames:
+            ms = f * 10 + crop["time_class"][f] - 1
+            self.assertEqual(int(crop["event_mask"][f]), sum(1 << w.col for w in want if w.start == ms))
+        lens = crop["ln_len"][crop["ln_flag"] > 0]
+        if lens.size:
+            self.assertTrue(np.all(np.abs(lens - 240) <= 1))
+
+    def test_pairs_share_the_rate_and_weights_average_one(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+
+        track = solve_map([Note(1000 + 200 * i, i % 4, 1000 + 200 * i, False) for i in range(40)], num_frames=4000)
+        index = SimpleNamespace(maps=[{"sr": 3.0 + i, "song_id": "s", "track": f"t{i}"} for i in range(4)],
+                                track=lambda i: track, feature_config=FeatureConfig())
+        ds = HybridCropDataset(index, range(4), 512, 64)
+        ds.rate_aug = 1.0
+        ds.rate_srs = [{f"{r:g}": 3.0 + i + 4 * (r - 1) for r in (1.1, 1.2, 1.3, 1.4, 1.5)} for i in range(4)]
+        for i in range(0, 20, 2):
+            self.assertEqual(ds._choose_rate(0, i), ds._choose_rate(0, i + 1))
+        rates = {ds._choose_rate(0, i) for i in range(0, 200, 2)}
+        self.assertTrue(rates <= {1.1, 1.2, 1.3, 1.4, 1.5} and len(rates) > 1)
+        # loss weights: no weight = the old loss; weights only re-weight crops
+        crops = [track.crop_arrays(0, 256), track.crop_arrays(64, 256)]
+        batch = {k: torch.from_numpy(np.stack([c[k] for c in crops])) for k in crops[0]}
+        batch.update(valid=torch.ones(2, 256), style=torch.zeros(2, STYLE_DIM), style_mask=torch.zeros(2, STYLE_DIM))
+        torch.manual_seed(0)
+        out = {"time_logits": torch.randn(2, 256, 11), "lane_logits": torch.randn(2, 256, 25), "chord_logits": torch.randn(2, 256, 4),
+               "stagger_logits": torch.randn(2, 256, 4, 10), "ln_logits": torch.randn(2, 256, 4),
+               "ln_bucket_logits": torch.randn(2, 256, 4, 48), "ln_resid": torch.rand(2, 256, 4), "style_pred": torch.zeros(2, STYLE_DIM)}
+        plain, _ = compute_losses(out, batch, LossWeights(), 10)
+        same, _ = compute_losses(out, dict(batch, loss_weight=torch.tensor([[2.0], [2.0]])), LossWeights(), 10)
+        self.assertAlmostEqual(float(plain), float(same), places=5)
+        skew, _ = compute_losses(out, dict(batch, loss_weight=torch.tensor([[1.0], [3.0]])), LossWeights(), 10)
+        self.assertNotAlmostEqual(float(plain), float(skew), places=4)
+
+
+class TestSRCalibration(unittest.TestCase):
+    def test_inverse_of_the_measured_curve(self):
+        from osu_mapper.hybrid.inference import calibrated_request
+
+        curve = {"requests": [2, 3, 4, 5, 6, 7, 8], "achieved": [2.61, 3.72, 4.36, 4.78, 5.03, 5.13, 5.15]}
+        ask, sat = calibrated_request(4.36, curve)
+        self.assertAlmostEqual(ask, 4.0, places=6)
+        ask, sat = calibrated_request(3.0, curve)                 # the raw maps overshoot at low requests: ask lower
+        self.assertTrue(2.0 < ask < 3.0 and not sat)
+        ask, sat = calibrated_request(7.0, curve)                 # saturated network: largest request, flagged
+        self.assertEqual((ask, sat), (8.0, True))
+        self.assertEqual(calibrated_request(5.0, None), (5.0, False))
+
+
+class TestBreakAndFix(unittest.TestCase):
+    """Break-and-fix canvas crops, the error head and self-correction (canvas.corrupt_canvas / correct)."""
+
+    def test_corruption_marks_exactly_the_changed_frames(self):
+        from osu_mapper.hybrid.canvas import EMPTY, canvas_from_targets, corrupt_canvas
+
+        track = solve_map(random_map(random.Random(2), 80))
+        tgt = track.crop_arrays(0, 1024)
+        st, ms, ln = canvas_from_targets(tgt, np.ones(1024, bool))
+        rng = np.random.default_rng(0)
+        st2, ms2, ln2, wrong = corrupt_canvas(st, ms, ln, rng, strength=1.0)
+        self.assertTrue(wrong.any())
+        changed = (st2 != st) | ((st2 >= 2) & ((ms2 != ms) | np.any(ln2 != ln, axis=1)))
+        np.testing.assert_array_equal(changed, wrong)
+        same, _, _, w0 = corrupt_canvas(st, ms, ln, rng, strength=0.0)
+        self.assertFalse(w0.any())
+        np.testing.assert_array_equal(same, st)
+        self.assertTrue(((st2 == EMPTY) | (st2 >= 2)).all())
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_error_loss_trains_the_error_head(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.canvas import canvas_from_targets, corrupt_canvas
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        track = solve_map(random_map(random.Random(3), 60))
+        tgt = track.crop_arrays(0, 256)
+        st, ms, ln = canvas_from_targets(tgt, np.ones(256, bool))
+        st, ms, ln, wrong = corrupt_canvas(st, ms, ln, np.random.default_rng(1), strength=1.0)
+        batch = {k: torch.from_numpy(v[None]) for k, v in tgt.items()}
+        batch.update(valid=torch.ones(1, 256), style=torch.zeros(1, STYLE_DIM), style_mask=torch.zeros(1, STYLE_DIM),
+                     canvas_state=torch.from_numpy(st[None]), canvas_ms=torch.from_numpy(ms[None]), canvas_ln=torch.from_numpy(ln[None]),
+                     canvas_wrong=torch.from_numpy(wrong[None].astype(np.float32)), canvas_train=torch.ones(1, 256))
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", canvas=True, error_head=True))
+        out = model(torch.randn(1, 256, fcfg.total_dim()), torch.zeros(1, 256, 13), torch.tensor([[4.0]]),
+                    batch["style"], batch["style_mask"], torch.randn(1, 30, fcfg.total_dim()), None,
+                    canvas=(batch["canvas_state"], batch["canvas_ms"], batch["canvas_ln"]))
+        loss, logs = compute_losses(out, batch, LossWeights(error=1.0), 10)
+        self.assertIn("error", logs)
+        loss.backward()
+        self.assertIsNotNone(model.error_head.weight.grad)
+        self.assertGreater(float(model.error_head.weight.grad.abs().sum()), 0.0)
+
+    def test_correction_keeps_only_improvements(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.canvas import correct
+        from osu_mapper.hybrid.renderer import HeadOutputs
+
+        F = 300
+        def head(err):
+            tp = np.zeros((F, 11), np.float32)
+            tp[:, 0] = 1.0
+            return HeadOutputs(tp, np.zeros((F, 25), np.float32), np.zeros((F, 4), np.int64), np.zeros((F, 4), np.float32),
+                               np.zeros((F, 4), np.int64), np.zeros((F, 4), np.float32), error_probs=err)
+        notes0 = [Note(100 * i, i % 4, 100 * i, False) for i in range(1, 25)]
+        calls = {"n": 0}
+
+        def predict(cv):
+            calls["n"] += 1
+            e = np.zeros(F, np.float32)
+            n_ev = int((cv[0] >= 2).sum())
+            e[(cv[0] >= 2)] = 0.9 if n_ev > 20 else 0.1      # the critic dislikes maps with more than 20 notes
+            return head(e)
+
+        def fit(o):
+            k = fit.k = getattr(fit, "k", 24) - 3              # every correction removes 3 notes
+            return SimpleNamespace(notes=notes0[:k], lag_ms=0, threshold=0.5)
+
+        out, res = correct(predict, fit, head(None), SimpleNamespace(notes=notes0, lag_ms=0, threshold=0.5), F, 10,
+                           lambda r: 0, steps=10)
+        self.assertLessEqual(len(res.notes), 20)               # corrected until the critic is satisfied
+        self.assertLess(calls["n"], 30)                        # and stopped (no endless corrections)
+
+
+class TestPlan(unittest.TestCase):
+    """Think first, then map: per-bar technique plan (motif_targets.bar_family / plan_from_logits, plan head + input)."""
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_plan_targets_input_head_and_two_pass_plan(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import SparseTrack
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+        from osu_mapper.hybrid.motif_targets import N_PLAN, N_PLAN_COPY, PLAN_FAMILIES, plan_from_logits, targets_for_track
+
+        tp = [RawTimingPoint(1000.0, 500.0)]
+        stairs = [Note(1000 + 125 * i, i % 4, 1000 + 125 * i, False) for i in range(32)]              # 4 bars of rolls
+        jacks = [Note(5000 + 125 * i, (i // 2) % 4, 5000 + 125 * i, False) for i in range(32)]         # 4 bars of jacks
+        track = solve_map(stairs + jacks, timing_points=tp, num_frames=1200)
+        sp = SparseTrack(track)
+        sp.pat = targets_for_track(sp, 4.0, None)
+        crop = sp.crop_arrays(0, 1200)
+        fam = crop["plan_family"]
+        self.assertEqual(PLAN_FAMILIES[int(fam[200])], "roll/stairs")
+        self.assertEqual(PLAN_FAMILIES[int(fam[600])], "jacks")
+        self.assertEqual(int(fam[1150]), 0)                                   # > 2 s after the last note: sparse
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", plan=True, pattern_heads=True))
+        batch = {k: torch.from_numpy(np.stack([v])) for k, v in crop.items()}
+        batch.update(valid=torch.ones(1, 1200), style=torch.zeros(1, STYLE_DIM), style_mask=torch.zeros(1, STYLE_DIM))
+        args = (torch.randn(1, 1200, fcfg.total_dim()), torch.zeros(1, 1200, 13), torch.tensor([[4.0]]), batch["style"],
+                batch["style_mask"], torch.randn(1, 30, fcfg.total_dim()), None)
+        out0 = model(*args)                                                   # no plan = all unknown
+        out1 = model(*args, plan=(batch["plan_family"], batch["plan_copy"]))
+        self.assertEqual(out0["plan_logits"].shape[-1], N_PLAN + N_PLAN_COPY)
+        loss, logs = compute_losses(out1, batch, LossWeights(plan=1.0), 10)
+        self.assertIn("plan", logs)
+        loss.backward()
+        self.assertIsNotNone(model.plan_head.weight.grad)
+        # the second-pass plan: per bar, argmax of the summed log-probabilities; a forced technique on non-empty bars
+        logits = np.full((1200, N_PLAN + N_PLAN_COPY), -5.0, np.float32)
+        logits[:, PLAN_FAMILIES.index("trill")] = 5.0
+        logits[1000:, 0] = 9.0                                                # silence at the end
+        logits[:, N_PLAN] = 5.0
+        fam, cpy = plan_from_logits(logits, tp, 10)
+        self.assertEqual(PLAN_FAMILIES[int(fam[300])], "trill")
+        forced, _ = plan_from_logits(logits, tp, 10, force_family="ln")
+        self.assertEqual(PLAN_FAMILIES[int(forced[300])], "ln")
+        self.assertEqual(PLAN_FAMILIES[int(forced[1150])], "sparse")
+
+
+class TestDPO(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_map_logprob_and_loss(self):
+        from osu_mapper.hybrid.dpo import dpo_loss, map_logprob
+        from osu_mapper.hybrid.params import N_LANE_CODES
+
+        track = solve_map(random_map(random.Random(4), 40))
+        good = {k: torch.from_numpy(v[None]) for k, v in track.crop_arrays(0, 256).items()}
+        bad = {k: torch.from_numpy(v[None]) for k, v in track.crop_arrays(40, 256).items()}   # another window's notes
+        # outputs that put all mass on the good map's events
+        tl = torch.full((1, 256, 11), -10.0)
+        tl[0, :, 0] = 10.0
+        f = good["time_class"][0] > 0
+        tl[0, f] = -10.0
+        tl[0, f, good["time_class"][0][f]] = 10.0
+        out = {"time_logits": tl, "lane_logits": torch.zeros(1, 256, N_LANE_CODES), "chord_logits": torch.zeros(1, 256, 4),
+               "ln_logits": torch.zeros(1, 256, 4)}
+        valid = torch.ones(1, 256)
+        lg, lb = map_logprob(out, good, valid), map_logprob(out, bad, valid)
+        self.assertGreater(float(lg), float(lb))
+        ref = {"time_logits": torch.zeros(1, 256, 11), "lane_logits": out["lane_logits"], "chord_logits": out["chord_logits"],
+               "ln_logits": out["ln_logits"]}
+        loss, acc = dpo_loss(lg, lb, map_logprob(ref, good, valid), map_logprob(ref, bad, valid))
+        self.assertEqual(acc, 1.0)
+        self.assertLess(float(loss), 0.01)
+
+
+class TestAugTag(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_tag_changes_the_condition_only_when_given(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", aug_tag=True)).eval()
+        with torch.no_grad():
+            model.aug_vec.fill_(0.5)                 # as if trained
+            for name, prm in model.named_parameters():
+                if "film" in name and prm.ndim == 2:   # FiLM layers start at zero: the condition has no effect until trained
+                    prm.normal_(0.0, 0.05)
+        args = (torch.randn(1, 256, fcfg.total_dim()), torch.zeros(1, 256, 13), torch.tensor([[5.0]]),
+                torch.zeros(1, STYLE_DIM), torch.zeros(1, STYLE_DIM), torch.randn(1, 30, fcfg.total_dim()), None)
+        with torch.no_grad():
+            plain = model(*args)["time_logits"]
+            untagged = model(*args, augmented=torch.zeros(1, 1))["time_logits"]
+            tagged = model(*args, augmented=torch.ones(1, 1))["time_logits"]
+        self.assertTrue(torch.allclose(plain, untagged))     # generation (no tag) = untagged crops
+        self.assertFalse(torch.allclose(plain, tagged))
+        # rates above --rate_max are never drawn
+        track = solve_map([Note(1000 + 200 * i, i % 4, 1000 + 200 * i, False) for i in range(40)], num_frames=4000)
+        index = SimpleNamespace(maps=[{"sr": 3.0, "song_id": "s", "track": "t"}], track=lambda i: track, feature_config=fcfg)
+        ds = HybridCropDataset(index, range(1), 512, 64, rate_max=1.3)
+        ds.rate_aug = 1.0
+        ds.rate_srs = [{f"{r:g}": 3.0 + 4 * (r - 1) for r in (1.1, 1.2, 1.3, 1.4, 1.5)}]
+        self.assertTrue({ds._choose_rate(0, i) for i in range(0, 400, 2)} <= {1.1, 1.2, 1.3})
+
+
+class TestAutoBatch(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_fills_the_card_and_backs_off_on_oom(self):
+        from unittest import mock
+
+        from osu_mapper.hybrid import autobatch
+
+        GB = 2 ** 30
+        state = {"peak": 0}
+        base, per, total, other = 1.0 * GB, 0.25 * GB, 8 * GB, 0.5 * GB
+
+        def step(bs):
+            need = base + per * bs
+            if need > total - other:
+                raise torch.cuda.OutOfMemoryError("fake")
+            state["peak"] = need
+
+        model = torch.nn.Linear(10, 10)
+        with mock.patch.object(torch.cuda, "mem_get_info", return_value=(total - other, total)), \
+             mock.patch.object(torch.cuda, "memory_reserved", return_value=0), \
+             mock.patch.object(torch.cuda, "empty_cache"), mock.patch.object(torch.cuda, "synchronize"), \
+             mock.patch.object(torch.cuda, "reset_peak_memory_stats"), \
+             mock.patch.object(torch.cuda, "max_memory_allocated", side_effect=lambda *_: state["peak"]):
+            bs = autobatch.find_batch_size(step, model, torch.device("cuda", 0), fraction=0.9, log=lambda *_: None)
+        # 90 % of 8 GB minus 0.5 GB of other programs = 6.7 GB; (6.7 - 1.0) / 0.25 = 22.8 -> 22 (even)
+        self.assertEqual(bs, 22)
+        self.assertLessEqual(base + per * bs, 0.9 * total - other)
+        self.assertIsNone(autobatch.find_batch_size(step, model, torch.device("cpu"), log=lambda *_: None))

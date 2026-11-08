@@ -191,6 +191,19 @@ def main(argv=None) -> None:
                          "this star rating' (learnt from songs with several difficulties) in the event probability; 0 = off")
     ap.add_argument("--patterns", default=None, help="pattern model for the fast-jack share (default checkpoints/hybrid/patterns.npz)")
     ap.add_argument("--threshold", default=None, help="event threshold(s), e.g. 0.5 or 0.5,0.4,0.3 (one difficulty per value; default: calibrated value stored in the checkpoint)")
+    ap.add_argument("--plan", default="auto",
+                    help="think first, then map (model trained with --plan_prob): 'auto' = a first pass proposes a per-bar "
+                         "technique plan, the second pass maps by it; a family name (stream, roll/stairs, trill, jacks, "
+                         "jumpstream, handstream, chordjack, ln) = that technique on every non-empty bar, at any star rating; "
+                         "'off' = one pass")
+    ap.add_argument("--correct_steps", type=int, default=3,
+                    help="self-correction after the map is made (model trained with --corrupt_prob): the error head marks "
+                         "wrong-looking frames, they are predicted again, a correction is kept only if the critic finds the map "
+                         "less wrong; 0 = off")
+    ap.add_argument("--sr_calibration", default=None, metavar="JSON",
+                    help="requested -> achieved curve of this checkpoint (sr_diagnose.py --write_calibration): the network "
+                         "is asked for the rating at which its own map really has the requested stars (default: the curve "
+                         "stored in the checkpoint, if any)")
     ap.add_argument("--sr_guidance", default="1",
                     help="make the map follow --sr more strongly (classifier-free guidance): 1 = off, 2-3 = strong; "
                          "a list (1,2,3) gives one difficulty per value")
@@ -331,13 +344,36 @@ def main(argv=None) -> None:
             segment_sections(an)  # finds the repeated phrases
             song_repeats = [r for r in an.repeats if r[3] >= 0.9]
             print(f"[repeats] {len(song_repeats)} repeated phrases (4 bars, similarity >= 0.9) mapped like their originals")
+        from osu_mapper.hybrid.inference import calibrated_request
+        sr_curve = None
+        if args.sr_calibration:
+            import json as _json
+            sr_curve = _json.loads(Path(args.sr_calibration).read_text(encoding="utf-8"))
+        elif getattr(predictor, "sr_calibration", None):
+            sr_curve = predictor.sr_calibration
         for target, guidance in [(t, g) for t in parse_sr_list(args.sr) for g in guidances]:
+            ask, saturated = calibrated_request(target, sr_curve)
+            if sr_curve is not None:
+                print(f"[calibration] {target:.2f}* -> network asked for {ask:.2f}*"
+                      + (" (above everything this network reaches: the fit has to add the rest)" if saturated else ""))
             if target > sr_hi:
                 print(f"[warn] star rating {target:g} is outside what the model was trained on (up to ~{sr_hi:g}*): "
                       f"the network extrapolates and the map gets WORSE, not harder (it saturates, then collapses)")
             t1 = time.time()
-            out = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
+            out = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
                                     sr_guidance=guidance, style_guidance=args.style_guidance)
+            plan_in = None
+            if args.plan != "off" and out.plan_logits is not None:
+                import numpy as np
+                from osu_mapper.hybrid.motif_targets import PLAN_FAMILIES, plan_from_logits
+                force = None if args.plan == "auto" else args.plan
+                if force is not None and force not in PLAN_FAMILIES:
+                    raise SystemExit(f"--plan: '{force}' is not one of {', '.join(PLAN_FAMILIES[1:])}")
+                plan_in = plan_from_logits(out.plan_logits, timing, out.frame_ms, force)
+                fams, cnt = np.unique(plan_in[0], return_counts=True)
+                print("[plan] " + ", ".join(f"{PLAN_FAMILIES[f]} {100 * c / cnt.sum():.0f}%" for f, c in sorted(zip(fams, cnt), key=lambda x: -x[1])))
+                out = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
+                                        sr_guidance=guidance, style_guidance=args.style_guidance, plan=plan_in)
             fit_info = ""
             for th in (thresholds if user_thresholds is not None or not predictor.threshold_by_sr else [predictor.threshold_for(target)]):
                 if args.fit_sr == "on" and user_thresholds is None:
@@ -355,13 +391,24 @@ def main(argv=None) -> None:
                         from osu_mapper.hybrid.canvas import refine
                         g_ = guidance
                         out, fit = refine(
-                            lambda cv: predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
-                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv),
+                            lambda cv: predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv,
+                                                         plan=plan_in),
                             lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
                             out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
                             steps=args.refine_steps, log=print, first=out)
                     else:
                         fit = fit_network_map(out, k_th, timing, target, args.od, log=print, **fit_kw)
+                    if args.correct_steps > 0 and getattr(predictor.model.cfg, "error_head", False):
+                        from osu_mapper.hybrid.canvas import correct
+                        g_ = guidance
+                        out, fit = correct(
+                            lambda cv: predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv,
+                                                         plan=plan_in),
+                            lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
+                            out, fit, out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
+                            steps=args.correct_steps, log=print)
                     notes, th = fit.notes, fit.threshold
                     fit_info = (f" | fitted: threshold {fit.threshold:.2f}, timing {-fit.lag_ms:+d} ms, lanes re-assigned "
                                 f"{fit.lane_strength:.2f}, fast jacks {100 * fit.jack_share:.0f}%")
@@ -370,8 +417,8 @@ def main(argv=None) -> None:
                         # Horizon 5.35 -> 5.53 for 5.57*, The Last Petal 5.39 -> 5.78 for 7.14*); only as a fallback, since
                         # where the rating is reachable without it guidance only blurs the network (F1 0.70 -> 0.70, 3: 0.70)
                         for g2 in (2.0, 3.0):
-                            out2 = predictor.predict(inputs, target, style, smask, batch_size=args.batch_size,
-                                                     sr_guidance=g2, style_guidance=args.style_guidance)
+                            out2 = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
+                                                     sr_guidance=g2, style_guidance=args.style_guidance, plan=plan_in)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                                    **fit_kw)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):

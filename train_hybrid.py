@@ -106,9 +106,10 @@ def to_device(batch: Dict[str, torch.Tensor], dev: torch.device) -> Dict[str, to
 
 def forward_batch(model: HybridParamNet, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     canvas = (batch["canvas_state"], batch["canvas_ms"], batch["canvas_ln"]) if "canvas_state" in batch else None
+    plan = (batch["plan_in_family"], batch["plan_in_copy"]) if "plan_in_family" in batch else None
     return model(
         batch["feats"], batch["beat"], batch["sr"], batch["style"], batch["style_mask"],
-        batch["coarse"], batch["coarse_mask"], canvas=canvas,
+        batch["coarse"], batch["coarse_mask"], canvas=canvas, plan=plan, augmented=batch.get("augmented"),
     )
 
 
@@ -239,7 +240,11 @@ def main() -> None:
     ap.add_argument("--preset", default="base", choices=sorted(PRESETS))
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--steps_per_epoch", type=int, default=1000)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", default="16",
+                    help="crops per GPU and step, or 'auto': the largest batch whose training step fits --mem_fraction of the "
+                         "card (probed with real crops and every loss of the run)")
+    ap.add_argument("--mem_fraction", type=float, default=0.9,
+                    help="--batch_size auto: share of the GPU memory to fill (lower it if other programs need the card)")
     ap.add_argument("--crop_sec", type=float, default=20.48, help="training window length (also the inference window)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--min_lr", type=float, default=1e-5)
@@ -272,13 +277,41 @@ def main() -> None:
                          "last 6 chords (needs --motifs); 0 = off")
     ap.add_argument("--motifs", default=None, help="motif library (mine_patterns.py; default checkpoints/hybrid/motifs.npz, "
                                                    "else test_NN/motifs.npz)")
+    ap.add_argument("--dpo_weight", type=float, default=0.1,
+                    help="preference optimization (DPO) on the pairs of make_self_maps.py (human map > the network's map, "
+                         "best > worst candidate by the objective reward); used only when the dataset has pairs; 0 = off")
+    ap.add_argument("--dpo_beta", type=float, default=0.1, help="DPO: strength of the pull to the frozen reference network")
+    ap.add_argument("--dpo_every", type=int, default=4, help="DPO: one pair batch every N training steps")
+    ap.add_argument("--plan_prob", type=float, default=0.5,
+                    help="think first, then map: share of crops that get the per-bar technique plan (family + copy kind, "
+                         "from the motif analysis) as input; the plan head always learns to propose it (needs --pattern_weight "
+                         "> 0, which computes the plan targets); 0 = off")
+    ap.add_argument("--plan_weight", type=float, default=0.2, help="loss: plan head")
+    ap.add_argument("--corrupt_prob", type=float, default=0.3,
+                    help="break and fix: share of canvas crops where almost the whole map is shown but partly broken (notes "
+                         "removed / added / moved, wrong lanes, jacks, wrong chords, LN flips); the network predicts every frame "
+                         "and its error head learns which shown frames are wrong (the self-correction critic); 0 = off")
+    ap.add_argument("--error_weight", type=float, default=0.3, help="loss: error head of break-and-fix crops")
     ap.add_argument("--canvas_prob", type=float, default=0.5,
                     help="masked discrete diffusion: share of crops that get part of their own map as input (the rest are "
                          "fully masked = the plain network); adds the canvas input; 0 = off (see osu_mapper/hybrid/canvas.py)")
     ap.add_argument("--ladder_k", type=int, default=4, help="difficulty ladder: maps of the same song per training crop")
     ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
-    ap.add_argument("--sr_balance", type=float, default=0.0,
+    ap.add_argument("--rate_aug", type=float, default=0.3,
+                    help="share of training crops sped up x1.1..--rate_max together with their music (features resampled, star "
+                         "rating measured by rosu-pp at that clock rate); rates that land in rare star bins are preferred. "
+                         "The network saturated around 5* before (sr_diagnose.py); 0 = off")
+    ap.add_argument("--rate_max", type=float, default=1.3,
+                    help="fastest rate of --rate_aug (1.1 .. 1.5): beyond x1.3 a sped-up map drifts from how mappers snap at "
+                         "that tempo; the hole in the hard bins is still filled")
+    ap.add_argument("--sr_rare", type=float, default=0.5,
+                    help="loss weight of a crop = (real maps in its 1-star bin)^-sr_rare (mean 1 per batch): rare, hard "
+                         "difficulties weigh more; 0 = off")
+    ap.add_argument("--finetune_min_sr", type=float, default=0.0,
+                    help="train only on maps of at least this star rating (or that reach it sped up with --rate_aug): a short "
+                         "second stage after the full training, e.g. --resume --finetune_min_sr 5 --epochs 3 --lr 5e-5")
+    ap.add_argument("--sr_balance", type=float, default=0.5,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
     ap.add_argument("--pitch_shift", type=float, default=0.5,
                     help="share of training crops transposed by +-1..2 semitones in feature space (stops the network from "
@@ -333,6 +366,17 @@ def main() -> None:
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
     val_idx = [i for i in val_idx if not index.maps[i].get("derived")]  # validation = real maps only
+    if args.finetune_min_sr > 0:
+        reach = {}
+        if args.rate_aug > 0:
+            from osu_mapper.hybrid.dataset import rate_star_ratings
+            reach = rate_star_ratings(index, train_idx)
+        before = len(train_idx)
+        train_idx = [i for i in train_idx if float(index.maps[i].get("sr", 0.0)) >= args.finetune_min_sr
+                     or max(reach.get(index.maps[i]["track"], {}).values() or [0.0]) >= args.finetune_min_sr]
+        print(f"[data] fine-tuning on the hard end: {len(train_idx)} of {before} training maps reach {args.finetune_min_sr:g}*")
+        if not train_idx:
+            sys.exit("--finetune_min_sr: no training map reaches that star rating")
     n_derived = sum(1 for i in train_idx if index.maps[i].get("derived"))
     print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps"
           + (f" ({n_derived} derived, {100 * args.derived_weight:.0f}% of draws)" if n_derived else "")
@@ -373,6 +417,15 @@ def main() -> None:
         new_head = resume_ckpt is not None
     if args.canvas_prob > 0 and not cfg.canvas and not args.eval_only:
         cfg.canvas = True
+        new_head = new_head or resume_ckpt is not None
+    if args.corrupt_prob > 0 and args.error_weight > 0 and args.canvas_prob > 0 and not cfg.error_head and not args.eval_only:
+        cfg.error_head = True
+        new_head = new_head or resume_ckpt is not None
+    if args.rate_aug > 0 and not cfg.aug_tag and not args.eval_only:
+        cfg.aug_tag = True          # sped-up crops are tagged; generation runs untagged = "like a real map"
+        new_head = new_head or resume_ckpt is not None
+    if args.plan_prob > 0 and args.pattern_weight > 0 and not cfg.plan and not args.eval_only:
+        cfg.plan = True
         new_head = new_head or resume_ckpt is not None
     if args.pattern_weight > 0 and not cfg.pattern_heads and not args.eval_only:
         cfg.pattern_heads = True
@@ -441,8 +494,12 @@ def main() -> None:
     train_model = DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None) if distributed else model
 
     weights = LossWeights(density=args.density_weight, pair=args.pair_weight, ladder=args.ladder_weight, jack=args.jack_weight,
-                          patterns=args.pattern_weight, prior=args.prior_weight)
-    if args.pair_prob > 0 and args.batch_size % 2:
+                          patterns=args.pattern_weight, prior=args.prior_weight,
+                          error=args.error_weight if args.corrupt_prob > 0 else 0.0,
+                          plan=args.plan_weight if (args.plan_prob > 0 and args.pattern_weight > 0) else 0.0)
+    auto_batch = str(args.batch_size).lower() == "auto"
+    args.batch_size = 16 if auto_batch else int(args.batch_size)
+    if args.pair_prob > 0 and args.batch_size % 2 and not auto_batch:
         print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
         args.pair_prob = 0.0
     total_steps = (start_epoch + args.epochs) * args.steps_per_epoch if resume_ckpt is None else max(int(resume_ckpt.get("total_steps", 0)), (start_epoch + args.epochs) * args.steps_per_epoch)
@@ -455,13 +512,52 @@ def main() -> None:
                                  sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0,
                                  pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0,
                                  canvas_prob=args.canvas_prob,
-                                 pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib)
+                                 pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
+                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare, rate_max=args.rate_max,
+                                 corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0,
+                                 plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0)
+    if auto_batch:
+        from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
+        probe_items = [train_ds[i] for i in range(12)]
+        frac = args.mem_fraction * (0.75 if (args.dpo_weight > 0 and index.data.get("dpo_pairs") and not distributed) else 1.0)
+
+        def probe_step(bs: int) -> None:
+            b = to_device(repeat_batch(probe_items, bs, collate_hybrid), dev)
+            with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
+                o = forward_batch(model, b)
+            l, _ = compute_losses(o, b, weights, cfg.frame_ms, sigma_ms=args.sigma_start, event_weight=args.event_weight)
+            l.backward()
+            model.zero_grad(set_to_none=True)
+            del o, l, b
+
+        found_bs = find_batch_size(probe_step, model, dev, frac, distributed=distributed, log=print)
+        if found_bs is None:
+            print("[batch] auto needs a CUDA GPU: using 16")
+        else:
+            args.batch_size = found_bs
+            train_ds.samples_per_epoch = args.steps_per_epoch * args.batch_size
+        print(f"[train] batch={args.batch_size} x {world} GPU(s) = {args.batch_size * world}")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
         val_ds = HybridCropDataset(index, val_idx, crop_frames, args.val_crops, train=False, seed=args.seed,
                                    pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_hybrid)
+    # preference pairs (make_self_maps.py): DPO against a frozen copy of the network at the start of this run
+    dpo_iter = ref_model = None
+    dpo_pairs = [p for p in index.data.get("dpo_pairs", []) if p.get("song_id") in {index.maps[i]["song_id"] for i in train_idx}]
+    if args.dpo_weight > 0 and dpo_pairs and distributed:
+        # a second forward pass per step (the pair batch) does not fit DistributedDataParallel's one-pass gradient sync
+        print("[dpo] off with several GPUs: run the DPO stage on one GPU (python train_hybrid.py --resume ... --dpo_weight 0.1)")
+    elif args.dpo_weight > 0 and dpo_pairs and not args.eval_only:
+        from osu_mapper.hybrid.dpo import DPOPairDataset
+        dpo_ds = DPOPairDataset(index, dpo_pairs, crop_frames, 10 ** 9, seed=args.seed + 31 * rank)
+        dpo_iter = iter(DataLoader(dpo_ds, batch_size=max(2, args.batch_size // 2), shuffle=False, num_workers=0,
+                                   collate_fn=collate_hybrid))
+        ref_model = copy.deepcopy(model).eval()
+        for p_ in ref_model.parameters():
+            p_.requires_grad_(False)
+        print(f"[dpo] {len(dpo_pairs)} preference pairs, beta {args.dpo_beta:g}, one batch every {args.dpo_every} steps")
     rng = random.Random(args.seed)
     val_full = sorted(rng.sample(val_idx, min(args.val_maps, len(val_idx)))) if val_idx else []
 
@@ -560,6 +656,7 @@ def main() -> None:
             t0 = time.time()
             run: Dict[str, float] = {}
             n_run = 0
+            run_n: Dict[str, int] = {}
             for batch in train_loader:
                 batch = to_device(batch, dev)
                 lr = lr_at(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
@@ -569,6 +666,21 @@ def main() -> None:
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                     out = forward_batch(train_model, batch)
                 loss, logs = compute_losses(out, batch, weights, cfg.frame_ms, sigma_ms=sigma, event_weight=args.event_weight)
+                if dpo_iter is not None and step % max(1, args.dpo_every) == 0:
+                    from osu_mapper.hybrid.dpo import dpo_loss, map_logprob
+                    db = to_device(next(dpo_iter), dev)
+                    nb = db["feats"].shape[0]
+                    zst = torch.zeros(nb, cfg.style_dim, device=dev)
+                    with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
+                        po = train_model(db["feats"], db["beat"], db["sr"], zst, zst, db["coarse"], db["coarse_mask"])
+                        with torch.no_grad():
+                            ro = ref_model(db["feats"], db["beat"], db["sr"], zst, zst, db["coarse"], db["coarse_mask"])
+                    tc = {k[2:]: v for k, v in db.items() if k.startswith("c_")}
+                    tr = {k[2:]: v for k, v in db.items() if k.startswith("r_")}
+                    ld, acc = dpo_loss(map_logprob(po, tc, db["valid"]), map_logprob(po, tr, db["valid"]),
+                                       map_logprob(ro, tc, db["valid"]), map_logprob(ro, tr, db["valid"]), args.dpo_beta)
+                    loss = loss + args.dpo_weight * ld
+                    logs["dpo"], logs["dpo_acc"] = float(ld.detach()), acc
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -580,15 +692,21 @@ def main() -> None:
                 step += 1
                 for k, v in logs.items():
                     run[k] = run.get(k, 0.0) + v
+                    run_n[k] = run_n.get(k, 0) + 1          # some terms (DPO) are not computed every step
                 n_run += 1
                 if step % args.log_every == 0:
-                    avg = {k: v / n_run for k, v in run.items()}
+                    avg = {k: v / max(1, run_n.get(k, n_run)) for k, v in run.items()}
                     print(f"  step {step:>7} | lr {lr:.2e} | sigma {sigma:.2f}ms | total {avg['total']:.4f} | time {avg['time']:.4f} lane {avg['lane']:.3f} chord {avg['chord']:.3f} "
                           f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f} "
                           f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)"
                           + (f" ladder {avg['ladder']:.3f}" if "ladder" in avg else "")
-                          + (f" jack {avg['jack']:.3f}" if "jack" in avg else ""), flush=True)
-                    run, n_run = {}, 0
+                          + (f" jack {avg['jack']:.3f}" if "jack" in avg else "")
+                          + (f" error {avg['error']:.3f}" if "error" in avg else "")
+                          + (f" patterns {avg['patterns']:.3f}" if "patterns" in avg else "")
+                          + (f" prior {avg['prior']:.3f}" if "prior" in avg else "")
+                          + (f" plan {avg['plan']:.3f}" if "plan" in avg else "")
+                          + (f" dpo {avg['dpo']:.3f} (acc {avg['dpo_acc']:.2f})" if "dpo" in avg else ""), flush=True)
+                    run, n_run, run_n = {}, 0, {}
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait
                 dist.barrier()

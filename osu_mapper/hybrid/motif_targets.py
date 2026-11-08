@@ -22,7 +22,7 @@ lane distribution (codes mapped to masks with the true previous chords) towards 
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +38,45 @@ PATTERN_HEADS: Dict[str, int] = {
     "copy": len(COPY_KINDS) + 1,          # none + exact / mirror / variation / rhythm
     "copy_dist": COPY_DIST_BEATS.size + 2,  # 0 = no copy, 1.. = distance bins
 }
+
+
+# plan of a map ("think first, then map"): the technique family of every bar (4 beats) - what a mapper decides before
+# placing notes. Learnt as a target (plan head) and given back as an input (plan embedding), so a technique learnt at
+# any difficulty can be asked for at any other.
+PLAN_FAMILIES: Tuple[str, ...] = ("sparse", "stream", "roll/stairs", "trill", "jacks", "jumpstream", "handstream",
+                                  "chordjack", "ln")
+N_PLAN = len(PLAN_FAMILIES)
+N_PLAN_COPY = len(COPY_KINDS) + 1       # no copy / exact / mirror / variation / rhythm
+
+
+def bar_family(masks: Sequence[int], lnmasks: Sequence[int]) -> int:
+    """Technique family of the chords of one bar (rules a mapper would use to name it)."""
+    m = [int(x) & 15 for x in masks]
+    n = len(m)
+    if n < 3:
+        return PLAN_FAMILIES.index("sparse")
+    pop = [bin(x).count("1") for x in m]
+    ln_share = float(np.mean([bool(x) for x in lnmasks])) if len(lnmasks) else 0.0
+    if ln_share >= 0.4:
+        return PLAN_FAMILIES.index("ln")
+    big = float(np.mean([p >= 3 for p in pop]))
+    two = float(np.mean([p >= 2 for p in pop]))
+    overlap = float(np.mean([bool(m[i] & m[i - 1]) for i in range(1, n)]))
+    if big >= 0.3:
+        return PLAN_FAMILIES.index("chordjack" if overlap >= 0.5 else "handstream")
+    if two >= 0.35:
+        return PLAN_FAMILIES.index("chordjack" if overlap >= 0.5 else "jumpstream")
+    same = float(np.mean([m[i] == m[i - 1] for i in range(1, n)]))
+    if same >= 0.3:
+        return PLAN_FAMILIES.index("jacks")
+    if n >= 4 and float(np.mean([m[i] == m[i - 2] and m[i] != m[i - 1] for i in range(2, n)])) >= 0.5:
+        return PLAN_FAMILIES.index("trill")
+    cols = [int(np.mean([c for c in range(4) if (x >> c) & 1])) for x in m]
+    steps = [cols[i] - cols[i - 1] for i in range(1, n)]
+    mono = float(np.mean([abs(d) == 1 and (i == 0 or d == steps[i - 1]) for i, d in enumerate(steps)]))
+    if mono >= 0.5:
+        return PLAN_FAMILIES.index("roll/stairs")
+    return PLAN_FAMILIES.index("stream")
 
 
 def event_notes(frames: np.ndarray, time_class: np.ndarray, event_mask: np.ndarray, ln_flag: np.ndarray,
@@ -62,6 +101,7 @@ def compute_targets(frames: np.ndarray, time_class: np.ndarray, event_mask: np.n
     n = int(frames.size)
     out = {k: np.full(n, -1, dtype=np.int16) for k in PATTERN_HEADS}
     out["prev"] = np.zeros((n, 2), dtype=np.uint8)
+    out["family"] = np.full(n, -1, dtype=np.int16)
     if n == 0:
         out["prior"] = np.zeros((0, 16), dtype=np.float16)
         return out
@@ -76,6 +116,10 @@ def compute_targets(frames: np.ndarray, time_class: np.ndarray, event_mask: np.n
         out["shape"][:] = tok["shape"][0]
         out["flow"][:] = tok["flow"][0]
         out["hand"][:] = HAND[cs.masks]
+        bar = np.floor((cs.beats - cs.beats[0]) / 4.0).astype(np.int64)
+        for b in np.unique(bar):
+            sel = np.flatnonzero(bar == b)
+            out["family"][sel] = bar_family(cs.masks[sel], cs.lnmasks[sel])
         copy = np.zeros(n, dtype=np.int16)
         dist = np.zeros(n, dtype=np.int16)
         if n >= 16:
@@ -96,7 +140,7 @@ def compute_targets(frames: np.ndarray, time_class: np.ndarray, event_mask: np.n
     return out
 
 
-TARGETS_VERSION = "motif-targets-v1"
+TARGETS_VERSION = "motif-targets-v2"
 
 
 def targets_for_track(track, sr: float, lib: Optional[MotifLibrary], cache_path=None) -> Dict[str, np.ndarray]:
@@ -121,3 +165,28 @@ def targets_for_track(track, sr: float, lib: Optional[MotifLibrary], cache_path=
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache_path, tag=np.array(tag), **out)
     return out
+
+
+def plan_from_logits(plan_logits: np.ndarray, timing_points, frame_ms: int = 10,
+                     force_family: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """The network's plan as per-frame inputs for the second pass: per bar (4 beats of the red lines) the family and the
+    copy kind with the highest summed log-probability; ``force_family`` puts one technique on every bar that is not
+    'sparse' (any technique at any difficulty)."""
+    from .motifs import beat_positions
+
+    F = plan_logits.shape[0]
+    lp = plan_logits.astype(np.float64)
+    fam_lp = lp[:, :N_PLAN] - np.logaddexp.reduce(lp[:, :N_PLAN], axis=1, keepdims=True)
+    cpy_lp = lp[:, N_PLAN:] - np.logaddexp.reduce(lp[:, N_PLAN:], axis=1, keepdims=True)
+    beats, _, _ = beat_positions((np.arange(F) + 0.5) * frame_ms, timing_points)
+    bar = np.floor(beats / 4.0).astype(np.int64)
+    fam = np.zeros(F, np.int64)
+    cpy = np.zeros(F, np.int64)
+    for b in np.unique(bar):
+        sel = bar == b
+        fam[sel] = int(np.argmax(fam_lp[sel].sum(axis=0)))
+        cpy[sel] = int(np.argmax(cpy_lp[sel].sum(axis=0)))
+    if force_family:
+        k = PLAN_FAMILIES.index(force_family)
+        fam = np.where(fam == PLAN_FAMILIES.index("sparse"), fam, k)
+    return fam, cpy

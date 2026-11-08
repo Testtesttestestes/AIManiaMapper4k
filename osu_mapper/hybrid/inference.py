@@ -135,7 +135,8 @@ class HybridPredictor:
                    int(ckpt.get("onset_shift_ms", 0)), float(ckpt.get("ln_length_scale", 1.0)))
         pred.sr_range = ckpt.get("sr_range")
         pred.disabled_reps = tuple(disable_reps)
-        pred.threshold_by_sr = {int(k): float(v) for k, v in (ckpt.get("decode_threshold_by_sr") or {}).items()}  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
+        pred.threshold_by_sr = {int(k): float(v) for k, v in (ckpt.get("decode_threshold_by_sr") or {}).items()}
+        pred.sr_calibration = ckpt.get("sr_calibration")  # [min, 99th percentile, max] star rating of the training maps (new checkpoints)
         return pred
 
     @torch.no_grad()
@@ -151,6 +152,7 @@ class HybridPredictor:
         sr_guidance: float = 1.0,
         style_guidance: float = 1.0,
         canvas: Optional[tuple] = None,
+        plan: Optional[tuple] = None,
     ) -> HeadOutputs:
         """Sliding-window inference over the whole track.
 
@@ -172,6 +174,8 @@ class HybridPredictor:
         time_acc = np.zeros((F, 1 + H), dtype=np.float32)
         w_acc = np.zeros(F, dtype=np.float32)
         imp_acc = np.zeros(F, dtype=np.float32)
+        err_acc = None
+        plan_rows = None
         ladder = None
         best_w = np.zeros(F, dtype=np.float32)
         lane = np.zeros((F, cfg.n_lane_codes), dtype=np.float32)
@@ -205,6 +209,19 @@ class HybridPredictor:
             if canvas is not None and getattr(self.model.cfg, "canvas", False):
                 # outside the song: state 0 = masked
                 cv = tuple(torch.from_numpy(np.stack([window_slice(np.asarray(a), s) for s in chunk])).to(dev) for a in canvas)
+            pl = None
+            if plan is not None and getattr(self.model.cfg, "plan", False):
+                from .motif_targets import N_PLAN, N_PLAN_COPY
+
+                def plan_slice(a: np.ndarray, s: int, unknown: int) -> np.ndarray:
+                    o = np.full(W, unknown, dtype=np.int64)
+                    lo, hi = max(0, s), min(a.shape[0], s + W)
+                    if hi > lo:
+                        o[lo - s: hi - s] = a[lo:hi]
+                    return o
+                pl = (torch.from_numpy(np.stack([plan_slice(np.asarray(plan[0]), s, N_PLAN) for s in chunk])).to(dev),
+                      torch.from_numpy(np.stack([plan_slice(np.asarray(plan[1]), s, N_PLAN_COPY) for s in chunk])).to(dev))
+
             def run(sr_value: float, use_style: bool) -> Dict[str, torch.Tensor]:
                 return self.model(
                     feats, beat,
@@ -215,6 +232,7 @@ class HybridPredictor:
                     None,
                     rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
                     canvas=cv,
+                    plan=pl,
                 )
 
             out = run(star_rating, True)
@@ -233,6 +251,8 @@ class HybridPredictor:
             lb = out["ln_bucket_logits"].argmax(dim=-1).cpu().numpy()
             lr = out["ln_resid"].float().cpu().numpy()
             imp = out["importance"].float().cpu().numpy() if "importance" in out else None
+            err = torch.sigmoid(out["error_logits"].float()).cpu().numpy() if ("error_logits" in out and cv is not None) else None
+            plg = out["plan_logits"].float().cpu().numpy() if "plan_logits" in out else None
             if imp is not None and ladder is None:
                 ladder = (float(out["ladder_c0"].float()), out["ladder_c"].float().cpu().numpy().copy())
             for j, s in enumerate(chunk):
@@ -243,6 +263,10 @@ class HybridPredictor:
                 time_acc[a:b] += tp[j, a - s: b - s] * wj[:, None]
                 if imp is not None:
                     imp_acc[a:b] += imp[j, a - s: b - s] * wj
+                if err is not None:
+                    if err_acc is None:
+                        err_acc = np.zeros(F, np.float64)
+                    err_acc[a:b] += err[j, a - s: b - s] * wj
                 w_acc[a:b] += wj
                 better = wj > best_w[a:b]
                 rows = np.flatnonzero(better) + a
@@ -253,6 +277,10 @@ class HybridPredictor:
                 ln_logits[rows] = ll[j, src]
                 ln_bucket[rows] = lb[j, src]
                 ln_resid[rows] = lr[j, src]
+                if plg is not None:
+                    if plan_rows is None:
+                        plan_rows = np.zeros((F, plg.shape[-1]), np.float32)
+                    plan_rows[rows] = plg[j, src]
                 best_w[a:b] = np.maximum(best_w[a:b], wj)
             if progress is not None:
                 progress(min(len(starts), bi + n), len(starts))
@@ -269,6 +297,8 @@ class HybridPredictor:
             chord_logprobs=chord,
             importance=(imp_acc / np.maximum(w_acc, 1e-6)).astype(np.float32) if ladder is not None else None,
             ladder=ladder,
+            error_probs=(err_acc / np.maximum(w_acc, 1e-6)).astype(np.float32) if err_acc is not None else None,
+            plan_logits=plan_rows,
         )
 
 
@@ -298,3 +328,21 @@ def star_rating_of(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint
 def estimated_timing_points(reps: Dict[str, np.ndarray], frame_ms: int) -> List[RawTimingPoint]:
     bpm, offset = estimate_tempo(reps, frame_ms)
     return [RawTimingPoint(time=float(offset), beat_len=60000.0 / bpm, meter=4, volume=70, uninherited=True)]
+
+
+def calibrated_request(target: float, curve: Optional[Dict[str, list]]) -> Tuple[float, bool]:
+    """The star rating to ask the network for so that its raw map has ``target`` stars, from a measured
+    requested -> achieved curve (sr_diagnose.py --write_calibration). Returns (request, saturated): saturated when
+    the target is above everything the network reached (then the largest measured request)."""
+    if not curve or len(curve.get("requests", [])) < 2:
+        return float(target), False
+    req = np.asarray(curve["requests"], dtype=np.float64)
+    ach = np.maximum.accumulate(np.asarray(curve["achieved"], dtype=np.float64))   # monotone
+    o = np.argsort(req)
+    req, ach = req[o], ach[o]
+    if target >= ach[-1] - 1e-6:
+        return float(req[-1]), bool(target > ach[-1] + 0.05)
+    if target <= ach[0]:
+        return float(max(0.5, req[0] - (ach[0] - target))), False
+    keep = np.concatenate([[True], np.diff(ach) > 1e-6])
+    return float(np.interp(target, ach[keep], req[keep])), False

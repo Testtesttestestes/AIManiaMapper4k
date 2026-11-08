@@ -42,6 +42,8 @@ class LossWeights:
     jack: float = 0.0      # fast transitions (< 160 ms): P(the chosen lane code hits a lane of the previous chord) vs the map
     ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
     patterns: float = 0.0  # pattern knowledge: rhythm / shape / hand / flow / copy of every event (needs the pattern heads)
+    plan: float = 0.0      # think first: the per-bar technique plan (family + copy kind) of every frame
+    error: float = 0.0     # break and fix: which visible canvas frames are wrong (needs the error head)
     prior: float = 0.0     # motif library: lane distribution of real maps after the last 6 chords (distillation)
 
     def to_dict(self) -> Dict[str, float]:
@@ -88,15 +90,33 @@ def compute_losses(
     tc = batch["time_class"]
     valid = batch["valid"].float()
     B, T = tc.shape
+    # per-crop weights (rare star ratings weigh more, dataset sr_rare), mean 1 inside the batch
+    if "loss_weight" in batch:
+        sw = batch["loss_weight"].float().view(B)
+        sw = sw / sw.mean().clamp(min=1e-8)
+    else:
+        sw = torch.ones(B, device=tc.device)
+
+    def wmean(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        """Mean of per-element losses ``x`` whose crop indices are ``rows``, weighted by the crop weights."""
+        wr = sw[rows]
+        return (x * wr).sum() / wr.sum().clamp(min=1e-8)
+
+    bidx = torch.arange(B, device=tc.device).view(B, 1).expand(B, T)
     # masked diffusion: frames given on the canvas are not predicted (time, lanes, members count only masked frames)
-    valid_pred = valid * (batch["canvas_state"] == 0).float() if "canvas_state" in batch else valid
+    if "canvas_train" in batch:      # masked frames, or every frame of a "break and fix" crop
+        valid_pred = valid * batch["canvas_train"].float()
+    elif "canvas_state" in batch:
+        valid_pred = valid * (batch["canvas_state"] == 0).float()
+    else:
+        valid_pred = valid
     logs: Dict[str, float] = {}
 
     # --- time (per-ms) -------------------------------------------------------------------------
     target = soft_time_targets(tc, frame_ms, sigma_ms)
     logp = F.log_softmax(out["time_logits"].float(), dim=-1)
     ce = -(target * logp).sum(dim=-1)
-    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred
+    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred * sw.view(B, 1)
     loss_time = (ce * w).sum() / w.sum().clamp(min=1.0)
     total = weights.time * loss_time
     logs["time"] = float(loss_time.detach())
@@ -110,23 +130,32 @@ def compute_losses(
         return sum(out[k].float().sum() for k in keys) * 0.0
     if n_ev > 0:
         # --- lane code -----------------------------------------------------------------------
-        loss_lane = F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing)
+        rows_ev = bidx[ev]
+        loss_lane = wmean(F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing,
+                                          reduction="none"), rows_ev)
         # --- members ---------------------------------------------------------------------------
         masks = batch["event_mask"]
         bits = ((masks.unsqueeze(-1) >> torch.arange(4, device=masks.device)) & 1)
         chord = bits.sum(dim=-1)
         member = (torch.arange(MAX_MEMBERS, device=masks.device).view(1, 1, -1) < chord.unsqueeze(-1)) & ev.unsqueeze(-1)
-        loss_chord = F.cross_entropy(out["chord_logits"][ev].float(), (chord[ev] - 1).clamp(0, MAX_MEMBERS - 1))
+        loss_chord = wmean(F.cross_entropy(out["chord_logits"][ev].float(), (chord[ev] - 1).clamp(0, MAX_MEMBERS - 1),
+                                           reduction="none"), rows_ev)
+        bidx_m = bidx.unsqueeze(-1).expand(B, T, MAX_MEMBERS)
         chord_member = member & (chord.unsqueeze(-1) >= 2)
         if chord_member.any():
-            loss_stagger = F.cross_entropy(out["stagger_logits"][chord_member].float(), batch["stagger"][chord_member].clamp(0, frame_ms - 1))
+            loss_stagger = wmean(F.cross_entropy(out["stagger_logits"][chord_member].float(),
+                                                 batch["stagger"][chord_member].clamp(0, frame_ms - 1), reduction="none"),
+                                 bidx_m[chord_member])
         else:
             loss_stagger = zero("stagger_logits")
-        loss_lnf = F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float())
+        loss_lnf = wmean(F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float(),
+                                                            reduction="none"), bidx_m[member])
         ln_member = member & (batch["ln_flag"] > 0.5)
         if ln_member.any():
             b_t, r_t = ln_targets(batch["ln_len"][ln_member])
-            loss_lnl = F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t) + F.l1_loss(out["ln_resid"][ln_member].float(), r_t)
+            rows_ln = bidx_m[ln_member]
+            loss_lnl = wmean(F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t, reduction="none")
+                             + F.l1_loss(out["ln_resid"][ln_member].float(), r_t, reduction="none"), rows_ln)
         else:
             loss_lnl = zero("ln_bucket_logits", "ln_resid")
     else:
@@ -160,7 +189,8 @@ def compute_losses(
     log_e = torch.stack([torch.log1p(e_events), torch.log1p(e_notes)], dim=-1)
     log_n = torch.stack([torch.log1p(n_events), torch.log1p(n_notes)], dim=-1)
     if weights.density > 0 and has.any():
-        loss_density = F.smooth_l1_loss(log_e[has], log_n[has], beta=0.1)
+        hb = torch.nonzero(has).view(-1)
+        loss_density = wmean(F.smooth_l1_loss(log_e[has], log_n[has], beta=0.1, reduction="none").mean(dim=-1), hb)
     else:
         loss_density = zero("time_logits", "chord_logits")
     pair = batch.get("pair_prev")
@@ -205,6 +235,35 @@ def compute_losses(
             loss_ladder = out["importance"].float().sum() * 0.0 + out["ladder_c"].sum() * 0.0
         total = total + weights.ladder * loss_ladder
         logs["ladder"] = float(loss_ladder.detach())
+
+    # --- the plan ------------------------------------------------------------------------------
+    if weights.plan > 0 and "plan_logits" in out and "plan_family" in batch:
+        from .motif_targets import N_PLAN
+        pl = out["plan_logits"].float()
+        vm = valid > 0
+        if vm.any():
+            loss_plan = 0.5 * (F.cross_entropy(pl[..., :N_PLAN][vm], batch["plan_family"][vm])
+                               + F.cross_entropy(pl[..., N_PLAN:][vm], batch["plan_copy"][vm]))
+        else:
+            loss_plan = pl.sum() * 0.0
+        total = total + weights.plan * loss_plan
+        logs["plan"] = float(loss_plan.detach())
+
+    # --- break and fix: the critic -------------------------------------------------------------
+    # every visible canvas frame: is it what the map has there? (correct maps too: "nothing to fix" teaches stopping)
+    if weights.error > 0 and "error_logits" in out and "canvas_wrong" in batch:
+        vis = (batch["canvas_state"] != 0).float() * valid
+        if vis.sum() > 0:
+            y = batch["canvas_wrong"].float()
+            pos = (y * vis).sum().clamp(min=1.0)
+            neg = ((1 - y) * vis).sum().clamp(min=1.0)
+            wts = vis * (y * (0.5 / pos) + (1 - y) * (0.5 / neg)) * vis.sum()   # wrong and right frames weigh the same
+            bce = F.binary_cross_entropy_with_logits(out["error_logits"].float(), y, reduction="none")
+            loss_err = (bce * wts).sum() / wts.sum().clamp(min=1e-8)
+        else:
+            loss_err = out["error_logits"].float().sum() * 0.0
+        total = total + weights.error * loss_err
+        logs["error"] = float(loss_err.detach())
 
     # --- pattern knowledge (motif_targets.py) ----------------------------------------------------
     if weights.patterns > 0 and "pattern_logits" in out and "pat_shape" in batch:

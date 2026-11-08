@@ -78,6 +78,8 @@ class HeadOutputs:
     chord_logprobs: Optional[np.ndarray] = None  # [F, 4] log P(chord size = 1..4)
     importance: Optional[np.ndarray] = None      # [F] difficulty-ladder importance (model with the importance head)
     ladder: Optional[tuple] = None               # (c0, c[LADDER_BINS]) of the monotone threshold theta(sr)
+    error_probs: Optional[np.ndarray] = None     # [F] P(the canvas frame shown to the network is wrong) (error head)
+    plan_logits: Optional[np.ndarray] = None     # [F, N_PLAN + N_PLAN_COPY] the network's own plan (plan head)
 
     def ladder_probs(self, sr: float) -> Optional[np.ndarray]:
         """[F] P(this moment is mapped at star rating ``sr``) from the difficulty ladder, None without the head."""
