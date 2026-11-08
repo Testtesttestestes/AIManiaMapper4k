@@ -870,8 +870,26 @@ class LanePredictor:
                 arr[int(s_[-1])] += wk
                 self.raw[ctx] = self.raw.get(ctx, 0.0) + float(t.count[k])
 
+    @classmethod
+    def cached(cls, lib: "MotifLibrary", sr: float, max_order: int = 6, level: str = "lanes") -> "LanePredictor":
+        """One predictor per star-rating bin and library (it depends on floor(sr) only): built once per song, not
+        once per difficulty."""
+        store = lib.__dict__.setdefault("_predictors", {})
+        key = (int(np.clip(math.floor(sr), 0, SR_BINS - 1)), int(max_order), level)
+        if key not in store:
+            store[key] = cls(lib, sr, max_order, level)
+        return store[key]
+
     def logprob(self, history: Sequence[int]) -> np.ndarray:
         """log P(next mask) for all 16 masks (index 0 unused)."""
+        key = tuple(int(x) for x in history[-self.max_order:])
+        cache = self.__dict__.setdefault("_memo", {})
+        hit = cache.get(key)
+        if hit is None:
+            hit = cache[key] = self._logprob(key)
+        return hit
+
+    def _logprob(self, history: Sequence[int]) -> np.ndarray:
         probs = np.zeros(16)
         mass = 1.0
         h = [int(x) for x in history[-self.max_order:]]

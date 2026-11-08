@@ -41,6 +41,8 @@ class LossWeights:
     pair: float = 0.3      # same window at two difficulties: the density RATIO must match the references
     jack: float = 0.0      # fast transitions (< 160 ms): P(the chosen lane code hits a lane of the previous chord) vs the map
     ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
+    patterns: float = 0.0  # pattern knowledge: rhythm / shape / hand / flow / copy of every event (needs the pattern heads)
+    prior: float = 0.0     # motif library: lane distribution of real maps after the last 6 chords (distillation)
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -204,6 +206,19 @@ def compute_losses(
         total = total + weights.ladder * loss_ladder
         logs["ladder"] = float(loss_ladder.detach())
 
+    # --- pattern knowledge (motif_targets.py) ----------------------------------------------------
+    if weights.patterns > 0 and "pattern_logits" in out and "pat_shape" in batch:
+        loss_pat, parts = pattern_loss(out["pattern_logits"], batch, ev)
+        total = total + weights.patterns * loss_pat
+        logs["patterns"] = float(loss_pat.detach())
+        for k, v in parts.items():
+            logs["pat_" + k] = v
+    if weights.prior > 0 and "pat_prior" in batch:
+        loss_prior, n_prior = prior_loss(out["lane_logits"], batch, ev)
+        total = total + weights.prior * loss_prior
+        logs["prior"] = float(loss_prior.detach())
+        logs["prior_events"] = float(n_prior)
+
     # --- auto-style ----------------------------------------------------------------------------
     sm = batch["style_mask"].float()
     if sm.sum() > 0:
@@ -278,3 +293,48 @@ def jack_loss(lane_logits: torch.Tensor, tc: torch.Tensor, event_mask: torch.Ten
     prob = prob / prob.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     q = (prob * ((res & p.unsqueeze(-1)) > 0).float()).sum(dim=-1).clamp(1e-6, 1 - 1e-6)
     return F.binary_cross_entropy(q, y), len(rows)
+
+
+def pattern_loss(logits: torch.Tensor, batch: Dict[str, torch.Tensor], ev: torch.Tensor):
+    """Mean cross-entropy of the pattern heads over event frames (each head over the events that have its target)."""
+    from .motif_targets import PATTERN_HEADS
+
+    parts: Dict[str, float] = {}
+    total = logits.float().sum() * 0.0
+    n_heads = 0
+    off = 0
+    for k, n in PATTERN_HEADS.items():
+        y = batch["pat_" + k]
+        m = ev & (y >= 0)
+        if m.any():
+            l = F.cross_entropy(logits[..., off:off + n][m].float(), y[m].clamp(0, n - 1))
+            total = total + l
+            parts[k] = float(l.detach())
+            n_heads += 1
+        off += n
+    return total / max(1, n_heads), parts
+
+
+def prior_loss(lane_logits: torch.Tensor, batch: Dict[str, torch.Tensor], ev: torch.Tensor):
+    """Cross-entropy between the motif library's next-chord distribution and the network's, on event frames.
+
+    The network predicts lane CODES relative to the previous two chords; with the reference's previous two chords
+    every code has a known resulting mask (LANE_TABLE), so the code distribution becomes a mask distribution."""
+    from .params import LANE_TABLE
+
+    prior = batch["pat_prior"].float()
+    m = ev & (prior.sum(dim=-1) > 0.5)
+    if not m.any():
+        return lane_logits.float().sum() * 0.0, 0
+    key = "prior:" + str(lane_logits.device)
+    if key not in _LANE_TABLE_T:
+        _LANE_TABLE_T[key] = torch.from_numpy(LANE_TABLE.astype(np.int64)).to(lane_logits.device)
+    table = _LANE_TABLE_T[key]                                               # [16, 16, C]
+    prev = batch["pat_prev"][m].long() & 15                                  # [N, 2]
+    res = table[prev[:, 0], prev[:, 1]]                                      # [N, C] resulting mask of every code
+    probs = torch.softmax(lane_logits[m].float(), dim=-1) * (res > 0).float()
+    q = torch.zeros(res.shape[0], 16, device=lane_logits.device).scatter_add_(1, res, probs)[:, 1:]
+    q = q / q.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    p = prior[m][:, 1:]
+    p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    return -(p * torch.log(q.clamp(min=1e-6))).sum(dim=-1).mean(), int(m.sum())
