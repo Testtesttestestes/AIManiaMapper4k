@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """
-Dataset Compatibility & Rhythm Feasibility Auditor for osu!mania 4K AI Mapper.
+Dataset check for the hybrid mapper: what the network will actually learn from your maps.
 
-Audits raw .osz / .osu beatmaps or dataset sources to determine:
-1. Quantization & Grid Compatibility:
-   - Does the discrete tick generator (1/4, 1/8, 1/3, 1/6) capture notes losslessly?
-   - Quantization residuals (ms delta between real notes and discrete ticks).
-   - Tick collision rate (notes collapsed into the same tick slot = training data loss).
-2. Polyrhythm & Meter Switching:
-   - Binary (4/4, 1/4, 1/8) vs Ternary (1/3, 1/6, 12/8) vs Irregular (1/5, 1/7, 1/12, 1/16).
-   - Multi-BPM maps and variable meter frequency.
-3. Long Note (LN) Anatomy & Gaps:
-   - Zero-gap LN chains (tail ending at exact ms where next note starts in same lane).
-   - Overlaps (note inside active LN on same lane).
-   - LN length distribution.
-4. Lane Distribution & Hand Balance:
-   - Left hand (Lane 0, 1) vs Right hand (Lane 2, 3) balance.
-5. Overall Feasibility Score:
-   - Identifies which maps confuse the Transformer and provides concrete remediation steps.
-
-Usage:
-    python audit_dataset_compatibility.py
-    python audit_dataset_compatibility.py --dir "sample beatmaps"
+    python audit_dataset_compatibility.py                       # "sample beatmaps"
+    python audit_dataset_compatibility.py --dir "D:/osu/Songs" --workers 8   # also folders of .osu (osu!'s Songs)
     python audit_dataset_compatibility.py --map "sample beatmaps/mymap.osz"
-    python audit_dataset_compatibility.py --out report.json
+    python audit_dataset_compatibility.py --fast                # skip the exact-roundtrip check (much faster)
+
+Per 4K mania difficulty (the same parser and the same parameter solver as prepare_hybrid_dataset.py):
+
+1. Exact reproduction: the map is turned into the network's parameters and rendered back; anything that does not
+   come back note for note (or needs the overflow list) is real data loss. The network keeps every note to the
+   millisecond, so a note between grid ticks is NOT lost.
+2. Rhythm grid, per red line in effect at each note (3 ms tolerance): 1/1, 1/2, 1/4, 1/8, triplets (1/3, 1/6),
+   1/12-1/16 and off-grid (unsnapped, 1/5, 1/7) - how much of the map the beat-grid features describe.
+3. Tempo: real tempo changes (red lines with another BPM) separate from SV (green lines), and the meters (4/4,
+   3/4, 5/4, 7/8 ...) including meter changes.
+4. Star ratings (rosu-pp) per 1-star bin: where the dataset is thin (train_hybrid.py --rate_aug / --sr_rare /
+   make_self_maps.py fill it).
+5. Long notes: share, zero-gap chains (release -> press on the same lane <= 5 ms), notes inside a held LN.
+6. Duplicates: difficulties with identical notes (the cleanup removes them: --clean).
 
 Cleanup (keeps only what training reads: 4K mania difficulties + the audio file they name):
     python audit_dataset_compatibility.py --clean                         # report only, nothing is changed
@@ -34,26 +30,20 @@ Cleanup (keeps only what training reads: 4K mania difficulties + the audio file 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import math
-import os
 import sys
 import zipfile
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-try:
-    import numpy as np
-except ImportError:
-    np = None  # type: ignore
+import numpy as np
 
-from osu_mapper.dataset.feature_extractor import parse_osu_for_training
 from osu_mapper.dataset.source_resolver import resolve_beatmap_sources
-from osu_mapper.pipeline.timing import (
-    MusicalGridTick,
-    generate_musical_grid_ticks_from_timing_points,
-)
+
+GRID_NAMES = ("1/1", "1/2", "1/4", "1/3-1/6", "1/8", "1/12-1/16", "off-grid")
 
 
 @dataclass
@@ -61,438 +51,240 @@ class MapAuditResult:
     map_name: str
     osz_name: str
     star_rating: float
-    bpm: float
-    timing_points_count: int
-    is_multi_bpm: bool
+    main_bpm: float
+    red_lines: int
+    tempo_changes: int                 # red lines whose BPM differs from the previous one
+    sv_lines: int                      # green lines (scroll speed only)
+    meters: List[int]
     total_notes: int
-    ln_count: int
     ln_ratio_pct: float
-    
-    # Quantization metrics
-    avg_quantization_error_ms: float
-    max_quantization_error_ms: float
-    notes_exact_grid_pct: float     # Error <= 2ms
-    notes_acceptable_pct: float     # Error <= 10ms
-    notes_off_grid_pct: float       # Error > 15ms (out of standard grid)
-    
-    # Tick collisions (loss of notes due to same-tick quantization)
-    tick_collisions_count: int
-    tick_collision_rate_pct: float
-    
-    # Rhythm divisor breakdown
-    binary_notes_pct: float         # 1/1, 1/2, 1/4, 1/8
-    triplet_notes_pct: float        # 1/3, 1/6, 1/12
-    irregular_notes_pct: float      # 1/5, 1/7, unaligned freehand
-    
-    # LN & Pattern physical anomalies
-    zero_gap_ln_count: int          # Next note in same lane starts <= 5ms after LN end
-    overlap_note_count: int         # Note starts while LN is still active in same lane
-    lane_distribution: List[int]    # [Col0, Col1, Col2, Col3]
-    lane_balance_ratio: float       # Left (0,1) vs Right (2,3) ratio
-    
-    # Feasibility grading
-    compatibility_score: float      # 0 to 100
-    compatibility_grade: str        # 'EXCELLENT', 'GOOD', 'COMPLEX', 'PROBLEMATIC'
-    warnings: List[str]
+    roundtrip_exact: Optional[bool]    # None = not checked (--fast)
+    overflow_notes: int
+    grid_pct: Dict[str, float]         # share of notes per grid class
+    zero_gap_ln_count: int
+    overlap_note_count: int
+    lane_distribution: List[int]
+    notes_key: str = ""
+    problems: List[str] = field(default_factory=list)
+    notes_info: List[str] = field(default_factory=list)
 
 
-def determine_note_divisor(time_ms: float, bpm: float, offset_ms: float) -> Tuple[str, float]:
-    """Identifies the closest musical divisor (1/1, 1/2, 1/3, 1/4, 1/6, 1/8, etc.) for a timestamp."""
-    beat_len = 60000.0 / max(20.0, bpm)
-    delta_from_offset = time_ms - offset_ms
-    beat_fraction = (delta_from_offset / beat_len) % 1.0
-    if beat_fraction < 0:
-        beat_fraction += 1.0
-    
-    # Standard candidate fractions
-    candidates = [
-        ("1/1", 0.0),
-        ("1/1", 1.0),
-        ("1/2", 0.5),
-        ("1/4", 0.25),
-        ("1/4", 0.75),
-        ("1/8", 0.125),
-        ("1/8", 0.375),
-        ("1/8", 0.625),
-        ("1/8", 0.875),
-        ("1/3", 1.0 / 3.0),
-        ("1/3", 2.0 / 3.0),
-        ("1/6", 1.0 / 6.0),
-        ("1/6", 5.0 / 6.0),
-        ("1/12", 1.0 / 12.0),
-        ("1/12", 5.0 / 12.0),
-        ("1/12", 7.0 / 12.0),
-        ("1/12", 11.0 / 12.0),
-        ("1/16", 1.0 / 16.0),
-    ]
-    
-    best_div = "irregular"
-    best_dist_ms = 99999.0
-    
-    for div_name, target_frac in candidates:
-        frac_diff = abs(beat_fraction - target_frac)
-        frac_diff = min(frac_diff, 1.0 - frac_diff)
-        dist_ms = frac_diff * beat_len
-        if dist_ms < best_dist_ms:
-            best_dist_ms = dist_ms
-            best_div = div_name
-            
-    if best_dist_ms > 12.0:
-        best_div = "irregular"
-        
-    return best_div, best_dist_ms
+def audit_beatmap_content(content: str, map_name: str, osz_name: str, roundtrip: bool = True) -> Optional[MapAuditResult]:
+    from osu_mapper.hybrid.beatmap import parse_osu_mania
+    from osu_mapper.hybrid.patterns import div_class, main_bpm
 
-
-def audit_beatmap_content(content: str, map_name: str, osz_name: str) -> Optional[MapAuditResult]:
-    details = parse_osu_for_training(content, map_name)
-    if not details or len(details.hit_objects) == 0:
+    m = parse_osu_mania(content)
+    if m is None or len(m.notes) < 20:
         return None
-        
-    hit_objs = sorted(details.hit_objects, key=lambda o: (o[1], o[0]))
-    total_notes = len(hit_objs)
-    ln_count = sum(1 for o in hit_objs if o[3] and o[2] > o[1])
-    ln_ratio = (ln_count / total_notes) * 100.0 if total_notes > 0 else 0.0
-    
-    min_t = hit_objs[0][1]
-    max_t = max(o[2] for o in hit_objs)
-    duration_ms = max(5000.0, float(max_t - min_t + 2000.0))
-    
-    # 1. Generate standard ticks as used by current generator
-    ticks = generate_musical_grid_ticks_from_timing_points(
-        timing_points=details.timing_points,
-        duration_ms=duration_ms,
-        default_bpm=details.bpm,
-        default_offset_ms=details.offset_ms,
-        subdiv_binary=8,
-        subdiv_ternary=6,
-    )
-    
-    if len(ticks) == 0:
-        return None
-        
-    tick_times = [t.time_ms for t in ticks]
-    
-    # 2. Measure Quantization Errors & Collisions
-    quant_errors: List[float] = []
-    occupied_slots: Dict[Tuple[int, int], int] = {}  # (tick_idx, col) -> count
-    collisions = 0
-    
-    exact_count = 0
-    acceptable_count = 0
-    off_grid_count = 0
-    
-    binary_div_count = 0
-    triplet_div_count = 0
-    irregular_div_count = 0
-    
-    lane_counts = [0, 0, 0, 0]
-    
-    import bisect
-
-    for col, start_ms, end_ms, is_ln in hit_objs:
-        if 0 <= col < 4:
-            lane_counts[col] += 1
-            
-        # Find closest tick using binary search
-        idx = bisect.bisect_left(tick_times, start_ms)
-        candidates = []
-        if idx > 0:
-            candidates.append(idx - 1)
-        if idx < len(tick_times):
-            candidates.append(idx)
-        if idx + 1 < len(tick_times):
-            candidates.append(idx + 1)
-            
-        best_tick_idx = candidates[0]
-        best_err = abs(tick_times[best_tick_idx] - start_ms)
-        for cand in candidates[1:]:
-            err = abs(tick_times[cand] - start_ms)
-            if err < best_err:
-                best_err = err
-                best_tick_idx = cand
-                
-        err_ms = float(best_err)
-        quant_errors.append(err_ms)
-        
-        if err_ms <= 2.0:
-            exact_count += 1
-        elif err_ms <= 10.0:
-            acceptable_count += 1
-        else:
-            off_grid_count += 1
-            
-        # Check collision on the same tick slot
-        slot_key = (best_tick_idx, col)
-        if slot_key in occupied_slots:
-            collisions += 1
-            occupied_slots[slot_key] += 1
-        else:
-            occupied_slots[slot_key] = 1
-            
-        # Divisor categorization
-        div_name, _ = determine_note_divisor(start_ms, details.bpm, details.offset_ms)
-        if div_name in ("1/1", "1/2", "1/4", "1/8", "1/16"):
-            binary_div_count += 1
-        elif div_name in ("1/3", "1/6", "1/12"):
-            triplet_div_count += 1
-        else:
-            irregular_div_count += 1
-
-    # 3. Analyze LN zero-gaps & overlaps
-    zero_gaps = 0
-    overlaps = 0
-    lane_objects: Dict[int, List[Tuple[int, int, bool]]] = {0: [], 1: [], 2: [], 3: []}
-    for col, s_ms, e_ms, is_ln in hit_objs:
-        if 0 <= col < 4:
-            lane_objects[col].append((s_ms, e_ms, is_ln))
-            
-    for col in range(4):
-        objs = lane_objects[col]
-        for i in range(len(objs) - 1):
-            cur_s, cur_e, cur_is_ln = objs[i]
-            next_s, next_e, next_is_ln = objs[i + 1]
-            
-            if cur_is_ln and cur_e > cur_s:
-                # Check overlap (next note starts while current is still held)
-                if next_s < cur_e - 10:
+    notes = sorted(m.notes, key=lambda n: (n.start, n.col))
+    reds = sorted((tp for tp in m.timing_points if tp.uninherited and tp.beat_len > 0), key=lambda r: r.time)
+    greens = [tp for tp in m.timing_points if not tp.uninherited]
+    bpms = [round(60000.0 / r.beat_len, 1) for r in reds]
+    tempo_changes = sum(1 for a, b in zip(bpms, bpms[1:]) if abs(a - b) > 0.05)
+    starts = sorted({n.start for n in notes})
+    cls = Counter(div_class(float(t), reds) for t in starts) if reds else Counter({len(GRID_NAMES) - 1: len(starts)})
+    grid = {GRID_NAMES[k]: round(100.0 * cls.get(k, 0) / max(1, len(starts)), 1) for k in range(len(GRID_NAMES))}
+    # long notes: zero-gap chains and notes inside a held LN, per lane
+    zero_gap = overlaps = 0
+    by_lane: Dict[int, list] = {}
+    for n in notes:
+        by_lane.setdefault(n.col, []).append(n)
+    for lane in by_lane.values():
+        for a, b in zip(lane, lane[1:]):
+            if a.ln and a.end > a.start:
+                if b.start < a.end:
                     overlaps += 1
-                # Check zero-gap (next note starts exactly or within 5ms of release)
-                elif abs(next_s - cur_e) <= 5:
-                    zero_gaps += 1
+                elif b.start - a.end <= 5:
+                    zero_gap += 1
+    exact, overflow = None, 0
+    if roundtrip:
+        from osu_mapper.hybrid.renderer import render_track
+        from osu_mapper.hybrid.solver import SolveStats, solve_map
 
-    # 4. Lane balance
-    left_hand = lane_counts[0] + lane_counts[1]
-    right_hand = lane_counts[2] + lane_counts[3]
-    lane_balance = (left_hand / max(1, right_hand)) if right_hand > 0 else 99.0
-    
-    # 5. Timing Points & Multi-BPM
-    uninherited_tps = [
-        tp for tp in details.timing_points
-        if (getattr(tp, 'uninherited', 1) in (1, True)) or (isinstance(tp, (list, tuple)) and (len(tp) < 3 or bool(tp[2])))
-    ]
-    is_multi_bpm = len(uninherited_tps) > 1
-    
-    # 6. Feasibility Score Calculation
-    score = 100.0
-    warnings: List[str] = []
-    
-    # Quantization error penalty
-    off_grid_pct = (off_grid_count / total_notes) * 100.0
-    score -= off_grid_pct * 1.5
-    if off_grid_pct > 10.0:
-        warnings.append(f"High off-grid rate ({off_grid_pct:.1f}% notes > 10ms from grid)")
-        
-    # Collision penalty
-    collision_pct = (collisions / total_notes) * 100.0
-    score -= collision_pct * 3.0
-    if collisions > 0:
-        warnings.append(f"Tick collisions ({collisions} notes [{collision_pct:.1f}%] collapse onto same tick)")
-        
-    # Polyrhythm warning
-    triplet_pct = (triplet_div_count / total_notes) * 100.0
-    irregular_pct = (irregular_div_count / total_notes) * 100.0
-    if triplet_pct > 20.0:
-        warnings.append(f"Heavy Triplet/Ternary meter ({triplet_pct:.1f}% 1/3 or 1/6 notes)")
-    if irregular_pct > 15.0:
-        score -= irregular_pct * 0.8
-        warnings.append(f"Irregular swing / unaligned rhythm ({irregular_pct:.1f}% irregular notes)")
-        
-    # Overlap and zero-gap warnings
-    if overlaps > 0:
-        score -= min(15.0, overlaps * 2.0)
-        warnings.append(f"Physical Overlaps in dataset ({overlaps} notes placed inside active LN)")
-    if zero_gaps > (total_notes * 0.05):
-        warnings.append(f"Excessive Zero-Gap LNs ({zero_gaps} release-to-press transitions without pause)")
-        
-    # Multi-BPM warning
-    if is_multi_bpm:
-        warnings.append(f"Multi-BPM map ({len(uninherited_tps)} tempo changes)")
-        
-    # Lane skew warning
-    if lane_balance > 1.8 or lane_balance < 0.55:
-        warnings.append(f"Heavy Lane Skew (Left/Right balance ratio = {lane_balance:.2f})")
-        
-    score = max(0.0, min(100.0, score))
-    
-    if score >= 90.0:
-        grade = "EXCELLENT"
-    elif score >= 75.0:
-        grade = "GOOD"
-    elif score >= 55.0:
-        grade = "COMPLEX"
+        stats = SolveStats()
+        track = solve_map(m, stats=stats)
+        exact = render_track(track) == sorted(m.notes)
+        overflow = int(stats.overflow)
+    try:
+        import rosu_pp_py
+
+        sr = float(rosu_pp_py.Difficulty().calculate(rosu_pp_py.Beatmap(content=content)).stars)
+    except Exception:
+        sr = 0.0
+    lanes = [0, 0, 0, 0]
+    for n in notes:
+        if 0 <= n.col < 4:
+            lanes[n.col] += 1
+    r = MapAuditResult(
+        map_name=m.metadata.get("Version", map_name), osz_name=osz_name, star_rating=round(sr, 2),
+        main_bpm=round(main_bpm(m.timing_points, notes[-1].start) or 0.0, 1), red_lines=len(reds), tempo_changes=tempo_changes,
+        sv_lines=len(greens), meters=sorted({max(1, int(r_.meter or 4)) for r_ in reds}) or [4],
+        total_notes=len(notes), ln_ratio_pct=round(100.0 * sum(n.ln for n in notes) / len(notes), 1),
+        roundtrip_exact=exact, overflow_notes=overflow, grid_pct=grid, zero_gap_ln_count=zero_gap,
+        overlap_note_count=overlaps, lane_distribution=lanes,
+        notes_key=hashlib.sha1(repr(m.canonical_notes()).encode("utf-8")).hexdigest())
+    if exact is False:
+        r.problems.append("does not reproduce exactly (prepare_hybrid_dataset.py skips it)")
+    if overflow:
+        r.problems.append(f"{overflow} notes only in the overflow list")
+    if not reds:
+        r.problems.append("no red line: no beat grid")
+    if grid["off-grid"] > 25.0:
+        r.notes_info.append(f"{grid['off-grid']:.0f}% notes off the grid (unsnapped / 1/5 / 1/7)")
+    if tempo_changes:
+        r.notes_info.append(f"{tempo_changes} tempo changes")
+    if any(x != 4 for x in r.meters):
+        r.notes_info.append("meter " + "/".join(f"{x}/4" for x in r.meters))
+    if overlaps:
+        r.problems.append(f"{overlaps} notes inside a held long note")
+    return r
+
+
+def _audit_text(job):
+    text, name, osz, roundtrip = job
+    try:
+        return audit_beatmap_content(text, name, osz, roundtrip)
+    except Exception as e:  # one broken difficulty must not stop the check
+        print(f"[Warn] {osz} :: {name}: {e}")
+        return None
+
+
+def _decode(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="ignore")
+
+
+def collect_texts(source: Path) -> List[Tuple[str, str, str]]:
+    from osu_mapper.hybrid.sources import is_lfs_pointer
+
+    if source.is_file():
+        if source.suffix.lower() == ".osu":
+            return [(_decode(source.read_bytes()), source.name, source.parent.name)]
+        osz_files, folders = [source], []
     else:
-        grade = "PROBLEMATIC"
-        
-    return MapAuditResult(
-        map_name=details.version,
-        osz_name=osz_name,
-        star_rating=details.star_rating,
-        bpm=details.bpm,
-        timing_points_count=len(details.timing_points),
-        is_multi_bpm=is_multi_bpm,
-        total_notes=total_notes,
-        ln_count=ln_count,
-        ln_ratio_pct=round(ln_ratio, 1),
-        avg_quantization_error_ms=round(float(sum(quant_errors) / max(1, len(quant_errors))), 2),
-        max_quantization_error_ms=round(float(max(quant_errors) if quant_errors else 0.0), 2),
-        notes_exact_grid_pct=round((exact_count / total_notes) * 100.0, 1),
-        notes_acceptable_pct=round(((exact_count + acceptable_count) / total_notes) * 100.0, 1),
-        notes_off_grid_pct=round(off_grid_pct, 1),
-        tick_collisions_count=collisions,
-        tick_collision_rate_pct=round(collision_pct, 2),
-        binary_notes_pct=round((binary_div_count / total_notes) * 100.0, 1),
-        triplet_notes_pct=round(triplet_pct, 1),
-        irregular_notes_pct=round(irregular_pct, 1),
-        zero_gap_ln_count=zero_gaps,
-        overlap_note_count=overlaps,
-        lane_distribution=lane_counts,
-        lane_balance_ratio=round(lane_balance, 2),
-        compatibility_score=round(score, 1),
-        compatibility_grade=grade,
-        warnings=warnings,
-    )
-
-
-def audit_all_dataset(source_dir: str | Path) -> List[MapAuditResult]:
-    source_dir = Path(source_dir)
-    osz_files, song_folders = resolve_beatmap_sources(source_dir)
-    results: List[MapAuditResult] = []
-
-    # 1. Parse from OSZ files
+        osz_files, folders = resolve_beatmap_sources(source)
+        # song folders right inside the given folder (osu!'s Songs folder, unpacked sets)
+        known = {Path(f).resolve() for f in folders}
+        for sub in [source] + sorted(p for p in source.iterdir() if p.is_dir()):
+            if sub.resolve() not in known and any(sub.glob("*.osu")):
+                folders.append(sub)
+    out: List[Tuple[str, str, str]] = []
+    skipped = 0
     for osz in osz_files:
+        if is_lfs_pointer(osz):
+            skipped += 1
+            continue
         try:
             with zipfile.ZipFile(osz, "r") as zf:
-                for name in zf.namelist():
-                    if name.lower().endswith(".osu"):
-                        try:
-                            content = zf.read(name).decode("utf-8-sig")
-                        except UnicodeDecodeError:
-                            content = zf.read(name).decode("latin-1", errors="ignore")
-                        res = audit_beatmap_content(content, name, osz.name)
-                        if res:
-                            results.append(res)
+                out += [(_decode(zf.read(n)), n, Path(osz).name) for n in zf.namelist() if n.lower().endswith(".osu")]
         except Exception as e:
-            print(f"[Warn] Failed reading {osz.name}: {e}")
+            print(f"[Warn] Failed reading {Path(osz).name}: {e}")
+    for folder in folders:
+        out += [(_decode(p.read_bytes()), p.name, Path(folder).name) for p in Path(folder).glob("*.osu")]
+    if skipped:
+        print(f"[Warn] {skipped} archives are Git LFS pointers (not downloaded): git lfs pull")
+    return out
 
-    # 2. Parse from uncompressed song folders
-    for folder in song_folders:
-        for osu_file in folder.glob("*.osu"):
-            try:
-                try:
-                    content = osu_file.read_text(encoding="utf-8-sig")
-                except UnicodeDecodeError:
-                    content = osu_file.read_text(encoding="latin-1", errors="ignore")
-                res = audit_beatmap_content(content, osu_file.name, folder.name)
-                if res:
-                    results.append(res)
-            except Exception as e:
-                print(f"[Warn] Failed reading {osu_file.name}: {e}")
 
-    return results
+def audit_all_dataset(source_dir: str | Path, roundtrip: bool = True, workers: int = 1) -> List[MapAuditResult]:
+    texts = collect_texts(Path(source_dir))
+    print(f"[Dataset Audit] {len(texts)} difficulties to check" + ("" if roundtrip else " (no roundtrip check)"))
+    jobs = [(t, n, o, roundtrip) for t, n, o in texts]
+    if workers > 1 and len(jobs) > 50:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            res = list(pool.map(_audit_text, jobs, chunksize=8))
+    else:
+        res = []
+        for k, j in enumerate(jobs, 1):
+            res.append(_audit_text(j))
+            if k % 200 == 0:
+                print(f"  {k}/{len(jobs)}", flush=True)
+    return [r for r in res if r is not None]
 
 
 def print_audit_report(results: List[MapAuditResult]) -> None:
     if not results:
-        print("\n[!] No valid osu!mania 4K beatmaps found to audit.")
+        print("\n[!] No osu!mania 4K difficulties found to check.")
         return
-
-    total_maps = len(results)
-    total_notes = sum(r.total_notes for r in results)
-    total_lns = sum(r.ln_count for r in results)
-    avg_ln_pct = sum(r.ln_ratio_pct for r in results) / total_maps
-    
-    avg_quant_err = sum(r.avg_quantization_error_ms for r in results) / total_maps
-    avg_on_grid = sum(r.notes_acceptable_pct for r in results) / total_maps
-    avg_off_grid = sum(r.notes_off_grid_pct for r in results) / total_maps
-    total_collisions = sum(r.tick_collisions_count for r in results)
-    avg_collision_rate = sum(r.tick_collision_rate_pct for r in results) / total_maps
-    
-    binary_maps = sum(1 for r in results if r.triplet_notes_pct < 5.0 and r.irregular_notes_pct < 5.0)
-    triplet_maps = sum(1 for r in results if r.triplet_notes_pct >= 15.0)
-    multi_bpm_maps = sum(1 for r in results if r.is_multi_bpm)
-    total_zero_gaps = sum(r.zero_gap_ln_count for r in results)
-    total_overlaps = sum(r.overlap_note_count for r in results)
-    
-    grade_counts = {
-        "EXCELLENT": sum(1 for r in results if r.compatibility_grade == "EXCELLENT"),
-        "GOOD": sum(1 for r in results if r.compatibility_grade == "GOOD"),
-        "COMPLEX": sum(1 for r in results if r.compatibility_grade == "COMPLEX"),
-        "PROBLEMATIC": sum(1 for r in results if r.compatibility_grade == "PROBLEMATIC"),
-    }
-
+    n = len(results)
+    notes = sum(r.total_notes for r in results)
+    lns = sum(r.total_notes * r.ln_ratio_pct / 100.0 for r in results)
     print("\n" + "=" * 78)
-    print(" 📊 OSU!MANIA 4K DATASET COMPATIBILITY & GENERATOR FEASIBILITY AUDIT")
+    print(" OSU!MANIA 4K DATASET CHECK (hybrid mapper)")
     print("=" * 78)
-    print(f"Total Maps Analyzed:     {total_maps:,}")
-    print(f"Total Notes Analyzed:    {total_notes:,} ({total_lns:,} Long Notes | {avg_ln_pct:.1f}% LN ratio)")
+    print(f"Difficulties: {n:,} | notes: {notes:,} ({lns / max(1, notes):.1%} long notes)")
     print("-" * 78)
-    print("🎯 1. DISCRETE GRID QUANTIZATION & ACCURACY")
-    print(f"  • Notes aligned to grid (<=10ms):  {avg_on_grid:.1f}%")
-    print(f"  • Notes falling off-grid (>10ms): {avg_off_grid:.1f}%")
-    print(f"  • Mean Quantization Delta:        {avg_quant_err:.2f} ms")
-    print(f"  • Tick Collisions (Data loss):    {total_collisions:,} notes ({avg_collision_rate:.2f}% avg per map)")
-    if total_collisions > 0:
-        print(f"    ⚠️ Warning: {total_collisions} notes collapsed into the same tick slot during training preparation!")
+    print("1. EXACT REPRODUCTION (the only real data loss)")
+    checked = [r for r in results if r.roundtrip_exact is not None]
+    if checked:
+        bad = [r for r in checked if not r.roundtrip_exact or r.overflow_notes]
+        print(f"  exact: {len(checked) - len(bad)} of {len(checked)}" + ("  - all reproduce note for note" if not bad else ""))
+        for r in bad[:10]:
+            print(f"    ! {r.osz_name} :: {r.map_name}: {'; '.join(r.problems)}")
     else:
-        print("    ✅ Clean: Zero tick collisions detected across the dataset.")
-
+        print("  not checked (--fast)")
     print("-" * 78)
-    print("🎵 2. RHYTHMIC METER & POLYRHYTHMS")
-    print(f"  • Pure Binary (4/4, 1/4, 1/8):    {binary_maps} maps ({(binary_maps / total_maps) * 100.0:.1f}%)")
-    print(f"  • Triplet/Ternary (1/3, 1/6):     {triplet_maps} maps ({(triplet_maps / total_maps) * 100.0:.1f}%)")
-    print(f"  • Multi-BPM / Tempo Shifts:       {multi_bpm_maps} maps ({(multi_bpm_maps / total_maps) * 100.0:.1f}%)")
-
+    print("2. RHYTHM GRID (per red line in effect, 3 ms; the network keeps every note to the ms anyway)")
+    tot = Counter()
+    for r in results:
+        for k, v in r.grid_pct.items():
+            tot[k] += v * r.total_notes
+    tw = sum(r.total_notes for r in results)
+    print("  " + " | ".join(f"{k} {tot[k] / tw:.1f}%" for k in GRID_NAMES))
+    off = [r for r in results if r.grid_pct["off-grid"] > 25.0]
+    print(f"  maps with > 25% off-grid notes: {len(off)} (unsnapped, 1/5, 1/7 - or a wrong red line; worth a look)")
     print("-" * 78)
-    print("🎹 3. LONG NOTE (LN) BEHAVIOR & PHYSICAL RESTRAINTS")
-    print(f"  • Zero-Gap LN Transitions:        {total_zero_gaps:,} occurrences (Release -> Press in <=5ms)")
-    print(f"  • Physical Note Overlaps:         {total_overlaps:,} occurrences (Notes inside active LN in dataset)")
-    if total_zero_gaps > 0:
-        print(f"    ℹ️ Insight: The training dataset contains {total_zero_gaps} continuous LN chains.")
-        print("               This explains why the model learns to string LNs tail-to-head to boost strain!")
-
+    print("3. TEMPO AND METER")
+    tc = sum(1 for r in results if r.tempo_changes)
+    print(f"  real tempo changes: {tc} maps ({100 * tc / n:.1f}%) | maps with SV (green lines): "
+          f"{sum(1 for r in results if r.sv_lines)} ({100 * sum(1 for r in results if r.sv_lines) / n:.1f}%)")
+    only44 = sum(1 for r in results if r.meters == [4])
+    has = Counter(x for r in results for x in r.meters if x != 4)
+    changes = sum(1 for r in results if len(r.meters) > 1)
+    print(f"  meter: only 4/4 in {only44} maps ({100 * only44 / n:.1f}%), meter changes inside the map: {changes}")
+    if has:
+        print("  maps with another meter: " + ", ".join(f"{x}/4: {c}" for x, c in sorted(has.items())))
     print("-" * 78)
-    print("🏆 4. GENERATOR COMPATIBILITY BREAKDOWN")
-    print(f"  • 🟢 EXCELLENT (Flawlessly reproducible):  {grade_counts['EXCELLENT']} maps ({(grade_counts['EXCELLENT'] / total_maps) * 100.0:.1f}%)")
-    print(f"  • 🟡 GOOD (Minor quantization delta):      {grade_counts['GOOD']} maps ({(grade_counts['GOOD'] / total_maps) * 100.0:.1f}%)")
-    print(f"  • 🟠 COMPLEX (Heavy triplets/Multi-BPM):   {grade_counts['COMPLEX']} maps ({(grade_counts['COMPLEX'] / total_maps) * 100.0:.1f}%)")
-    print(f"  • 🔴 PROBLEMATIC (High collisions/off-grid): {grade_counts['PROBLEMATIC']} maps ({(grade_counts['PROBLEMATIC'] / total_maps) * 100.0:.1f}%)")
-
+    print("4. STAR RATINGS (rosu-pp) - where the dataset is thin")
+    bins = Counter(int(min(11, max(0, r.star_rating))) for r in results)
+    peak = max(bins.values())
+    for b in range(0, 12):
+        if bins.get(b):
+            bar = "#" * max(1, int(40 * bins[b] / peak))
+            print(f"  {b:>2}-{b + 1:<2}*  {bins[b]:>5}  {bar}")
+    hard = sum(v for k, v in bins.items() if k >= 6)
+    print(f"  6*+: {hard} ({100 * hard / n:.1f}%)")
+    print("-" * 78)
+    print("5. LONG NOTES")
+    zg = sum(r.zero_gap_ln_count for r in results)
+    ov = sum(r.overlap_note_count for r in results)
+    print(f"  zero-gap chains (release -> press <= 5 ms): {zg} | notes inside a held LN: {ov}")
+    print("-" * 78)
+    print("6. DUPLICATES")
+    dup = sum(c - 1 for c in Counter(r.notes_key for r in results).values() if c > 1)
+    print(f"  difficulties with the same notes as another one: {dup}" + (" (remove: --clean --apply)" if dup else ""))
     print("=" * 78)
-    print("📋 SAMPLE BEATMAP DETAILS (Top 8 audited)")
-    print(f"{'Map Title / Diff':<32} {'SR':<5} {'BPM':<6} {'OnGrid%':<9} {'Coll':<6} {'Grade':<11} {'Key Warning'}")
-    print("-" * 78)
-    for r in results[:8]:
-        name_short = (r.map_name[:30] + "..") if len(r.map_name) > 30 else r.map_name
-        warn_str = r.warnings[0] if r.warnings else "None (Clean)"
-        print(f"{name_short:<32} {r.star_rating:<5.2f} {r.bpm:<6.1f} {r.notes_acceptable_pct:<9.1f} {r.tick_collisions_count:<6} {r.compatibility_grade:<11} {warn_str[:25]}")
-    
-    if len(results) > 8:
-        print(f"... and {len(results) - 8} more beatmaps.")
-
-    print("=" * 78)
-    print("💡 ACTIONABLE ARCHITECTURAL RECOMMENDATIONS:")
-    print("-" * 78)
-    
-    if avg_off_grid > 5.0 or total_collisions > 0:
-        print("1. [Quantization]: Increase subdivision resolution from 8 (1/8) to dynamic tick snapping,")
-        print("   or add sub-tick micro-offsets (del_ms) to hit object outputs.")
-    else:
-        print("1. [Quantization]: Standard 1/8 binary + 1/6 ternary grid ticks are mathematically sufficient for 95%+ notes.")
-
-    if total_zero_gaps > 100:
-        print("2. [Zero-Gap LNs]: The dataset itself teaches the neural network zero-gap transitions.")
-        print("   -> Apply a minimum Release Gap (e.g. min 40ms buffer) in pattern_generator.py sanitizer.")
-        print("   -> Lower ln_threshold from 0.28 to 0.45-0.55 during inference decoding.")
-
-    if total_overlaps > 0:
-        print("3. [Sanitizer Overlap Masking]: Implement active lane lock during generation so that a key cannot")
-        print("   receive new hit events while an LN is active on that column.")
-
+    print("WHAT IT MEANS FOR TRAINING")
+    if checked and any(not r.roundtrip_exact or r.overflow_notes for r in checked):
+        print("  * Maps that do not reproduce exactly are skipped by prepare_hybrid_dataset.py.")
+    if hard / n < 0.2:
+        print(f"  * Hard maps are rare ({100 * hard / n:.0f}% at 6*+): keep --rate_aug / --sr_rare on, run make_self_maps.py "
+              "after the first training (HYBRID_GUIDE.md 4.9).")
+    if off:
+        print("  * Off-grid maps are fine for the network (ms targets); check their red lines if the share is unexpected.")
+    if dup:
+        print("  * Duplicates weigh one chart twice: python audit_dataset_compatibility.py --clean --apply")
+    if ov:
+        print("  * Notes inside held LNs cannot be played as written; those maps teach overlaps.")
     print("=" * 78 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Audit dataset compatibility and rhythm feasibility for osu!mania 4K AI Mapper.")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", "--sample-dir", default="sample beatmaps", help="Directory containing .osz beatmaps or song folders.")
     parser.add_argument("--map", default=None, help="Path to a single .osz or .osu file to audit.")
     parser.add_argument("--out", default="dataset_audit_report.json", help="Path to save JSON audit report.")
@@ -510,6 +302,9 @@ def main():
     parser.add_argument("--min_notes", type=int, default=20, help="with --clean: difficulties with fewer notes are removed")
     parser.add_argument("--verbose", action="store_true", help="with --clean: list every removed difficulty and why")
     parser.add_argument("--skip_audit", action="store_true", help="only the cleanup, no rhythm/grid audit afterwards")
+    parser.add_argument("--fast", action="store_true", help="skip the exact-roundtrip check (the slow part)")
+    parser.add_argument("--workers", type=int, default=max(1, min(8, (__import__("os").cpu_count() or 2) - 1)),
+                        help="parallel processes")
     args = parser.parse_args()
 
     if args.clean:
@@ -531,43 +326,12 @@ def main():
         if args.skip_audit:
             return
 
-    results: List[MapAuditResult] = []
-
-    if args.map:
-        map_path = Path(args.map)
-        if not map_path.exists():
-            print(f"[Error] Map file not found: {map_path}")
-            sys.exit(1)
-            
-        if map_path.suffix.lower() == ".osu":
-            try:
-                content = map_path.read_text(encoding="utf-8-sig")
-            except UnicodeDecodeError:
-                content = map_path.read_text(encoding="latin-1", errors="ignore")
-            r = audit_beatmap_content(content, map_path.name, map_path.parent.name)
-            if r:
-                results.append(r)
-        elif map_path.suffix.lower() == ".osz":
-            with zipfile.ZipFile(map_path, "r") as zf:
-                for name in zf.namelist():
-                    if name.lower().endswith(".osu"):
-                        try:
-                            content = zf.read(name).decode("utf-8-sig")
-                        except UnicodeDecodeError:
-                            content = zf.read(name).decode("latin-1", errors="ignore")
-                        r = audit_beatmap_content(content, name, map_path.name)
-                        if r:
-                            results.append(r)
-    else:
-        sample_dir = Path(args.dir)
-        if not sample_dir.exists():
-            # Try alternate standard dirs
-            for alt in ["sample_beatmaps", "dataset_processed", "."]:
-                if Path(alt).is_dir():
-                    sample_dir = Path(alt)
-                    break
-        print(f"[Dataset Audit] Scanning beatmaps in: '{sample_dir.resolve()}' ...")
-        results = audit_all_dataset(sample_dir)
+    source = Path(args.map) if args.map else Path(args.dir)
+    if not source.exists():
+        print(f"[Error] not found: {source}")
+        sys.exit(1)
+    print(f"[Dataset Audit] Checking '{source.resolve()}' ...")
+    results = audit_all_dataset(source, roundtrip=not args.fast, workers=args.workers)
 
     print_audit_report(results)
 
