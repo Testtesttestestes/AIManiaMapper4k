@@ -206,6 +206,33 @@ class SparseTrack:
     def event_frames(self) -> np.ndarray:
         return self.frames
 
+    def _plan(self, i0: int, i1: int, rows: np.ndarray, length: int, rate: float) -> Dict[str, np.ndarray]:
+        """Plan of the window, per frame: technique family and copy kind of the bar each frame lies in (forward-filled
+        from the events, the event before the window included; frames more than 2 s after a note are 'sparse')."""
+        fam = np.zeros(length, dtype=np.int64)
+        cpy = np.zeros(length, dtype=np.int64)
+        if "family" not in self.pat:
+            return {"plan_family": fam, "plan_copy": cpy}
+        ev_rows = list(rows)
+        ev_f = list(self.pat["family"][i0:i1]) if i1 > i0 else []
+        ev_c = list(self.pat["copy"][i0:i1]) if i1 > i0 else []
+        if i0 > 0:                                   # the bar the window starts in
+            ev_rows = [-1] + ev_rows
+            ev_f = [self.pat["family"][i0 - 1]] + ev_f
+            ev_c = [self.pat["copy"][i0 - 1]] + ev_c
+        if not ev_rows:
+            return {"plan_family": fam, "plan_copy": cpy}
+        ev_rows = np.asarray(ev_rows, dtype=np.int64)
+        pos = np.searchsorted(ev_rows, np.arange(length), side="right") - 1
+        has = pos >= 0
+        far = np.zeros(length, bool)
+        far[has] = (np.arange(length)[has] - ev_rows[pos[has]]) * rate > 200
+        fam[has] = np.maximum(0, np.asarray(ev_f, dtype=np.int64)[pos[has]])
+        cpy[has] = np.maximum(0, np.asarray(ev_c, dtype=np.int64)[pos[has]])
+        fam[far] = 0
+        cpy[far] = 0
+        return {"plan_family": fam, "plan_copy": cpy}
+
     def _crop_rate(self, start: int, length: int, rate: float) -> Optional[Dict[str, np.ndarray]]:
         H = self.frame_ms
         span = int(math.ceil(length * rate)) + 1
@@ -239,6 +266,7 @@ class SparseTrack:
                 a = np.full(length, -1, dtype=np.int64)
                 a[rows] = self.pat[k][idx]
                 out["pat_" + k] = a
+            out.update(self._plan(int(idx[0]) if idx.size else i0, int(idx[-1]) + 1 if idx.size else i0, rows, length, rate))
             prior = np.zeros((length, 16), dtype=np.float32)
             prev = np.zeros((length, 2), dtype=np.int64)
             prior[rows] = self.pat["prior"][idx]
@@ -277,6 +305,7 @@ class SparseTrack:
                 if i1 > i0:
                     a[rows] = self.pat[k][i0:i1]
                 out["pat_" + k] = a
+            out.update(self._plan(i0, i1, rows if i1 > i0 else np.zeros(0, np.int64), length, 1.0))
             prior = np.zeros((length, 16), dtype=np.float32)
             prev = np.zeros((length, 2), dtype=np.int64)
             if i1 > i0:
@@ -285,6 +314,19 @@ class SparseTrack:
             out["pat_prior"] = prior
             out["pat_prev"] = prev
         return out
+
+
+def sample_known_spans(T: int, rng: np.random.Generator, frame_ms: int = 10) -> np.ndarray:
+    """True where a plan / canvas is given: a random share hidden in spans of 1-6 s."""
+    known = np.ones(T, bool)
+    need = int(rng.uniform(0.1, 0.7) * T)
+    tries = 0
+    while (~known).sum() < need and tries < 32:
+        L = int(rng.integers(int(1000 / frame_ms), int(6000 / frame_ms) + 1))
+        a = int(rng.integers(0, max(1, T - L + 1)))
+        known[a:a + L] = False
+        tries += 1
+    return known
 
 
 def _crop_rows(arr: np.ndarray, start: int, length: int) -> np.ndarray:
@@ -318,6 +360,7 @@ class HybridCropDataset(Dataset):
         rate_aug: float = 0.0,
         sr_rare: float = 0.0,
         corrupt_prob: float = 0.0,
+        plan_prob: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -331,6 +374,7 @@ class HybridCropDataset(Dataset):
         self.ladder_k = int(ladder_k)
         self.canvas_prob = float(canvas_prob)
         self.corrupt_prob = float(corrupt_prob)
+        self.plan_prob = float(plan_prob)
         self.epoch = 0
         self.tracks = [SparseTrack(index.track(i)) for i in self.map_indices]
         self.entries = [index.maps[i] for i in self.map_indices]
@@ -489,6 +533,18 @@ class HybridCropDataset(Dataset):
         }
         for key, arr in tgt.items():
             item[key] = torch.from_numpy(arr)
+        if "plan_family" in tgt:
+            # the plan as input: known in a share of the crops (whole, or with unknown spans), otherwise all unknown -
+            # the network learns to map from a plan AND without one (then its plan head proposes one)
+            from .motif_targets import N_PLAN, N_PLAN_COPY
+            pf = np.full(self.crop, N_PLAN, dtype=np.int64)
+            pc = np.full(self.crop, N_PLAN_COPY, dtype=np.int64)
+            if self.plan_prob > 0 and rng.random() < self.plan_prob:
+                pf, pc = tgt["plan_family"].copy(), tgt["plan_copy"].copy()
+                if rng.random() < 0.5:
+                    hide = ~sample_known_spans(self.crop, rng)
+                    pf[hide], pc[hide] = N_PLAN, N_PLAN_COPY
+            item["plan_in_family"], item["plan_in_copy"] = torch.from_numpy(pf), torch.from_numpy(pc)
         if self.canvas_prob > 0:
             from .canvas import MASK, canvas_from_targets, corrupt_canvas, sample_known
             wrong = np.zeros(self.crop, bool)

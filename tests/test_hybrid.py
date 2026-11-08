@@ -1013,3 +1013,51 @@ class TestBreakAndFix(unittest.TestCase):
                            lambda r: 0, steps=10)
         self.assertLessEqual(len(res.notes), 20)               # corrected until the critic is satisfied
         self.assertLess(calls["n"], 30)                        # and stopped (no endless corrections)
+
+
+class TestPlan(unittest.TestCase):
+    """Think first, then map: per-bar technique plan (motif_targets.bar_family / plan_from_logits, plan head + input)."""
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_plan_targets_input_head_and_two_pass_plan(self):
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import SparseTrack
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+        from osu_mapper.hybrid.motif_targets import N_PLAN, N_PLAN_COPY, PLAN_FAMILIES, plan_from_logits, targets_for_track
+
+        tp = [RawTimingPoint(1000.0, 500.0)]
+        stairs = [Note(1000 + 125 * i, i % 4, 1000 + 125 * i, False) for i in range(32)]              # 4 bars of rolls
+        jacks = [Note(5000 + 125 * i, (i // 2) % 4, 5000 + 125 * i, False) for i in range(32)]         # 4 bars of jacks
+        track = solve_map(stairs + jacks, timing_points=tp, num_frames=1200)
+        sp = SparseTrack(track)
+        sp.pat = targets_for_track(sp, 4.0, None)
+        crop = sp.crop_arrays(0, 1200)
+        fam = crop["plan_family"]
+        self.assertEqual(PLAN_FAMILIES[int(fam[200])], "roll/stairs")
+        self.assertEqual(PLAN_FAMILIES[int(fam[600])], "jacks")
+        self.assertEqual(int(fam[1150]), 0)                                   # > 2 s after the last note: sparse
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", plan=True, pattern_heads=True))
+        batch = {k: torch.from_numpy(np.stack([v])) for k, v in crop.items()}
+        batch.update(valid=torch.ones(1, 1200), style=torch.zeros(1, STYLE_DIM), style_mask=torch.zeros(1, STYLE_DIM))
+        args = (torch.randn(1, 1200, fcfg.total_dim()), torch.zeros(1, 1200, 13), torch.tensor([[4.0]]), batch["style"],
+                batch["style_mask"], torch.randn(1, 30, fcfg.total_dim()), None)
+        out0 = model(*args)                                                   # no plan = all unknown
+        out1 = model(*args, plan=(batch["plan_family"], batch["plan_copy"]))
+        self.assertEqual(out0["plan_logits"].shape[-1], N_PLAN + N_PLAN_COPY)
+        loss, logs = compute_losses(out1, batch, LossWeights(plan=1.0), 10)
+        self.assertIn("plan", logs)
+        loss.backward()
+        self.assertIsNotNone(model.plan_head.weight.grad)
+        # the second-pass plan: per bar, argmax of the summed log-probabilities; a forced technique on non-empty bars
+        logits = np.full((1200, N_PLAN + N_PLAN_COPY), -5.0, np.float32)
+        logits[:, PLAN_FAMILIES.index("trill")] = 5.0
+        logits[1000:, 0] = 9.0                                                # silence at the end
+        logits[:, N_PLAN] = 5.0
+        fam, cpy = plan_from_logits(logits, tp, 10)
+        self.assertEqual(PLAN_FAMILIES[int(fam[300])], "trill")
+        forced, _ = plan_from_logits(logits, tp, 10, force_family="ln")
+        self.assertEqual(PLAN_FAMILIES[int(forced[300])], "ln")
+        self.assertEqual(PLAN_FAMILIES[int(forced[1150])], "sparse")

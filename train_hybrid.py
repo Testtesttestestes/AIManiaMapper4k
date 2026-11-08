@@ -106,9 +106,10 @@ def to_device(batch: Dict[str, torch.Tensor], dev: torch.device) -> Dict[str, to
 
 def forward_batch(model: HybridParamNet, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     canvas = (batch["canvas_state"], batch["canvas_ms"], batch["canvas_ln"]) if "canvas_state" in batch else None
+    plan = (batch["plan_in_family"], batch["plan_in_copy"]) if "plan_in_family" in batch else None
     return model(
         batch["feats"], batch["beat"], batch["sr"], batch["style"], batch["style_mask"],
-        batch["coarse"], batch["coarse_mask"], canvas=canvas,
+        batch["coarse"], batch["coarse_mask"], canvas=canvas, plan=plan,
     )
 
 
@@ -272,6 +273,11 @@ def main() -> None:
                          "last 6 chords (needs --motifs); 0 = off")
     ap.add_argument("--motifs", default=None, help="motif library (mine_patterns.py; default checkpoints/hybrid/motifs.npz, "
                                                    "else test_NN/motifs.npz)")
+    ap.add_argument("--plan_prob", type=float, default=0.5,
+                    help="think first, then map: share of crops that get the per-bar technique plan (family + copy kind, "
+                         "from the motif analysis) as input; the plan head always learns to propose it (needs --pattern_weight "
+                         "> 0, which computes the plan targets); 0 = off")
+    ap.add_argument("--plan_weight", type=float, default=0.2, help="loss: plan head")
     ap.add_argument("--corrupt_prob", type=float, default=0.3,
                     help="break and fix: share of canvas crops where almost the whole map is shown but partly broken (notes "
                          "removed / added / moved, wrong lanes, jacks, wrong chords, LN flips); the network predicts every frame "
@@ -403,6 +409,9 @@ def main() -> None:
     if args.corrupt_prob > 0 and args.error_weight > 0 and args.canvas_prob > 0 and not cfg.error_head and not args.eval_only:
         cfg.error_head = True
         new_head = new_head or resume_ckpt is not None
+    if args.plan_prob > 0 and args.pattern_weight > 0 and not cfg.plan and not args.eval_only:
+        cfg.plan = True
+        new_head = new_head or resume_ckpt is not None
     if args.pattern_weight > 0 and not cfg.pattern_heads and not args.eval_only:
         cfg.pattern_heads = True
         new_head = new_head or resume_ckpt is not None
@@ -471,7 +480,8 @@ def main() -> None:
 
     weights = LossWeights(density=args.density_weight, pair=args.pair_weight, ladder=args.ladder_weight, jack=args.jack_weight,
                           patterns=args.pattern_weight, prior=args.prior_weight,
-                          error=args.error_weight if args.corrupt_prob > 0 else 0.0)
+                          error=args.error_weight if args.corrupt_prob > 0 else 0.0,
+                          plan=args.plan_weight if (args.plan_prob > 0 and args.pattern_weight > 0) else 0.0)
     if args.pair_prob > 0 and args.batch_size % 2:
         print("[warn] --batch_size is odd: pairs disabled (use an even batch size)")
         args.pair_prob = 0.0
@@ -487,7 +497,8 @@ def main() -> None:
                                  canvas_prob=args.canvas_prob,
                                  pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
                                  rate_aug=args.rate_aug, sr_rare=args.sr_rare,
-                                 corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0)
+                                 corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0,
+                                 plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:
@@ -622,7 +633,8 @@ def main() -> None:
                           + (f" jack {avg['jack']:.3f}" if "jack" in avg else "")
                           + (f" error {avg['error']:.3f}" if "error" in avg else "")
                           + (f" patterns {avg['patterns']:.3f}" if "patterns" in avg else "")
-                          + (f" prior {avg['prior']:.3f}" if "prior" in avg else ""), flush=True)
+                          + (f" prior {avg['prior']:.3f}" if "prior" in avg else "")
+                          + (f" plan {avg['plan']:.3f}" if "plan" in avg else ""), flush=True)
                     run, n_run = {}, 0
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait

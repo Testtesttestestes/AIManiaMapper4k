@@ -59,6 +59,7 @@ class HybridModelConfig:
     event_prior: float = 0.03
     canvas: bool = False              # masked discrete diffusion: a partially known map of the window as input (canvas.py)
     importance_head: bool = False     # difficulty ladder: per-frame importance + monotone threshold per star rating
+    plan: bool = False                # think first, then map: per-bar technique plan as input + a head that predicts it
     error_head: bool = False          # break and fix: P(a visible canvas frame is wrong) - the self-correction critic
     pattern_heads: bool = False       # pattern knowledge: rhythm / shape / hand / flow / copy heads (motif_targets.py)
 
@@ -210,6 +211,14 @@ class HybridParamNet(nn.Module):
             nn.init.zeros_(self.canvas_out.weight)   # starts as the plain network: an older checkpoint is unchanged
             nn.init.zeros_(self.canvas_out.bias)
 
+        if cfg.plan:
+            from .motif_targets import N_PLAN, N_PLAN_COPY
+            self.plan_family = nn.Embedding(N_PLAN + 1, d)      # last index = unknown
+            self.plan_copy = nn.Embedding(N_PLAN_COPY + 1, d)
+            self.plan_out = nn.Linear(d, d)
+            nn.init.zeros_(self.plan_out.weight)                 # starts as the network without a plan
+            nn.init.zeros_(self.plan_out.bias)
+            self.plan_head = nn.Linear(d, N_PLAN + N_PLAN_COPY)
         cond_in = 2 + 2 * cfg.style_dim
         self.cond_mlp = nn.Sequential(nn.Linear(cond_in, d), nn.SiLU(), nn.Linear(d, d))
         self.global_in = nn.Sequential(nn.Linear(cfg.coarse_dim, d), nn.GELU(), nn.Linear(d, d))
@@ -288,6 +297,7 @@ class HybridParamNet(nn.Module):
         coarse_mask: Optional[torch.Tensor] = None,
         rep_present: Optional[torch.Tensor] = None,
         canvas: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
         B, T, _ = feats.shape
@@ -328,6 +338,14 @@ class HybridParamNet(nn.Module):
             e = self.canvas_state(st) + self.canvas_ms(cms.clamp(0, cfg.frame_ms - 1)) * (st >= 2).unsqueeze(-1).float() \
                 + self.canvas_ln(cln)
             x = x + self.canvas_out(e)
+        if cfg.plan:
+            from .motif_targets import N_PLAN, N_PLAN_COPY
+            if plan is None:
+                pf = torch.full((B, T), N_PLAN, dtype=torch.long, device=dev)
+                pc = torch.full((B, T), N_PLAN_COPY, dtype=torch.long, device=dev)
+            else:
+                pf, pc = plan[0].long().to(dev).clamp(0, N_PLAN), plan[1].long().to(dev).clamp(0, N_PLAN_COPY)
+            x = x + self.plan_out(self.plan_family(pf) + self.plan_copy(pc))
         x = self.in_norm(x)
         c = self._condition(sr, style.float(), style_mask, coarse, coarse_mask, use_global)
 
@@ -354,6 +372,8 @@ class HybridParamNet(nn.Module):
             extra["pattern_logits"] = self.pattern_head(u)
         if cfg.error_head:
             extra["error_logits"] = self.error_head(u).squeeze(-1)
+        if cfg.plan:
+            extra["plan_logits"] = self.plan_head(u)
         return {
             **extra,
             "time_logits": self.time_head(u),

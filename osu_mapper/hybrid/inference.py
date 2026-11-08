@@ -152,6 +152,7 @@ class HybridPredictor:
         sr_guidance: float = 1.0,
         style_guidance: float = 1.0,
         canvas: Optional[tuple] = None,
+        plan: Optional[tuple] = None,
     ) -> HeadOutputs:
         """Sliding-window inference over the whole track.
 
@@ -174,6 +175,7 @@ class HybridPredictor:
         w_acc = np.zeros(F, dtype=np.float32)
         imp_acc = np.zeros(F, dtype=np.float32)
         err_acc = None
+        plan_rows = None
         ladder = None
         best_w = np.zeros(F, dtype=np.float32)
         lane = np.zeros((F, cfg.n_lane_codes), dtype=np.float32)
@@ -207,6 +209,19 @@ class HybridPredictor:
             if canvas is not None and getattr(self.model.cfg, "canvas", False):
                 # outside the song: state 0 = masked
                 cv = tuple(torch.from_numpy(np.stack([window_slice(np.asarray(a), s) for s in chunk])).to(dev) for a in canvas)
+            pl = None
+            if plan is not None and getattr(self.model.cfg, "plan", False):
+                from .motif_targets import N_PLAN, N_PLAN_COPY
+
+                def plan_slice(a: np.ndarray, s: int, unknown: int) -> np.ndarray:
+                    o = np.full(W, unknown, dtype=np.int64)
+                    lo, hi = max(0, s), min(a.shape[0], s + W)
+                    if hi > lo:
+                        o[lo - s: hi - s] = a[lo:hi]
+                    return o
+                pl = (torch.from_numpy(np.stack([plan_slice(np.asarray(plan[0]), s, N_PLAN) for s in chunk])).to(dev),
+                      torch.from_numpy(np.stack([plan_slice(np.asarray(plan[1]), s, N_PLAN_COPY) for s in chunk])).to(dev))
+
             def run(sr_value: float, use_style: bool) -> Dict[str, torch.Tensor]:
                 return self.model(
                     feats, beat,
@@ -217,6 +232,7 @@ class HybridPredictor:
                     None,
                     rep_present=rep_present.expand(n, -1) if rep_present is not None else None,
                     canvas=cv,
+                    plan=pl,
                 )
 
             out = run(star_rating, True)
@@ -236,6 +252,7 @@ class HybridPredictor:
             lr = out["ln_resid"].float().cpu().numpy()
             imp = out["importance"].float().cpu().numpy() if "importance" in out else None
             err = torch.sigmoid(out["error_logits"].float()).cpu().numpy() if ("error_logits" in out and cv is not None) else None
+            plg = out["plan_logits"].float().cpu().numpy() if "plan_logits" in out else None
             if imp is not None and ladder is None:
                 ladder = (float(out["ladder_c0"].float()), out["ladder_c"].float().cpu().numpy().copy())
             for j, s in enumerate(chunk):
@@ -260,6 +277,10 @@ class HybridPredictor:
                 ln_logits[rows] = ll[j, src]
                 ln_bucket[rows] = lb[j, src]
                 ln_resid[rows] = lr[j, src]
+                if plg is not None:
+                    if plan_rows is None:
+                        plan_rows = np.zeros((F, plg.shape[-1]), np.float32)
+                    plan_rows[rows] = plg[j, src]
                 best_w[a:b] = np.maximum(best_w[a:b], wj)
             if progress is not None:
                 progress(min(len(starts), bi + n), len(starts))
@@ -277,6 +298,7 @@ class HybridPredictor:
             importance=(imp_acc / np.maximum(w_acc, 1e-6)).astype(np.float32) if ladder is not None else None,
             ladder=ladder,
             error_probs=(err_acc / np.maximum(w_acc, 1e-6)).astype(np.float32) if err_acc is not None else None,
+            plan_logits=plan_rows,
         )
 
 

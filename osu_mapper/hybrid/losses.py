@@ -42,6 +42,7 @@ class LossWeights:
     jack: float = 0.0      # fast transitions (< 160 ms): P(the chosen lane code hits a lane of the previous chord) vs the map
     ladder: float = 0.0    # difficulty ladder: which moments are mapped at which star rating (needs the importance head)
     patterns: float = 0.0  # pattern knowledge: rhythm / shape / hand / flow / copy of every event (needs the pattern heads)
+    plan: float = 0.0      # think first: the per-bar technique plan (family + copy kind) of every frame
     error: float = 0.0     # break and fix: which visible canvas frames are wrong (needs the error head)
     prior: float = 0.0     # motif library: lane distribution of real maps after the last 6 chords (distillation)
 
@@ -234,6 +235,19 @@ def compute_losses(
             loss_ladder = out["importance"].float().sum() * 0.0 + out["ladder_c"].sum() * 0.0
         total = total + weights.ladder * loss_ladder
         logs["ladder"] = float(loss_ladder.detach())
+
+    # --- the plan ------------------------------------------------------------------------------
+    if weights.plan > 0 and "plan_logits" in out and "plan_family" in batch:
+        from .motif_targets import N_PLAN
+        pl = out["plan_logits"].float()
+        vm = valid > 0
+        if vm.any():
+            loss_plan = 0.5 * (F.cross_entropy(pl[..., :N_PLAN][vm], batch["plan_family"][vm])
+                               + F.cross_entropy(pl[..., N_PLAN:][vm], batch["plan_copy"][vm]))
+        else:
+            loss_plan = pl.sum() * 0.0
+        total = total + weights.plan * loss_plan
+        logs["plan"] = float(loss_plan.detach())
 
     # --- break and fix: the critic -------------------------------------------------------------
     # every visible canvas frame: is it what the map has there? (correct maps too: "nothing to fix" teaches stopping)
