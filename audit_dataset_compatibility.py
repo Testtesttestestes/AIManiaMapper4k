@@ -24,6 +24,11 @@ Usage:
     python audit_dataset_compatibility.py --dir "sample beatmaps"
     python audit_dataset_compatibility.py --map "sample beatmaps/mymap.osz"
     python audit_dataset_compatibility.py --out report.json
+
+Cleanup (keeps only what training reads: 4K mania difficulties + the audio file they name):
+    python audit_dataset_compatibility.py --clean                         # report only, nothing is changed
+    python audit_dataset_compatibility.py --clean --apply                 # remove videos, bg, hitsounds, clones...
+    python audit_dataset_compatibility.py --clean --apply --out_dir clean # cleaned copies, originals untouched
 """
 
 from __future__ import annotations
@@ -491,7 +496,40 @@ def main():
     parser.add_argument("--dir", "--sample-dir", default="sample beatmaps", help="Directory containing .osz beatmaps or song folders.")
     parser.add_argument("--map", default=None, help="Path to a single .osz or .osu file to audit.")
     parser.add_argument("--out", default="dataset_audit_report.json", help="Path to save JSON audit report.")
+    parser.add_argument("--clean", action="store_true",
+                        help="cleanup report: what training does not need (videos, backgrounds, hitsounds, storyboards, "
+                             "other modes / key counts, unusable audio, clone difficulties) and how much space it frees")
+    parser.add_argument("--apply", action="store_true",
+                        help="with --clean: really remove it (archives are rewritten in place; an archive without a usable "
+                             "4K difficulty is deleted)")
+    parser.add_argument("--out_dir", default=None,
+                        help="with --clean --apply: write cleaned copies here instead of changing the originals")
+    parser.add_argument("--keep_clones", action="store_true", help="with --clean: keep difficulties with identical notes")
+    parser.add_argument("--strict_timing", action="store_true",
+                        help="with --clean: identical notes with different timing points are not clones")
+    parser.add_argument("--min_notes", type=int, default=20, help="with --clean: difficulties with fewer notes are removed")
+    parser.add_argument("--verbose", action="store_true", help="with --clean: list every removed difficulty and why")
+    parser.add_argument("--skip_audit", action="store_true", help="only the cleanup, no rhythm/grid audit afterwards")
     args = parser.parse_args()
+
+    if args.clean:
+        from osu_mapper.dataset.cleaner import apply_plan, format_report, plan_dataset
+
+        root = Path(args.dir)
+        print(f"[Dataset Cleanup] Checking '{root.resolve()}' ...")
+        rep = plan_dataset(root, min_notes=args.min_notes, keep_clones=args.keep_clones, strict_timing=args.strict_timing)
+        print(format_report(rep, verbose=args.verbose))
+        if args.apply:
+            print("[Dataset Cleanup] Applying" + (f" -> {Path(args.out_dir).resolve()}" if args.out_dir else " in place") + " ...")
+            apply_plan(rep, args.out_dir)
+            print("[Dataset Cleanup] Done.")
+            if args.out_dir:
+                args.dir = args.out_dir
+        else:
+            print("[Dataset Cleanup] Dry run: nothing was changed. Add --apply to remove it "
+                  "(or --apply --out_dir <folder> to write cleaned copies).")
+        if args.skip_audit:
+            return
 
     results: List[MapAuditResult] = []
 
