@@ -109,7 +109,7 @@ def forward_batch(model: HybridParamNet, batch: Dict[str, torch.Tensor]) -> Dict
     plan = (batch["plan_in_family"], batch["plan_in_copy"]) if "plan_in_family" in batch else None
     return model(
         batch["feats"], batch["beat"], batch["sr"], batch["style"], batch["style_mask"],
-        batch["coarse"], batch["coarse_mask"], canvas=canvas, plan=plan,
+        batch["coarse"], batch["coarse_mask"], canvas=canvas, plan=plan, augmented=batch.get("augmented"),
     )
 
 
@@ -295,9 +295,12 @@ def main() -> None:
     ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
     ap.add_argument("--rate_aug", type=float, default=0.3,
-                    help="share of training crops sped up x1.1..x1.5 together with their music (features resampled, star "
+                    help="share of training crops sped up x1.1..--rate_max together with their music (features resampled, star "
                          "rating measured by rosu-pp at that clock rate); rates that land in rare star bins are preferred. "
                          "The network saturated around 5* before (sr_diagnose.py); 0 = off")
+    ap.add_argument("--rate_max", type=float, default=1.3,
+                    help="fastest rate of --rate_aug (1.1 .. 1.5): beyond x1.3 a sped-up map drifts from how mappers snap at "
+                         "that tempo; the hole in the hard bins is still filled")
     ap.add_argument("--sr_rare", type=float, default=0.5,
                     help="loss weight of a crop = (real maps in its 1-star bin)^-sr_rare (mean 1 per batch): rare, hard "
                          "difficulties weigh more; 0 = off")
@@ -414,6 +417,9 @@ def main() -> None:
     if args.corrupt_prob > 0 and args.error_weight > 0 and args.canvas_prob > 0 and not cfg.error_head and not args.eval_only:
         cfg.error_head = True
         new_head = new_head or resume_ckpt is not None
+    if args.rate_aug > 0 and not cfg.aug_tag and not args.eval_only:
+        cfg.aug_tag = True          # sped-up crops are tagged; generation runs untagged = "like a real map"
+        new_head = new_head or resume_ckpt is not None
     if args.plan_prob > 0 and args.pattern_weight > 0 and not cfg.plan and not args.eval_only:
         cfg.plan = True
         new_head = new_head or resume_ckpt is not None
@@ -501,7 +507,7 @@ def main() -> None:
                                  pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0,
                                  canvas_prob=args.canvas_prob,
                                  pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
-                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare,
+                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare, rate_max=args.rate_max,
                                  corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0,
                                  plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)

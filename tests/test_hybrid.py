@@ -1088,3 +1088,37 @@ class TestDPO(unittest.TestCase):
         loss, acc = dpo_loss(lg, lb, map_logprob(ref, good, valid), map_logprob(ref, bad, valid))
         self.assertEqual(acc, 1.0)
         self.assertLess(float(loss), 0.01)
+
+
+class TestAugTag(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_tag_changes_the_condition_only_when_given(self):
+        from types import SimpleNamespace
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset
+        from osu_mapper.hybrid.model import HybridParamNet, build_config
+
+        fcfg = FeatureConfig()
+        torch.manual_seed(0)
+        model = HybridParamNet(build_config(fcfg.dims(), fcfg.total_dim(), "tiny", aug_tag=True)).eval()
+        with torch.no_grad():
+            model.aug_vec.fill_(0.5)                 # as if trained
+            for name, prm in model.named_parameters():
+                if "film" in name and prm.ndim == 2:   # FiLM layers start at zero: the condition has no effect until trained
+                    prm.normal_(0.0, 0.05)
+        args = (torch.randn(1, 256, fcfg.total_dim()), torch.zeros(1, 256, 13), torch.tensor([[5.0]]),
+                torch.zeros(1, STYLE_DIM), torch.zeros(1, STYLE_DIM), torch.randn(1, 30, fcfg.total_dim()), None)
+        with torch.no_grad():
+            plain = model(*args)["time_logits"]
+            untagged = model(*args, augmented=torch.zeros(1, 1))["time_logits"]
+            tagged = model(*args, augmented=torch.ones(1, 1))["time_logits"]
+        self.assertTrue(torch.allclose(plain, untagged))     # generation (no tag) = untagged crops
+        self.assertFalse(torch.allclose(plain, tagged))
+        # rates above --rate_max are never drawn
+        track = solve_map([Note(1000 + 200 * i, i % 4, 1000 + 200 * i, False) for i in range(40)], num_frames=4000)
+        index = SimpleNamespace(maps=[{"sr": 3.0, "song_id": "s", "track": "t"}], track=lambda i: track, feature_config=fcfg)
+        ds = HybridCropDataset(index, range(1), 512, 64, rate_max=1.3)
+        ds.rate_aug = 1.0
+        ds.rate_srs = [{f"{r:g}": 3.0 + 4 * (r - 1) for r in (1.1, 1.2, 1.3, 1.4, 1.5)}]
+        self.assertTrue({ds._choose_rate(0, i) for i in range(0, 400, 2)} <= {1.1, 1.2, 1.3})

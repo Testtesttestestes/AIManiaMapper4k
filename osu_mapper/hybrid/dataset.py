@@ -361,6 +361,7 @@ class HybridCropDataset(Dataset):
         sr_rare: float = 0.0,
         corrupt_prob: float = 0.0,
         plan_prob: float = 0.0,
+        rate_max: float = 1.3,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -408,6 +409,7 @@ class HybridCropDataset(Dataset):
         self.weights = span_len / span_len.sum()
         # rate augmentation: star ratings at every clock rate, and how rare each 1-star bin is among the real maps
         self.rate_aug = float(rate_aug) if train else 0.0
+        self.rate_max = float(rate_max)
         self.rate_srs: List[Dict[str, float]] = [{} for _ in self.entries]
         if self.rate_aug > 0:
             table = rate_star_ratings(index, self.map_indices, log=log)
@@ -523,6 +525,7 @@ class HybridCropDataset(Dataset):
             "valid": torch.from_numpy(valid.astype(np.float32)),
             "sr": torch.tensor([sr_label], dtype=torch.float32),
             "rate": torch.tensor([rate], dtype=torch.float32),
+            "augmented": torch.tensor([1.0 if rate != 1.0 else 0.0], dtype=torch.float32),
             # rare star ratings weigh more in the loss: (real maps in the 1-star bin of this crop's rating)^-sr_rare
             "loss_weight": torch.tensor([float(max(1.0, self.bin_counts[int(np.clip(sr_label, 0, 11.99))]) ** -self.sr_rare)],
                                         dtype=torch.float32),
@@ -574,7 +577,7 @@ class HybridCropDataset(Dataset):
         rng = np.random.default_rng(self._item_seed(i - i % 2) + 7_777)
         if rng.random() >= self.rate_aug:
             return 1.0
-        rates = [r for r in RATES if f"{r:g}" in self.rate_srs[k]]
+        rates = [r for r in RATES if r <= self.rate_max + 1e-9 and f"{r:g}" in self.rate_srs[k]]
         if not rates:
             return 1.0
         srs = np.array([self.rate_srs[k][f"{r:g}"] for r in rates])
