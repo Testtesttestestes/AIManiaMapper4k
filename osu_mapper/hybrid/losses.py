@@ -88,6 +88,19 @@ def compute_losses(
     tc = batch["time_class"]
     valid = batch["valid"].float()
     B, T = tc.shape
+    # per-crop weights (rare star ratings weigh more, dataset sr_rare), mean 1 inside the batch
+    if "loss_weight" in batch:
+        sw = batch["loss_weight"].float().view(B)
+        sw = sw / sw.mean().clamp(min=1e-8)
+    else:
+        sw = torch.ones(B, device=tc.device)
+
+    def wmean(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        """Mean of per-element losses ``x`` whose crop indices are ``rows``, weighted by the crop weights."""
+        wr = sw[rows]
+        return (x * wr).sum() / wr.sum().clamp(min=1e-8)
+
+    bidx = torch.arange(B, device=tc.device).view(B, 1).expand(B, T)
     # masked diffusion: frames given on the canvas are not predicted (time, lanes, members count only masked frames)
     valid_pred = valid * (batch["canvas_state"] == 0).float() if "canvas_state" in batch else valid
     logs: Dict[str, float] = {}
@@ -96,7 +109,7 @@ def compute_losses(
     target = soft_time_targets(tc, frame_ms, sigma_ms)
     logp = F.log_softmax(out["time_logits"].float(), dim=-1)
     ce = -(target * logp).sum(dim=-1)
-    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred
+    w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred * sw.view(B, 1)
     loss_time = (ce * w).sum() / w.sum().clamp(min=1.0)
     total = weights.time * loss_time
     logs["time"] = float(loss_time.detach())
@@ -110,23 +123,32 @@ def compute_losses(
         return sum(out[k].float().sum() for k in keys) * 0.0
     if n_ev > 0:
         # --- lane code -----------------------------------------------------------------------
-        loss_lane = F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing)
+        rows_ev = bidx[ev]
+        loss_lane = wmean(F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing,
+                                          reduction="none"), rows_ev)
         # --- members ---------------------------------------------------------------------------
         masks = batch["event_mask"]
         bits = ((masks.unsqueeze(-1) >> torch.arange(4, device=masks.device)) & 1)
         chord = bits.sum(dim=-1)
         member = (torch.arange(MAX_MEMBERS, device=masks.device).view(1, 1, -1) < chord.unsqueeze(-1)) & ev.unsqueeze(-1)
-        loss_chord = F.cross_entropy(out["chord_logits"][ev].float(), (chord[ev] - 1).clamp(0, MAX_MEMBERS - 1))
+        loss_chord = wmean(F.cross_entropy(out["chord_logits"][ev].float(), (chord[ev] - 1).clamp(0, MAX_MEMBERS - 1),
+                                           reduction="none"), rows_ev)
+        bidx_m = bidx.unsqueeze(-1).expand(B, T, MAX_MEMBERS)
         chord_member = member & (chord.unsqueeze(-1) >= 2)
         if chord_member.any():
-            loss_stagger = F.cross_entropy(out["stagger_logits"][chord_member].float(), batch["stagger"][chord_member].clamp(0, frame_ms - 1))
+            loss_stagger = wmean(F.cross_entropy(out["stagger_logits"][chord_member].float(),
+                                                 batch["stagger"][chord_member].clamp(0, frame_ms - 1), reduction="none"),
+                                 bidx_m[chord_member])
         else:
             loss_stagger = zero("stagger_logits")
-        loss_lnf = F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float())
+        loss_lnf = wmean(F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float(),
+                                                            reduction="none"), bidx_m[member])
         ln_member = member & (batch["ln_flag"] > 0.5)
         if ln_member.any():
             b_t, r_t = ln_targets(batch["ln_len"][ln_member])
-            loss_lnl = F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t) + F.l1_loss(out["ln_resid"][ln_member].float(), r_t)
+            rows_ln = bidx_m[ln_member]
+            loss_lnl = wmean(F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t, reduction="none")
+                             + F.l1_loss(out["ln_resid"][ln_member].float(), r_t, reduction="none"), rows_ln)
         else:
             loss_lnl = zero("ln_bucket_logits", "ln_resid")
     else:
@@ -160,7 +182,8 @@ def compute_losses(
     log_e = torch.stack([torch.log1p(e_events), torch.log1p(e_notes)], dim=-1)
     log_n = torch.stack([torch.log1p(n_events), torch.log1p(n_notes)], dim=-1)
     if weights.density > 0 and has.any():
-        loss_density = F.smooth_l1_loss(log_e[has], log_n[has], beta=0.1)
+        hb = torch.nonzero(has).view(-1)
+        loss_density = wmean(F.smooth_l1_loss(log_e[has], log_n[has], beta=0.1, reduction="none").mean(dim=-1), hb)
     else:
         loss_density = zero("time_logits", "chord_logits")
     pair = batch.get("pair_prev")

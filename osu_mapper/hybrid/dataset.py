@@ -16,6 +16,7 @@ validation would contain the training audio and look much better than reality.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 from pathlib import Path
@@ -29,6 +30,9 @@ from .audio_features import BEAT_DIM, FeatureConfig, beat_features
 from .params import PARAM_VERSION, ParamTrack
 
 INDEX_VERSION = "hybrid-dataset-v1"
+# rate augmentation: the map and the music sped up together (how players make harder versions); star ratings measured
+# by rosu-pp at the clock rate (Peter on Crack 5.38* -> x1.2 6.31* -> x1.5 7.70*)
+RATES: Tuple[float, ...] = (1.1, 1.2, 1.3, 1.4, 1.5)
 LOSS_MARGIN_FRAMES = 200  # frames before the first / after the last note that still count as "no note here"
 
 
@@ -129,6 +133,59 @@ def split_key(entry: Dict[str, Any]) -> str:
     return base if base else str(entry.get("song_id"))
 
 
+def rate_star_ratings(index: "HybridIndex", map_indices: Sequence[int], rates: Sequence[float] = RATES,
+                      log=print) -> Dict[str, Dict[str, float]]:
+    """{track file: {rate: star rating}} of every map at every clock rate (rosu-pp), cached in <root>/rate_srs.json."""
+    import time as _time
+
+    from .beatmap import ManiaMap, map_to_osu_text
+    from .renderer import render_track
+
+    cache_path = index.root / "rate_srs.json"
+    cache: Dict[str, Dict[str, float]] = {}
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+    todo = [i for i in map_indices if index.maps[i]["track"] not in cache
+            or any(f"{r:g}" not in cache[index.maps[i]["track"]] for r in rates)]
+    if todo:
+        try:
+            import rosu_pp_py
+        except ImportError:
+            log("[rate] rosu-pp-py is not installed: rate augmentation is off (pip install rosu-pp-py)")
+            return {}
+        t0 = _time.time()
+        for n, i in enumerate(todo, 1):
+            e = index.maps[i]
+            tr = index.track(i)
+            notes = render_track(tr)
+            text = map_to_osu_text(ManiaMap(notes=notes, timing_points=tr.timing_points, overall_difficulty=float(e.get("od", 8.0))))
+            bm = rosu_pp_py.Beatmap(content=text)
+            cache[e["track"]] = {f"{r:g}": float(rosu_pp_py.Difficulty(clock_rate=float(r)).calculate(bm).stars) for r in rates}
+            if n % 200 == 0:
+                log(f"  [rate] star ratings at {len(rates)} rates: {n}/{len(todo)} maps ({_time.time() - t0:.0f}s)")
+        try:
+            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+    return cache
+
+
+def scaled_timing_points(tps, start_ms: float, rate: float):
+    """Red / green lines of a window that starts at ``start_ms`` and is played ``rate`` times faster."""
+    from dataclasses import replace
+
+    out = []
+    for tp in tps:
+        if tp.uninherited:
+            out.append(replace(tp, time=start_ms + (tp.time - start_ms) / rate, beat_len=tp.beat_len / rate))
+        else:
+            out.append(replace(tp, time=start_ms + (tp.time - start_ms) / rate))
+    return out
+
+
 class SparseTrack:
     """Event-only copy of a ParamTrack (~20x smaller in RAM than the dense arrays)."""
 
@@ -149,7 +206,53 @@ class SparseTrack:
     def event_frames(self) -> np.ndarray:
         return self.frames
 
-    def crop_arrays(self, start: int, length: int) -> Dict[str, np.ndarray]:
+    def _crop_rate(self, start: int, length: int, rate: float) -> Optional[Dict[str, np.ndarray]]:
+        H = self.frame_ms
+        span = int(math.ceil(length * rate)) + 1
+        i0, i1 = np.searchsorted(self.frames, [start, start + span])
+        ms = (self.frames[i0:i1] - start) * H + self.time_class[i0:i1].astype(np.int64) - 1
+        new_ms = np.floor(ms / rate).astype(np.int64)
+        keep = new_ms < length * H
+        idx = np.arange(i0, i1)[keep]
+        new_ms = new_ms[keep]
+        rows = new_ms // H
+        if rows.size and np.any(np.diff(rows) == 0):
+            return None
+        out = {
+            "time_class": np.zeros(length, dtype=np.int64),
+            "lane_code": np.full(length, -1, dtype=np.int64),
+            "event_mask": np.zeros(length, dtype=np.int64),
+            "stagger": np.zeros((length, 4), dtype=np.int64),
+            "ln_flag": np.zeros((length, 4), dtype=np.float32),
+            "ln_len": np.zeros((length, 4), dtype=np.int64),
+        }
+        if idx.size:
+            out["time_class"][rows] = new_ms - rows * H + 1
+            out["lane_code"][rows] = self.lane_code[idx]
+            out["event_mask"][rows] = self.event_mask[idx]
+            out["stagger"][rows] = np.clip(np.round(self.stagger[idx] / rate), 0, H - 1)
+            out["ln_flag"][rows] = self.ln_flag[idx]
+            out["ln_len"][rows] = np.where(self.ln_flag[idx], np.maximum(1, np.round(self.ln_len[idx] / rate)), 0)
+        if self.pat is not None:
+            from .motif_targets import PATTERN_HEADS
+            for k in PATTERN_HEADS:
+                a = np.full(length, -1, dtype=np.int64)
+                a[rows] = self.pat[k][idx]
+                out["pat_" + k] = a
+            prior = np.zeros((length, 16), dtype=np.float32)
+            prev = np.zeros((length, 2), dtype=np.int64)
+            prior[rows] = self.pat["prior"][idx]
+            prev[rows] = self.pat["prev"][idx]
+            out["pat_prior"] = prior
+            out["pat_prev"] = prev
+        return out
+
+    def crop_arrays(self, start: int, length: int, rate: float = 1.0) -> Optional[Dict[str, np.ndarray]]:
+        """Targets of the window [start, start + length) frames; with ``rate`` > 1 the window covers
+        ``length * rate`` frames of the map, played ``rate`` times faster (event times, LN lengths and staggers divided
+        by the rate). None when two events of the map would fall into one frame at that speed."""
+        if rate != 1.0:
+            return self._crop_rate(start, length, rate)
         out = {
             "time_class": np.zeros(length, dtype=np.int64),
             "lane_code": np.full(length, -1, dtype=np.int64),
@@ -212,6 +315,8 @@ class HybridCropDataset(Dataset):
         pattern_targets: bool = False,
         motifs=None,
         log=print,
+        rate_aug: float = 0.0,
+        sr_rare: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -255,6 +360,17 @@ class HybridCropDataset(Dataset):
             span_len[derived] *= derived_weight / span_len[derived].sum()
             span_len[~derived] *= (1.0 - derived_weight) / span_len[~derived].sum()
         self.weights = span_len / span_len.sum()
+        # rate augmentation: star ratings at every clock rate, and how rare each 1-star bin is among the real maps
+        self.rate_aug = float(rate_aug) if train else 0.0
+        self.rate_srs: List[Dict[str, float]] = [{} for _ in self.entries]
+        if self.rate_aug > 0:
+            table = rate_star_ratings(index, self.map_indices, log=log)
+            self.rate_srs = [table.get(e["track"], {}) for e in self.entries]
+            if not any(self.rate_srs):
+                self.rate_aug = 0.0
+        real_bins = [int(np.clip(float(e.get("sr", 0.0)), 0, 11.99)) for e in self.entries if not e.get("derived")]
+        self.bin_counts = np.bincount(real_bins, minlength=12).astype(np.float64) if real_bins else np.ones(12)
+        self.sr_rare = float(sr_rare)
         # pairs: the same window of the same song at another difficulty (teaches what changes with SR)
         self.pair_prob = float(pair_prob) if train else 0.0
         by_song: Dict[str, List[int]] = {}
@@ -291,6 +407,7 @@ class HybridCropDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         pair_prev = 0.0
+        pair_src = -1
         if self.fixed is not None:
             k, start = self.fixed[i]
             rng = np.random.default_rng(self.seed + i)
@@ -303,6 +420,7 @@ class HybridCropDataset(Dataset):
                 k_prev, start_prev = self._draw(np.random.default_rng(self._item_seed(i - 1)))
                 if self.siblings[k_prev] and rng.random() < self.pair_prob:
                     k, start, pair_prev = int(rng.choice(self.siblings[k_prev])), start_prev, 1.0
+                    pair_src = k_prev
         entry, track = self.entries[k], self.tracks[k]
         song_id = entry["song_id"]
         variant = 0
@@ -310,29 +428,59 @@ class HybridCropDataset(Dataset):
             variant = int(rng.integers(1, self.index.num_variants(song_id)))
         feats_all = self.index.features(song_id, variant)
         n_audio = feats_all.shape[0]
-        feats = _crop_rows(feats_all, start, self.crop)
+        rate = self._choose_rate(pair_src if pair_src >= 0 else k, i - 1 if pair_src >= 0 else i)
+        if rate != 1.0 and f"{rate:g}" not in self.rate_srs[k]:
+            rate = 1.0
+        tgt = track.crop_arrays(start, self.crop, rate)
+        if tgt is None:                      # two events would share a frame at this speed: no augmentation
+            rate = 1.0
+            tgt = track.crop_arrays(start, self.crop)
+        sr_label = float(entry.get("sr", 0.0)) if rate == 1.0 else float(self.rate_srs[k][f"{rate:g}"])
+        H = track.frame_ms
+        if rate == 1.0:
+            feats = _crop_rows(feats_all, start, self.crop)
+            src = np.arange(start, start + self.crop, dtype=np.float64)
+            tps = track.timing_points
+        else:
+            # the same music played `rate` times faster: features resampled to the 10 ms grid, red lines scaled
+            n_src = int(math.ceil(self.crop * rate)) + 2
+            block = _crop_rows(feats_all, start, n_src)
+            pos = (np.arange(self.crop) + 0.5) * rate - 0.5
+            lo = np.clip(np.floor(pos).astype(np.int64), 0, n_src - 2)
+            w = (pos - lo).clip(0.0, 1.0)[:, None].astype(np.float32)
+            feats = block[lo] * (1.0 - w) + block[lo + 1] * w
+            src = start + pos
+            tps = scaled_timing_points(track.timing_points, start * H, rate)
 
-        tps = track.timing_points
         beat_shift = int(rng.integers(-3, 4)) if self.augment else 0  # small timing-estimate error
-        beat = beat_features(tps, start + beat_shift, self.crop, track.frame_ms) if tps else np.zeros((self.crop, BEAT_DIM), np.float32)
+        beat = beat_features(tps, start + beat_shift, self.crop, H) if tps else np.zeros((self.crop, BEAT_DIM), np.float32)
 
-        frames = np.arange(start, start + self.crop)
         a, b = self.spans[k]
-        valid = (frames >= 0) & (frames < max(n_audio, track.num_frames))
-        valid &= (frames >= a - LOSS_MARGIN_FRAMES) & (frames <= b + LOSS_MARGIN_FRAMES)
+        valid = (src >= 0) & (src < max(n_audio, track.num_frames))
+        valid &= (src >= a - LOSS_MARGIN_FRAMES) & (src <= b + LOSS_MARGIN_FRAMES)
 
         if self.augment:
             feats = self._augment(feats, rng)
 
-        tgt = track.crop_arrays(start, self.crop)
         coarse = self.index.coarse(song_id)
-        ladder = self._ladder(k, start, rng) if self.ladder_k > 0 else None
+        ladder = self._ladder(k, start, rng, rate) if self.ladder_k > 0 else None
+        style = np.array(entry["style"], dtype=np.float32)
+        if rate != 1.0:
+            from .solver import STYLE_KEYS
+            style[STYLE_KEYS.index("sr")] = sr_label / 10.0
+            j = STYLE_KEYS.index("nps")
+            nps = math.expm1(float(style[j]) * math.log1p(30.0))
+            style[j] = math.log1p(nps * rate) / math.log1p(30.0)
         item = {
-            "feats": torch.from_numpy(feats),
+            "feats": torch.from_numpy(np.ascontiguousarray(feats, dtype=np.float32)),
             "beat": torch.from_numpy(beat),
             "valid": torch.from_numpy(valid.astype(np.float32)),
-            "sr": torch.tensor([float(entry.get("sr", 0.0))], dtype=torch.float32),
-            "style": torch.tensor(entry["style"], dtype=torch.float32),
+            "sr": torch.tensor([sr_label], dtype=torch.float32),
+            "rate": torch.tensor([rate], dtype=torch.float32),
+            # rare star ratings weigh more in the loss: (real maps in the 1-star bin of this crop's rating)^-sr_rare
+            "loss_weight": torch.tensor([float(max(1.0, self.bin_counts[int(np.clip(sr_label, 0, 11.99))]) ** -self.sr_rare)],
+                                        dtype=torch.float32),
+            "style": torch.from_numpy(style),
             "style_mask": torch.tensor(entry["style_mask"], dtype=torch.float32),
             "coarse": torch.from_numpy(coarse),
             "pair_prev": torch.tensor([pair_prev], dtype=torch.float32),
@@ -349,7 +497,25 @@ class HybridCropDataset(Dataset):
             item["ladder_sr"] = torch.from_numpy(ladder[1])
         return item
 
-    def _ladder(self, k: int, start: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+    def _choose_rate(self, k: int, i: int) -> float:
+        """A clock rate for item i (1.0 = none). Items 2j and 2j+1 draw the same rate (pairs stay comparable). Rates
+        whose star rating lands in a rare bin are preferred: the augmentation adds hard maps where they are missing."""
+        if self.rate_aug <= 0 or not self.rate_srs[k] or self.fixed is not None:
+            return 1.0
+        rng = np.random.default_rng(self._item_seed(i - i % 2) + 7_777)
+        if rng.random() >= self.rate_aug:
+            return 1.0
+        rates = [r for r in RATES if f"{r:g}" in self.rate_srs[k]]
+        if not rates:
+            return 1.0
+        srs = np.array([self.rate_srs[k][f"{r:g}"] for r in rates])
+        rarity = 1.0 / np.maximum(1.0, self.bin_counts[np.clip(srs.astype(int), 0, 11)])
+        rarity = np.where(srs <= 11.0, rarity, 0.0)
+        if rarity.sum() <= 0:
+            return 1.0
+        return float(rates[int(rng.choice(len(rates), p=rarity / rarity.sum()))])
+
+    def _ladder(self, k: int, start: int, rng: np.random.Generator, rate: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         """[K, T] whether each of up to K maps of the same song (this one first) has a note starting in each frame
         (+-1 frame, different mappers place one hit a few ms apart; -1 outside that map's notes) and [K] their star
         ratings (-1 = no map)."""
@@ -360,16 +526,19 @@ class HybridCropDataset(Dataset):
         if len(others) > K - 1:
             others = list(rng.choice(others, size=K - 1, replace=False))
         for row, j in enumerate([k] + others):
-            tc = self.tracks[j].crop_arrays(start, self.crop)["time_class"] > 0
+            arr = self.tracks[j].crop_arrays(start, self.crop, rate)
+            if arr is None or (rate != 1.0 and f"{rate:g}" not in self.rate_srs[j]):
+                continue                                   # that map cannot be played at this rate: unknown row
+            tc = arr["time_class"] > 0
             p = tc.copy()
             p[1:] |= tc[:-1]
             p[:-1] |= tc[1:]
             # outside that map's own first..last note it says nothing about the moment (-1 = unknown)
             fa, fb = self.spans[j]
-            frames = np.arange(start, start + self.crop)
+            frames = start + (np.arange(self.crop) + 0.5) * rate - 0.5
             p = np.where((frames >= fa) & (frames <= fb), p.astype(np.float32), -1.0)
             pres[row] = p
-            srs[row] = float(self.entries[j].get("sr", 0.0)) or -1.0
+            srs[row] = (float(self.entries[j].get("sr", 0.0)) if rate == 1.0 else float(self.rate_srs[j][f"{rate:g}"])) or -1.0
         return pres, srs
 
     def _augment(self, feats: np.ndarray, rng: np.random.Generator) -> np.ndarray:

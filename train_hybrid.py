@@ -278,7 +278,17 @@ def main() -> None:
     ap.add_argument("--ladder_k", type=int, default=4, help="difficulty ladder: maps of the same song per training crop")
     ap.add_argument("--pair_prob", type=float, default=0.5, help="share of odd batch items drawn as a sibling difficulty of the previous item (needs an even --batch_size)")
     ap.add_argument("--derived_weight", type=float, default=0.3, help="share of training draws given to derived (thinned) maps, see make_derived_maps.py")
-    ap.add_argument("--sr_balance", type=float, default=0.0,
+    ap.add_argument("--rate_aug", type=float, default=0.3,
+                    help="share of training crops sped up x1.1..x1.5 together with their music (features resampled, star "
+                         "rating measured by rosu-pp at that clock rate); rates that land in rare star bins are preferred. "
+                         "The network saturated around 5* before (sr_diagnose.py); 0 = off")
+    ap.add_argument("--sr_rare", type=float, default=0.5,
+                    help="loss weight of a crop = (real maps in its 1-star bin)^-sr_rare (mean 1 per batch): rare, hard "
+                         "difficulties weigh more; 0 = off")
+    ap.add_argument("--finetune_min_sr", type=float, default=0.0,
+                    help="train only on maps of at least this star rating (or that reach it sped up with --rate_aug): a short "
+                         "second stage after the full training, e.g. --resume --finetune_min_sr 5 --epochs 3 --lr 5e-5")
+    ap.add_argument("--sr_balance", type=float, default=0.5,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
     ap.add_argument("--pitch_shift", type=float, default=0.5,
                     help="share of training crops transposed by +-1..2 semitones in feature space (stops the network from "
@@ -333,6 +343,17 @@ def main() -> None:
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
     val_idx = [i for i in val_idx if not index.maps[i].get("derived")]  # validation = real maps only
+    if args.finetune_min_sr > 0:
+        reach = {}
+        if args.rate_aug > 0:
+            from osu_mapper.hybrid.dataset import rate_star_ratings
+            reach = rate_star_ratings(index, train_idx)
+        before = len(train_idx)
+        train_idx = [i for i in train_idx if float(index.maps[i].get("sr", 0.0)) >= args.finetune_min_sr
+                     or max(reach.get(index.maps[i]["track"], {}).values() or [0.0]) >= args.finetune_min_sr]
+        print(f"[data] fine-tuning on the hard end: {len(train_idx)} of {before} training maps reach {args.finetune_min_sr:g}*")
+        if not train_idx:
+            sys.exit("--finetune_min_sr: no training map reaches that star rating")
     n_derived = sum(1 for i in train_idx if index.maps[i].get("derived"))
     print(f"[data] {len(index.maps)} maps, {len(index.songs)} songs -> train {len(train_idx)} maps"
           + (f" ({n_derived} derived, {100 * args.derived_weight:.0f}% of draws)" if n_derived else "")
@@ -455,7 +476,8 @@ def main() -> None:
                                  sr_balance=args.sr_balance, derived_weight=args.derived_weight, pair_prob=args.pair_prob if args.pair_weight > 0 else 0.0,
                                  pitch_shift_prob=args.pitch_shift, ladder_k=args.ladder_k if args.ladder_weight > 0 else 0,
                                  canvas_prob=args.canvas_prob,
-                                 pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib)
+                                 pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
+                                 rate_aug=args.rate_aug, sr_rare=args.sr_rare)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_hybrid, drop_last=True)
     val_loader = None
     if val_idx:

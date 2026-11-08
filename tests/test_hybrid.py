@@ -854,3 +854,70 @@ class TestPatternKnowledge(unittest.TestCase):
         bad = torch.full((1, 512, N_LANE_CODES), -30.0)
         bad[..., code_for_mask(1 << 0)] = 30.0
         self.assertGreater(float(prior_loss(bad, batch, ev)[0]), 5.0)
+
+
+class TestRateAugmentation(unittest.TestCase):
+    """Rate augmentation (dataset.SparseTrack._crop_rate, HybridCropDataset._choose_rate) and per-crop loss weights."""
+
+    def test_sped_up_crop_matches_a_sped_up_map(self):
+        from osu_mapper.hybrid.dataset import SparseTrack
+
+        rng = random.Random(5)
+        notes, t = [], 1000
+        for _ in range(60):
+            t += rng.choice([60, 90, 125, 250])
+            c = rng.randrange(4)
+            ln = rng.random() < 0.2
+            notes.append(Note(t, c, t + 300 if ln else t, ln))
+        notes = sorted({(n.start, n.col): n for n in notes}.values(), key=lambda n: (n.start, n.col))
+        track = solve_map(notes, num_frames=2000)
+        sp = SparseTrack(track)
+        start, length, rate = 150, 400, 1.25
+        crop = sp.crop_arrays(start, length, rate)
+        self.assertIsNotNone(crop)
+        s0 = start * 10
+        want = sorted(Note(s0 + (n.start - s0) * 4 // 5 - s0, n.col, 0, n.ln) for n in notes
+                      if s0 <= n.start and (n.start - s0) * 4 // 5 < length * 10)
+        got_frames = np.flatnonzero(crop["time_class"] > 0)
+        got_ms = got_frames * 10 + crop["time_class"][got_frames] - 1
+        self.assertEqual(sorted(set(got_ms.tolist())), sorted({w.start for w in want}))
+        # chords keep their lanes, LN lengths are divided by the rate
+        for f in got_frames:
+            ms = f * 10 + crop["time_class"][f] - 1
+            self.assertEqual(int(crop["event_mask"][f]), sum(1 << w.col for w in want if w.start == ms))
+        lens = crop["ln_len"][crop["ln_flag"] > 0]
+        if lens.size:
+            self.assertTrue(np.all(np.abs(lens - 240) <= 1))
+
+    def test_pairs_share_the_rate_and_weights_average_one(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from osu_mapper.hybrid.audio_features import FeatureConfig
+        from osu_mapper.hybrid.dataset import HybridCropDataset
+        from osu_mapper.hybrid.losses import LossWeights, compute_losses
+
+        track = solve_map([Note(1000 + 200 * i, i % 4, 1000 + 200 * i, False) for i in range(40)], num_frames=4000)
+        index = SimpleNamespace(maps=[{"sr": 3.0 + i, "song_id": "s", "track": f"t{i}"} for i in range(4)],
+                                track=lambda i: track, feature_config=FeatureConfig())
+        ds = HybridCropDataset(index, range(4), 512, 64)
+        ds.rate_aug = 1.0
+        ds.rate_srs = [{f"{r:g}": 3.0 + i + 4 * (r - 1) for r in (1.1, 1.2, 1.3, 1.4, 1.5)} for i in range(4)]
+        for i in range(0, 20, 2):
+            self.assertEqual(ds._choose_rate(0, i), ds._choose_rate(0, i + 1))
+        rates = {ds._choose_rate(0, i) for i in range(0, 200, 2)}
+        self.assertTrue(rates <= {1.1, 1.2, 1.3, 1.4, 1.5} and len(rates) > 1)
+        # loss weights: no weight = the old loss; weights only re-weight crops
+        crops = [track.crop_arrays(0, 256), track.crop_arrays(64, 256)]
+        batch = {k: torch.from_numpy(np.stack([c[k] for c in crops])) for k in crops[0]}
+        batch.update(valid=torch.ones(2, 256), style=torch.zeros(2, STYLE_DIM), style_mask=torch.zeros(2, STYLE_DIM))
+        torch.manual_seed(0)
+        out = {"time_logits": torch.randn(2, 256, 11), "lane_logits": torch.randn(2, 256, 25), "chord_logits": torch.randn(2, 256, 4),
+               "stagger_logits": torch.randn(2, 256, 4, 10), "ln_logits": torch.randn(2, 256, 4),
+               "ln_bucket_logits": torch.randn(2, 256, 4, 48), "ln_resid": torch.rand(2, 256, 4), "style_pred": torch.zeros(2, STYLE_DIM)}
+        plain, _ = compute_losses(out, batch, LossWeights(), 10)
+        same, _ = compute_losses(out, dict(batch, loss_weight=torch.tensor([[2.0], [2.0]])), LossWeights(), 10)
+        self.assertAlmostEqual(float(plain), float(same), places=5)
+        skew, _ = compute_losses(out, dict(batch, loss_weight=torch.tensor([[1.0], [3.0]])), LossWeights(), 10)
+        self.assertNotAlmostEqual(float(plain), float(skew), places=4)
