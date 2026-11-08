@@ -1061,3 +1061,30 @@ class TestPlan(unittest.TestCase):
         forced, _ = plan_from_logits(logits, tp, 10, force_family="ln")
         self.assertEqual(PLAN_FAMILIES[int(forced[300])], "ln")
         self.assertEqual(PLAN_FAMILIES[int(forced[1150])], "sparse")
+
+
+class TestDPO(unittest.TestCase):
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch not installed")
+    def test_map_logprob_and_loss(self):
+        from osu_mapper.hybrid.dpo import dpo_loss, map_logprob
+        from osu_mapper.hybrid.params import N_LANE_CODES
+
+        track = solve_map(random_map(random.Random(4), 40))
+        good = {k: torch.from_numpy(v[None]) for k, v in track.crop_arrays(0, 256).items()}
+        bad = {k: torch.from_numpy(v[None]) for k, v in track.crop_arrays(40, 256).items()}   # another window's notes
+        # outputs that put all mass on the good map's events
+        tl = torch.full((1, 256, 11), -10.0)
+        tl[0, :, 0] = 10.0
+        f = good["time_class"][0] > 0
+        tl[0, f] = -10.0
+        tl[0, f, good["time_class"][0][f]] = 10.0
+        out = {"time_logits": tl, "lane_logits": torch.zeros(1, 256, N_LANE_CODES), "chord_logits": torch.zeros(1, 256, 4),
+               "ln_logits": torch.zeros(1, 256, 4)}
+        valid = torch.ones(1, 256)
+        lg, lb = map_logprob(out, good, valid), map_logprob(out, bad, valid)
+        self.assertGreater(float(lg), float(lb))
+        ref = {"time_logits": torch.zeros(1, 256, 11), "lane_logits": out["lane_logits"], "chord_logits": out["chord_logits"],
+               "ln_logits": out["ln_logits"]}
+        loss, acc = dpo_loss(lg, lb, map_logprob(ref, good, valid), map_logprob(ref, bad, valid))
+        self.assertEqual(acc, 1.0)
+        self.assertLess(float(loss), 0.01)

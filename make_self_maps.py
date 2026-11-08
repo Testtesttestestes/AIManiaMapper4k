@@ -44,6 +44,9 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--motifs", default=None, help="motif library for the pattern reward (default: test_NN/motifs.npz)")
     ap.add_argument("--remove", action="store_true", help="only delete the self-generated maps")
+    ap.add_argument("--no_pairs", action="store_true",
+                    help="do not save DPO preference pairs (best vs worst candidate, human map vs the network's map at the "
+                         "human map's rating; train_hybrid.py --dpo_weight uses them)")
     args = ap.parse_args()
 
     from make_derived_maps import _write
@@ -68,6 +71,10 @@ def main() -> None:
         (root / m["track"]).unlink(missing_ok=True)
     if old:
         print(f"removed {len(old)} previous self-generated maps")
+    for p_ in data.get("dpo_pairs", []):
+        if p_.get("rejected_own", True):
+            (root / p_["rejected"]).unlink(missing_ok=True)
+    data["dpo_pairs"] = []
     shutil.copy2(index_path, index_path.with_suffix(".json.bak"))
     if args.remove:
         data["maps"] = keep
@@ -93,7 +100,18 @@ def main() -> None:
     if args.max_songs:
         songs = songs[:args.max_songs]
     made: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []
     t0 = time.time()
+
+    def save_track(notes, tag: str, ref_map, num_frames: int):
+        m_ = ManiaMap(notes=list(notes), timing_points=tps, overall_difficulty=float(ref_map.get("od", 8.0)))
+        st_ = SolveStats()
+        tr_ = solve_map(m_, num_frames=num_frames, stats=st_)
+        if render_track(tr_) != sorted(m_.notes):
+            return None, None, None
+        mid_ = stable_id(ref_map["map_id"], tag)
+        tr_.save_npz(root / "maps" / f"{mid_}.npz")
+        return mid_, tr_, st_
     # candidate settings: classifier-free guidance (hears more notes) x lane sampling temperature (other patterns)
     variants = [(1.0, 0.0), (1.5, 0.0), (2.0, 0.0), (1.5, 0.6), (1.0, 0.6), (2.5, 0.0), (2.0, 0.6), (3.0, 0.3)]
     for n_song, sid in enumerate(songs, 1):
@@ -108,11 +126,25 @@ def main() -> None:
         inputs = SongInputs(feats, coarse, beat, int(song.get("duration_ms", feats.shape[0] * fcfg.frame_ms)))
         power = feats[:, spec[0]] if spec else None
         human = [float(m.get("sr", 0.0)) for m in maps]
+        if not args.no_pairs:
+            # the human map against the network's own map at the same rating: "the human did better" (SPIN-style)
+            for hm in maps:
+                hsr = float(hm.get("sr", 0.0))
+                out = predictor.predict(inputs, hsr)
+                knobs = DecodeKnobs(onset_threshold=predictor.threshold_for(hsr), ln_threshold=predictor.ln_threshold)
+                fit = fit_network_map(out, knobs, tps, hsr, float(hm.get("od", 8.0)))
+                if len(fit.notes) < 20:
+                    continue
+                mid_, _, _ = save_track(fit.notes, f"dpo-rej-human-{hsr:g}", hm, tr_ref.num_frames)
+                if mid_ is not None:
+                    pairs.append({"song_id": sid, "sr": hsr, "chosen": hm["track"], "rejected": f"maps/{mid_}.npz",
+                                  "kind": "human>network", "rejected_own": True})
         for target in targets:
             if any(abs(h - target) < args.min_gap for h in human):
                 continue
             pred = LanePredictor.cached(lib, target) if lib is not None else None
             best = None
+            worst = None
             for g, temp in variants[:max(1, args.candidates)]:
                 out = predictor.predict(inputs, target, sr_guidance=g)
                 knobs = DecodeKnobs(onset_threshold=predictor.threshold_for(target), ln_threshold=predictor.ln_threshold,
@@ -121,6 +153,8 @@ def main() -> None:
                 r = map_reward(fit.notes, tps, target, float(ref.get("od", 8.0)), pred, power, sr=float(fit.star_rating))
                 if best is None or r["reward"] > best[0]["reward"]:
                     best = (r, fit.notes, g, temp)
+                if worst is None or r["reward"] < worst[0]["reward"]:
+                    worst = (r, fit.notes, g, temp)
             r, notes, g, temp = best
             ok = abs(r["sr"] - target) <= args.max_error and r["reward"] >= args.min_reward
             print(f"[{n_song}/{len(songs)}] {ref.get('osu_file', sid)[:44]:<44} ask {target:.1f} -> {r['sr']:.2f}* "
@@ -147,8 +181,18 @@ def main() -> None:
                 "reward": {k: round(float(v), 4) for k, v in r.items()}, "piece": split_key(ref),
             })
             human.append(float(r["sr"]))
+            if not args.no_pairs and worst is not None and worst[0]["reward"] < r["reward"] - 0.5:
+                mid_w, _, _ = save_track(worst[1], f"dpo-rej-{target:g}", ref, tr_ref.num_frames)
+                if mid_w is not None:
+                    pairs.append({"song_id": sid, "sr": target, "chosen": f"maps/{mid}.npz", "rejected": f"maps/{mid_w}.npz",
+                                  "kind": "best>worst", "rejected_own": True,
+                                  "rewards": [round(float(r["reward"]), 3), round(float(worst[0]["reward"]), 3)]})
     data["maps"] = keep + made
+    data["dpo_pairs"] = pairs
     _write(index_path, data)
+    if pairs:
+        print(f"DPO pairs: {len(pairs)} ({sum(p['kind'] == 'human>network' for p in pairs)} human > network, "
+              f"{sum(p['kind'] == 'best>worst' for p in pairs)} best > worst)")
     bins = np.bincount([int(min(d["sr"], 9.99)) for d in made], minlength=10) if made else np.zeros(10, int)
     print(f"\nself-generated maps: {len(made)} from {len(songs)} songs in {time.time() - t0:.0f}s "
           f"(backup: {index_path.with_suffix('.json.bak')})")

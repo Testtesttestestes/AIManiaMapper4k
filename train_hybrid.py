@@ -273,6 +273,11 @@ def main() -> None:
                          "last 6 chords (needs --motifs); 0 = off")
     ap.add_argument("--motifs", default=None, help="motif library (mine_patterns.py; default checkpoints/hybrid/motifs.npz, "
                                                    "else test_NN/motifs.npz)")
+    ap.add_argument("--dpo_weight", type=float, default=0.1,
+                    help="preference optimization (DPO) on the pairs of make_self_maps.py (human map > the network's map, "
+                         "best > worst candidate by the objective reward); used only when the dataset has pairs; 0 = off")
+    ap.add_argument("--dpo_beta", type=float, default=0.1, help="DPO: strength of the pull to the frozen reference network")
+    ap.add_argument("--dpo_every", type=int, default=4, help="DPO: one pair batch every N training steps")
     ap.add_argument("--plan_prob", type=float, default=0.5,
                     help="think first, then map: share of crops that get the per-bar technique plan (family + copy kind, "
                          "from the motif analysis) as input; the plan head always learns to propose it (needs --pattern_weight "
@@ -505,6 +510,18 @@ def main() -> None:
         val_ds = HybridCropDataset(index, val_idx, crop_frames, args.val_crops, train=False, seed=args.seed,
                                    pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_hybrid)
+    # preference pairs (make_self_maps.py): DPO against a frozen copy of the network at the start of this run
+    dpo_iter = ref_model = None
+    dpo_pairs = [p for p in index.data.get("dpo_pairs", []) if p.get("song_id") in {index.maps[i]["song_id"] for i in train_idx}]
+    if args.dpo_weight > 0 and dpo_pairs and not args.eval_only:
+        from osu_mapper.hybrid.dpo import DPOPairDataset
+        dpo_ds = DPOPairDataset(index, dpo_pairs, crop_frames, 10 ** 9, seed=args.seed + 31 * rank)
+        dpo_iter = iter(DataLoader(dpo_ds, batch_size=max(2, args.batch_size // 2), shuffle=False, num_workers=0,
+                                   collate_fn=collate_hybrid))
+        ref_model = copy.deepcopy(model).eval()
+        for p_ in ref_model.parameters():
+            p_.requires_grad_(False)
+        print(f"[dpo] {len(dpo_pairs)} preference pairs, beta {args.dpo_beta:g}, one batch every {args.dpo_every} steps")
     rng = random.Random(args.seed)
     val_full = sorted(rng.sample(val_idx, min(args.val_maps, len(val_idx)))) if val_idx else []
 
@@ -603,6 +620,7 @@ def main() -> None:
             t0 = time.time()
             run: Dict[str, float] = {}
             n_run = 0
+            run_n: Dict[str, int] = {}
             for batch in train_loader:
                 batch = to_device(batch, dev)
                 lr = lr_at(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
@@ -612,6 +630,21 @@ def main() -> None:
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                     out = forward_batch(train_model, batch)
                 loss, logs = compute_losses(out, batch, weights, cfg.frame_ms, sigma_ms=sigma, event_weight=args.event_weight)
+                if dpo_iter is not None and step % max(1, args.dpo_every) == 0:
+                    from osu_mapper.hybrid.dpo import dpo_loss, map_logprob
+                    db = to_device(next(dpo_iter), dev)
+                    nb = db["feats"].shape[0]
+                    zst = torch.zeros(nb, cfg.style_dim, device=dev)
+                    with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
+                        po = train_model(db["feats"], db["beat"], db["sr"], zst, zst, db["coarse"], db["coarse_mask"])
+                        with torch.no_grad():
+                            ro = ref_model(db["feats"], db["beat"], db["sr"], zst, zst, db["coarse"], db["coarse_mask"])
+                    tc = {k[2:]: v for k, v in db.items() if k.startswith("c_")}
+                    tr = {k[2:]: v for k, v in db.items() if k.startswith("r_")}
+                    ld, acc = dpo_loss(map_logprob(po, tc, db["valid"]), map_logprob(po, tr, db["valid"]),
+                                       map_logprob(ro, tc, db["valid"]), map_logprob(ro, tr, db["valid"]), args.dpo_beta)
+                    loss = loss + args.dpo_weight * ld
+                    logs["dpo"], logs["dpo_acc"] = float(ld.detach()), acc
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -623,9 +656,10 @@ def main() -> None:
                 step += 1
                 for k, v in logs.items():
                     run[k] = run.get(k, 0.0) + v
+                    run_n[k] = run_n.get(k, 0) + 1          # some terms (DPO) are not computed every step
                 n_run += 1
                 if step % args.log_every == 0:
-                    avg = {k: v / n_run for k, v in run.items()}
+                    avg = {k: v / max(1, run_n.get(k, n_run)) for k, v in run.items()}
                     print(f"  step {step:>7} | lr {lr:.2e} | sigma {sigma:.2f}ms | total {avg['total']:.4f} | time {avg['time']:.4f} lane {avg['lane']:.3f} chord {avg['chord']:.3f} "
                           f"stagger {avg['stagger']:.3f} ln {avg['ln_flag']:.3f}/{avg['ln_len']:.3f} style {avg['style']:.3f} "
                           f"density {avg['density']:.3f} pair {avg['pair']:.3f} ({avg['pairs']:.1f}/batch)"
@@ -634,8 +668,9 @@ def main() -> None:
                           + (f" error {avg['error']:.3f}" if "error" in avg else "")
                           + (f" patterns {avg['patterns']:.3f}" if "patterns" in avg else "")
                           + (f" prior {avg['prior']:.3f}" if "prior" in avg else "")
-                          + (f" plan {avg['plan']:.3f}" if "plan" in avg else ""), flush=True)
-                    run, n_run = {}, 0
+                          + (f" plan {avg['plan']:.3f}" if "plan" in avg else "")
+                          + (f" dpo {avg['dpo']:.3f} (acc {avg['dpo_acc']:.2f})" if "dpo" in avg else ""), flush=True)
+                    run, n_run, run_n = {}, 0, {}
 
             if not is_main:  # validation and checkpoints happen on rank 0; the others wait
                 dist.barrier()
