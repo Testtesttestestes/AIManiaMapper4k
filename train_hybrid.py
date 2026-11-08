@@ -513,7 +513,10 @@ def main() -> None:
     # preference pairs (make_self_maps.py): DPO against a frozen copy of the network at the start of this run
     dpo_iter = ref_model = None
     dpo_pairs = [p for p in index.data.get("dpo_pairs", []) if p.get("song_id") in {index.maps[i]["song_id"] for i in train_idx}]
-    if args.dpo_weight > 0 and dpo_pairs and not args.eval_only:
+    if args.dpo_weight > 0 and dpo_pairs and distributed:
+        # a second forward pass per step (the pair batch) does not fit DistributedDataParallel's one-pass gradient sync
+        print("[dpo] off with several GPUs: run the DPO stage on one GPU (python train_hybrid.py --resume ... --dpo_weight 0.1)")
+    elif args.dpo_weight > 0 and dpo_pairs and not args.eval_only:
         from osu_mapper.hybrid.dpo import DPOPairDataset
         dpo_ds = DPOPairDataset(index, dpo_pairs, crop_frames, 10 ** 9, seed=args.seed + 31 * rank)
         dpo_iter = iter(DataLoader(dpo_ds, batch_size=max(2, args.batch_size // 2), shuffle=False, num_workers=0,
