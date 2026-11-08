@@ -1152,3 +1152,50 @@ class TestAutoBatch(unittest.TestCase):
         self.assertEqual(bs, 22)
         self.assertLessEqual(base + per * bs, 0.9 * total - other)
         self.assertIsNone(autobatch.find_batch_size(step, model, torch.device("cpu"), log=lambda *_: None))
+
+
+class TestRateVersions2(unittest.TestCase):
+    """Rate versions found by content (rate_groups.py), whatever their names."""
+
+    def test_found_by_content_and_grouped_for_the_split(self):
+        import json
+        import tempfile
+
+        from osu_mapper.hybrid.dataset import piece_name
+        from osu_mapper.hybrid.rate_groups import find_rate_versions, regroup_index
+
+        rng = random.Random(9)
+        t, notes = 1000, []
+        for _ in range(120):
+            t += rng.choice([125, 250, 375])
+            c = rng.randrange(4)
+            notes.append(Note(t, c, t + 400 if rng.random() < 0.2 else t, False))
+        notes = [Note(n.start, n.col, n.end, n.end > n.start) for n in notes]
+        fast = [Note(int(round(n.start / 1.3)) + 37, n.col, int(round(n.end / 1.3)) + 37, n.ln) for n in notes]   # x1.3, other offset
+        rng2, t2, other = random.Random(10), 1000, []                                     # same lanes, another rhythm
+        for n in notes:
+            t2 += rng2.choice([125, 250, 375])
+            other.append(Note(t2, n.col, t2 + (n.end - n.start), n.ln))
+        pairs = find_rate_versions({"orig": notes, "fast": fast, "other": other})
+        rates = {tuple(sorted((a, b))): r for a, b, r in pairs}
+        self.assertAlmostEqual(rates[("fast", "orig")] if ("fast", "orig") in rates else 1 / rates[("orig", "fast")], 1.3, delta=0.01)
+        self.assertNotIn(("orig", "other"), rates)
+        self.assertNotIn(("fast", "other"), rates)
+        # names say nothing -> the split groups them anyway
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "maps").mkdir()
+            maps = []
+            for mid, sid, piece, ns in (("m1", "s1", "artist song", notes), ("m2", "s2", "someone else upload", fast),
+                                        ("m3", "s3", "unrelated", other)):
+                solve_map(ns, num_frames=12000).save_npz(root / "maps" / f"{mid}.npz")
+                maps.append({"map_id": mid, "song_id": sid, "piece": piece, "track": f"maps/{mid}.npz", "roundtrip_exact": True})
+            data = {"maps": maps}
+            changed = regroup_index(data, root, log=lambda *_: None)
+            pieces = {m["map_id"]: m["piece"] for m in data["maps"]}
+            self.assertEqual(changed, 1)
+            self.assertEqual(pieces["m1"], pieces["m2"])
+            self.assertNotEqual(pieces["m1"], pieces["m3"])
+        # the name rules: tags removed, titles with x in a word kept
+        self.assertEqual(piece_name("A - B (130%)"), piece_name("A - B [Sped Up Ver.]"))
+        self.assertEqual(piece_name("Camellia - Mx3"), "camellia mx3")

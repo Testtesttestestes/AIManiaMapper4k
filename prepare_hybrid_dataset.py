@@ -209,6 +209,15 @@ def main() -> None:
             write_index()
 
     write_index()
+    # rate versions (sped up / slowed down copies with their own audio) found by content: one piece for the split
+    from osu_mapper.hybrid.rate_groups import regroup_index
+    data_now = json.loads(index_path.read_text(encoding="utf-8"))
+    moved = regroup_index(data_now, out)
+    if moved:
+        tmp = index_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data_now, indent=1, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(index_path)
+        print(f"rate versions: {moved} maps grouped with their original song for the train/val split")
     (out / "data_check_report.json").write_text(json.dumps(rejected, indent=1, ensure_ascii=False), encoding="utf-8")
     print("\n" + "=" * 70)
     print(f"songs {totals['songs']} | maps {totals['maps']} | audio {totals['audio_hours']:.2f} h | notes {totals['notes']:,}")

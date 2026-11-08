@@ -109,7 +109,15 @@ class HybridIndex:
         return ParamTrack.load_npz(self.root / self.maps[map_idx]["track"])
 
 
-_RATE_RE = re.compile(r"[\(\[]?\s*(?:x\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*x|rate\s*\d+(?:[.,]\d+)?|nightcore|\bnc\b|daycore)\s*[\)\]]?", re.I)
+# rate / speed tags in titles (the content check in rate_groups.py finds the versions these miss)
+_RATE_RE = re.compile(
+    r"[\(\[\{]?\s*(?:"
+    r"(?<![a-z0-9])[x\u00d7]\s*\d+(?:[.,]\d+)?|(?<![a-z])\d+(?:[.,]\d+)?\s*[x\u00d7](?![a-z0-9])"  # x1.1  1,25x  ×1.2 (not Mx3)
+    r"|rate\s*[:=]?\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*rate"                     # rate 1.2  1.2 rate
+    r"|\d{2,3}(?:[.,]\d+)?\s*%"                                                   # 130%
+    r"|sped[\s-]*up|speed[\s-]*up|speedup|slowed(?:[\s-]*down)?|slow[\s-]*down"     # sped up, slowed
+    r"|double[\s-]*time|half[\s-]*time|\bdt\b|\bht\b|\bnc\b|nightcore|daycore"
+    r")(?:\s*ver(?:sion|\.)?)?\s*[\)\]\}]?", re.I)
 
 
 def piece_name(text: str) -> str:
