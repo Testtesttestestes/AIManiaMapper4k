@@ -64,6 +64,9 @@ def init_distributed(requested_device: str) -> Tuple[bool, int, int, torch.devic
     # long timeout: before the first collective every rank builds the dataset caches (motif targets, star ratings at
     # every rate), which can take far longer than the default 10 minutes on a big dataset
     import datetime
+    # the heartbeat monitor only dumps debug info on hangs; when torchrun exits first (Ctrl+C) it floods the console
+    # with "TCPStore ... Broken pipe" every second. Hangs are still caught by the collective timeout below.
+    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
     dist.init_process_group(backend=backend, timeout=datetime.timedelta(hours=3))
     return True, rank, world, dev
 
@@ -650,6 +653,21 @@ def main() -> None:
 
     epoch = start_epoch
     best_epoch = start_epoch
+    # Ctrl+C (SIGINT, also forwarded by torchrun) and SIGTERM: the first one interrupts training, later ones are ignored
+    # so that the checkpoint is saved in one piece
+    got_signal = {"n": 0}
+
+    def _on_signal(signum, frame):
+        got_signal["n"] += 1
+        if got_signal["n"] == 1:
+            raise KeyboardInterrupt
+    import signal as _signal
+    for _sig in (_signal.SIGINT, getattr(_signal, "SIGTERM", None)):
+        if _sig is not None:
+            try:
+                _signal.signal(_sig, _on_signal)
+            except (ValueError, OSError):
+                pass
     stop_file = ckpt_dir / "STOP"
     if is_main:
         stop_file.unlink(missing_ok=True)
@@ -747,10 +765,33 @@ def main() -> None:
                 stop = bool(flag.item())
             if stop:
                 break
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError):
+            # with several GPUs another rank may leave on Ctrl+C first: this rank's collective then fails with
+            # "connection closed" before its own signal arrives. Wait a moment for it; any other error is real.
+            if not distributed:
+                raise
+            try:
+                for _ in range(50):
+                    if got_signal["n"]:
+                        break
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
+            if not got_signal["n"]:
+                raise
         if is_main:
-            print(f"\n[paused] saving {last_path} (resume with: python train_hybrid.py --data {args.data} --resume)")
+            print(f"\n[paused] saving {last_path} (resume with: python train_hybrid.py --data {args.data} --resume); "
+                  f"the best epoch so far is in {best_path}", flush=True)
             save_checkpoint(last_path, **payload(max(start_epoch, epoch - 1), {}))
+            print("[paused] saved", flush=True)
+        if distributed:
+            # torchrun stops on Ctrl+C too, and with it the store the ranks talk through: a normal NCCL teardown would
+            # wait for the other ranks and its monitor threads would print connection errors and keep the process
+            # alive. Everything worth keeping is saved, so leave at once.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         return
     print(f"[done] best score {best_score:.4f}; checkpoints in {ckpt_dir}")
     if distributed:

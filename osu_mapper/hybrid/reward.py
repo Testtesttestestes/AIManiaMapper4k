@@ -4,7 +4,7 @@ Objective reward of a generated map (no human rating needed): the "RL from feedb
     r = w_sr * stars + w_play * playability + w_pattern * patterns + w_silence * silence
 
 * stars      -|SR - target| (rosu-pp): the network must give what was asked;
-* playability  fast jacks against what real maps of that star rating have, the longest one-hand run, hand balance
+* playability  fast jacks, the share of the map in one-hand runs longer than 8 notes (10 % costs 1), hand balance
                (ergonomics.ergonomics_report);
 * patterns   how real maps of that star rating continue the chords (motif library, LanePredictor): mean
              log-probability of every chord after the six before it, against human maps of that rating (less typical
@@ -73,8 +73,11 @@ def map_reward(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], t
     sr = float(star_rating_of(notes, timing_points, od)) if sr is None else float(sr)
     er = ergonomics_report(notes)
     jack = float(er.get("fast_jack_pct", 0.0)) / 100.0
+    # long one-hand runs as the SHARE of the map inside them (human maps: ~0 %), not the single longest run: one bad
+    # spot in a 4000-note map used to cost up to -25 and decided the choice between candidates on its own
+    long_runs = float(er.get("long_run_pct", 0.0)) / 100.0
     r_play = -(abs(jack - jack_target) * 4.0 if jack_target is not None else jack) \
-             - 0.25 * max(0.0, float(er.get("max_one_hand_run", 0.0)) - 6.0) - float(er.get("hand_imbalance", 0.0))
+             - 10.0 * long_runs - float(er.get("hand_imbalance", 0.0))
     r_pat = 0.0
     if lane_predictor is not None:
         lp = pattern_logp(notes, lane_predictor)
@@ -86,3 +89,77 @@ def map_reward(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], t
     parts["reward"] = (w.stars * parts["stars"] + w.play * parts["play"] + w.pattern * parts["pattern"]
                        + w.silence * parts["silence"])
     return parts
+
+
+def note_rewards(notes: Sequence[Note], target_sr: float, lane_predictor=None, power: Optional[np.ndarray] = None,
+                 weights: Optional[RewardWeights] = None, frame_ms: int = 10, silence_std: float = 6.0,
+                 pattern_window: int = 8) -> Dict[str, np.ndarray]:
+    """The reward of ``map_reward`` spread over the map: a penalty (<= 0) for every event (chord), so that a bad spot
+    can be found and replaced instead of costing the whole map.
+
+    Per event: a fast jack (a lane of the previous event again within 150 ms), being inside a one-hand run longer than
+    8 events (10 each, so their mean is the map's share term), the hand imbalance of its 2 s window, a note in silence
+    (10 per note, the map's term is 10 x the share) and how much less typical its chords are than human maps of the
+    rating (the motif library's log-probability, averaged over ``pattern_window`` events - a single unusual chord is
+    variety, a run of them is a broken pattern). The stars are a property of the whole map and are not spread.
+
+    Returns ``times`` (event start, ms), ``penalty`` (weighted sum per event), the parts (``jack``, ``long_run``,
+    ``imbalance``, ``pattern``, ``silence``, unweighted) and ``event_of_note`` (index into the events for every note
+    of ``sorted(notes)``)."""
+    from .ergonomics import LEFT, RIGHT, _group_events
+
+    w = weights or RewardWeights()
+    srt = sorted(notes)
+    events = _group_events(srt, 8)
+    n = len(events)
+    out: Dict[str, np.ndarray] = {k: np.zeros(n) for k in ("jack", "long_run", "imbalance", "pattern", "silence")}
+    out["times"] = np.array([ev[0].start for ev in events], dtype=np.float64)
+    if n == 0:
+        out["penalty"] = np.zeros(0)
+        out["event_of_note"] = np.zeros(0, dtype=np.int64)
+        return out
+    cols = [{m.col for m in ev} for ev in events]
+    hands = ["L" if c <= set(LEFT) else "R" if c <= set(RIGHT) else "B" for c in cols]
+    t = out["times"]
+    run_start = 0
+    run = 0
+    for i in range(n):
+        if i and cols[i] & cols[i - 1] and t[i] - t[i - 1] < 150.0:
+            out["jack"][i] = 1.0
+        if i and hands[i] != "B" and hands[i] == hands[i - 1] and t[i] - t[i - 1] < 200.0:
+            run += 1
+        else:
+            run, run_start = (1 if hands[i] != "B" else 0), i
+        if run > 8:
+            out["long_run"][run_start:i + 1] = 10.0
+    # hand balance of the 2 s window of each event
+    left = np.array([sum(c in LEFT for c in cs) for cs in cols], dtype=np.float64)
+    size = np.array([len(cs) for cs in cols], dtype=np.float64)
+    win = ((t - t[0]) // 2000).astype(np.int64)
+    for b in np.unique(win):
+        sel = win == b
+        if size[sel].sum() >= 4:
+            out["imbalance"][sel] = abs(left[sel].sum() / size[sel].sum() - 0.5) * 2.0
+    if lane_predictor is not None and n >= 8:
+        masks = [sum(1 << c for c in cs) for cs in cols]
+        lp = np.zeros(n)
+        for i in range(1, n):
+            lp[i] = float(lane_predictor.logprob(masks[max(0, i - lane_predictor.max_order):i])[masks[i]])
+        lp[0] = lp[1]
+        k = max(1, int(pattern_window))
+        smooth = np.convolve(np.pad(lp, (k // 2, k - 1 - k // 2), mode="edge"), np.ones(k) / k, mode="valid")
+        out["pattern"] = np.minimum(0.0, smooth - human_pattern_logp(target_sr))
+    if power is not None and power.size:
+        top = float(np.percentile(power, 95))
+        silent = power < top - float(silence_std)
+        for i, ev in enumerate(events):
+            f = np.clip(np.array([m.start for m in ev]) // frame_ms, 0, power.size - 1)
+            out["silence"][i] = 10.0 * float(silent[f].sum())
+    out["penalty"] = -(w.play * (out["jack"] + out["long_run"] + out["imbalance"]) + w.pattern * (-out["pattern"])
+                       + w.silence * out["silence"])
+    note_ev = {}
+    for i, ev in enumerate(events):
+        for m in ev:
+            note_ev[id(m)] = i
+    out["event_of_note"] = np.array([note_ev[id(m)] for m in srt], dtype=np.int64)
+    return out

@@ -3,7 +3,9 @@ Direct preference optimization (DPO, Rafailov et al. 2023) for the hybrid networ
 
 Pairs (chosen, rejected) of maps of the same song and star rating come from make_self_maps.py: the best and the worst
 of the network's candidates by the objective reward, and a human map against the network's own map at the human map's
-star rating ("the human did better", SPIN-style - no human rating needed).
+star rating ("the human did better", SPIN-style - no human rating needed). Most windows (``segment_prob``) are taken
+around the bars where the chosen map is clearly better by the per-event reward (pair["segments"]); over the rest of
+the song the two maps are often equally good, and training a preference there teaches noise.
 
 The network factorizes over frames, so the log-probability of a whole map in a window is a sum:
     log p(map) = sum_frames log p(time class) + sum_events [log p(lane code) + log p(chord size) + sum_members log p(LN flag)]
@@ -58,7 +60,8 @@ def dpo_loss(pol_c: torch.Tensor, pol_r: torch.Tensor, ref_c: torch.Tensor, ref_
 class DPOPairDataset(Dataset):
     """Windows of preference pairs: the same crop of the song's audio, the chosen and the rejected map's targets."""
 
-    def __init__(self, index, pairs: Sequence[Dict[str, Any]], crop_frames: int, samples_per_epoch: int, seed: int = 0):
+    def __init__(self, index, pairs: Sequence[Dict[str, Any]], crop_frames: int, samples_per_epoch: int, seed: int = 0,
+                 segment_prob: float = 0.75):
         from .dataset import SparseTrack
 
         self.index = index
@@ -66,6 +69,7 @@ class DPOPairDataset(Dataset):
         self.pairs = list(pairs)
         self.samples = int(samples_per_epoch)
         self.seed = seed
+        self.segment_prob = float(segment_prob)
         self.tracks = [(SparseTrack(ParamTrack.load_npz(index.root / p["chosen"])),
                         SparseTrack(ParamTrack.load_npz(index.root / p["rejected"]))) for p in self.pairs]
 
@@ -80,9 +84,17 @@ class DPOPairDataset(Dataset):
         k = rng.randrange(len(self.pairs))
         p = self.pairs[k]
         ch, rj = self.tracks[k]
-        ev = np.union1d(ch.event_frames(), rj.event_frames())
-        lo, hi = (int(ev[0]), int(ev[-1])) if ev.size else (0, ch.num_frames)
-        start = rng.randint(lo - self.crop // 2, max(lo - self.crop // 2 + 1, hi - self.crop // 2))
+        seg = p.get("segments") or []
+        if seg and rng.random() < self.segment_prob:
+            # a window around a bar where the chosen map is clearly better by the per-event reward (make_self_maps.py):
+            # elsewhere the two maps are often equally good and the preference is noise
+            a, b = seg[rng.randrange(len(seg))]
+            mid = rng.randint(int(a), max(int(a), int(b) - 1))
+            start = mid - rng.randint(self.crop // 4, 3 * self.crop // 4)
+        else:
+            ev = np.union1d(ch.event_frames(), rj.event_frames())
+            lo, hi = (int(ev[0]), int(ev[-1])) if ev.size else (0, ch.num_frames)
+            start = rng.randint(lo - self.crop // 2, max(lo - self.crop // 2 + 1, hi - self.crop // 2))
         feats = _crop_rows(self.index.features(p["song_id"]), start, self.crop)
         beat = beat_features(ch.timing_points, start, self.crop, ch.frame_ms)
         frames = np.arange(start, start + self.crop)

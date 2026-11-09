@@ -14,7 +14,10 @@ notes in silence) picks the best, and the chosen map is added to the dataset wit
 not the requested one - the network gets hard examples it can actually learn from, labelled honestly.
 
 The new maps are marked "derived": true and "self": true: never used for validation, drawn only with the derived
-share of training crops (train_hybrid.py --derived_weight), no style information. They belong to the song's piece, so
+share of training crops (train_hybrid.py --derived_weight), no style information. Every event of them has a reward
+(maps/<id>_q.npz, reward.note_rewards): around its bad spots (jacks, long one-hand runs, notes in silence, broken
+patterns) the training loss weighs less, so the network does not learn its own mistakes. Several candidates are made
+per request and the best bars of them are stitched into one map (osu_mapper/hybrid/stitch.py) when that is better. They belong to the song's piece, so
 songs of the validation split stay out of training. Repeat after each training round (the next network makes
 better candidates); make_derived_maps.py keeps them.
 """
@@ -44,6 +47,8 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--motifs", default=None, help="motif library for the pattern reward (default: test_NN/motifs.npz)")
     ap.add_argument("--remove", action="store_true", help="only delete the self-generated maps")
+    ap.add_argument("--no_stitch", action="store_true",
+                    help="do not stitch the best bars of the candidates (osu_mapper/hybrid/stitch.py) into one map")
     ap.add_argument("--no_pairs", action="store_true",
                     help="do not save DPO preference pairs (best vs worst candidate, human map vs the network's map at the "
                          "human map's rating; train_hybrid.py --dpo_weight uses them)")
@@ -58,9 +63,10 @@ def main() -> None:
     from osu_mapper.hybrid.network_fit import fit_network_map
     from osu_mapper.hybrid.params import ParamTrack
     from osu_mapper.hybrid.renderer import DecodeKnobs, render_track
-    from osu_mapper.hybrid.reward import map_reward
+    from osu_mapper.hybrid.reward import map_reward, note_rewards
     from osu_mapper.hybrid.solver import STYLE_DIM, SolveStats, compute_style, solve_map
     from osu_mapper.hybrid.sources import stable_id
+    from osu_mapper.hybrid.stitch import preference_segments, stitch_candidates
 
     root = Path(args.data)
     index_path = root / "index.json"
@@ -69,6 +75,8 @@ def main() -> None:
     old = [m for m in data["maps"] if m.get("self")]
     for m in old:
         (root / m["track"]).unlink(missing_ok=True)
+        if m.get("quality"):
+            (root / m["quality"]).unlink(missing_ok=True)
     if old:
         print(f"removed {len(old)} previous self-generated maps")
     for p_ in data.get("dpo_pairs", []):
@@ -100,6 +108,7 @@ def main() -> None:
     if args.max_songs:
         songs = songs[:args.max_songs]
     made: List[Dict[str, Any]] = []
+    n_stitch_tried, n_stitch_used = [0], [0]
     pairs: List[Dict[str, Any]] = []
     t0 = time.time()
 
@@ -112,8 +121,9 @@ def main() -> None:
         mid_ = stable_id(ref_map["map_id"], tag)
         tr_.save_npz(root / "maps" / f"{mid_}.npz")
         return mid_, tr_, st_
-    # candidate settings: classifier-free guidance (hears more notes) x lane sampling temperature (other patterns)
-    variants = [(1.0, 0.0), (1.5, 0.0), (2.0, 0.0), (1.5, 0.6), (1.0, 0.6), (2.5, 0.0), (2.0, 0.6), (3.0, 0.3)]
+    # candidate settings: guidance of WHERE the notes go (hears more notes; the lanes keep the patterns the network
+    # learned from humans, see HybridPredictor.predict) x lane sampling temperature (other patterns)
+    variants = [(1.0, 0.0), (1.5, 0.0), (2.0, 0.0), (1.5, 0.5), (1.0, 0.5), (2.5, 0.0), (2.0, 0.5), (3.0, 0.3)]
     for n_song, sid in enumerate(songs, 1):
         maps = by_song[sid]
         ref = max(maps, key=lambda m: float(m.get("sr", 0.0)))
@@ -137,28 +147,51 @@ def main() -> None:
                     continue
                 mid_, _, _ = save_track(fit.notes, f"dpo-rej-human-{hsr:g}", hm, tr_ref.num_frames)
                 if mid_ is not None:
+                    hn = render_track(ParamTrack.load_npz(root / hm["track"]))
+                    seg = preference_segments(hn, fit.notes, tps, hsr, LanePredictor.cached(lib, hsr) if lib is not None
+                                              else None, power)
                     pairs.append({"song_id": sid, "sr": hsr, "chosen": hm["track"], "rejected": f"maps/{mid_}.npz",
-                                  "kind": "human>network", "rejected_own": True})
+                                  "kind": "human>network", "rejected_own": True, "segments": seg})
         for target in targets:
             if any(abs(h - target) < args.min_gap for h in human):
                 continue
             pred = LanePredictor.cached(lib, target) if lib is not None else None
             best = None
             worst = None
+            all_notes = []
             for g, temp in variants[:max(1, args.candidates)]:
                 out = predictor.predict(inputs, target, sr_guidance=g)
                 knobs = DecodeKnobs(onset_threshold=predictor.threshold_for(target), ln_threshold=predictor.ln_threshold,
                                     lane_temperature=temp)
                 fit = fit_network_map(out, knobs, tps, target, float(ref.get("od", 8.0)))
                 r = map_reward(fit.notes, tps, target, float(ref.get("od", 8.0)), pred, power, sr=float(fit.star_rating))
+                all_notes.append(fit.notes)
                 if best is None or r["reward"] > best[0]["reward"]:
                     best = (r, fit.notes, g, temp)
                 if worst is None or r["reward"] < worst[0]["reward"]:
                     worst = (r, fit.notes, g, temp)
             r, notes, g, temp = best
+            stitch_note = ""
+            if not args.no_stitch and len(all_notes) >= 2:
+                # the best bars of all candidates (per-event reward); kept only when better as a whole
+                st_notes, info = stitch_candidates(all_notes, tps, target, pred, power)
+                if len(st_notes) >= 20:
+                    rs = map_reward(st_notes, tps, target, float(ref.get("od", 8.0)), pred, power)
+                    better = rs["reward"] > r["reward"] and abs(rs["sr"] - target) <= args.max_error
+                    stitch_note = (f" | stitched {info['switches']} seams: {rs['sr']:.2f}* reward {rs['reward']:+.2f}"
+                                   + (" - used" if better else ""))
+                    n_stitch_tried[0] += 1
+                    if better:
+                        n_stitch_used[0] += 1
+                        r, notes, g, temp = rs, st_notes, "stitched", 0.0
             ok = abs(r["sr"] - target) <= args.max_error and r["reward"] >= args.min_reward
+            why = [] if ok else (["stars"] if abs(r["sr"] - target) > args.max_error else []) + \
+                (["reward"] if r["reward"] < args.min_reward else [])
             print(f"[{n_song}/{len(songs)}] {ref.get('osu_file', sid)[:44]:<44} ask {target:.1f} -> {r['sr']:.2f}* "
-                  f"reward {r['reward']:+.2f} (guidance {g:g}, lanes T {temp:g}){'' if ok else '  - not kept'}", flush=True)
+                  f"reward {r['reward']:+.2f} = stars {3 * r['stars']:+.2f} play {r['play']:+.2f} "
+                  f"patterns {r['pattern']:+.2f} silence {2 * r['silence']:+.2f} "
+                  + ("(stitched)" if g == "stitched" else f"(guidance {g:g}, lanes T {temp:g})")
+                  + ("" if ok else f"  - not kept ({', '.join(why)})") + stitch_note, flush=True)
             if not ok:
                 continue
             m = ManiaMap(notes=list(notes), timing_points=tps, overall_difficulty=float(ref.get("od", 8.0)))
@@ -170,6 +203,12 @@ def main() -> None:
             mid = stable_id(ref["map_id"], f"self-{target:g}")
             tr.save_npz(root / "maps" / f"{mid}.npz")
             style, _ = compute_style(tr, m.notes, r["sr"], m.overall_difficulty)
+            # per-event reward: training weighs the bad spots of this map less (dataset SparseTrack.set_quality)
+            nr = note_rewards(m.notes, float(r["sr"]), LanePredictor.cached(lib, float(r["sr"])) if lib is not None else None,
+                              power)
+            np.savez_compressed(root / "maps" / f"{mid}_q.npz", times=nr["times"].astype(np.float32),
+                                penalty=nr["penalty"].astype(np.float32))
+            bad = float((nr["penalty"] < -4.0).mean()) if nr["penalty"].size else 0.0
             made.append({
                 "map_id": mid, "song_id": sid, "track": f"maps/{mid}.npz", "source": ref["source"],
                 "osu_file": f"{ref.get('osu_file', '')} [self {target:g}]", "version": f"self {target:g}", "creator": "network",
@@ -177,7 +216,8 @@ def main() -> None:
                 "style": [round(float(x), 5) for x in style], "style_mask": [0.0] * STYLE_DIM,
                 "notes": len(m.notes), "events": stats.events, "overflow": stats.overflow,
                 "overflow_reasons": stats.overflow_reasons, "overlaps_in_ln": stats.overlaps_in_ln, "roundtrip_exact": True,
-                "derived": True, "self": True, "parent": ref["map_id"], "requested_sr": target,
+                "derived": True, "self": True, "parent": ref["map_id"], "requested_sr": target, "stitched": g == "stitched",
+                "quality": f"maps/{mid}_q.npz", "bad_spots": round(bad, 4),
                 "reward": {k: round(float(v), 4) for k, v in r.items()}, "piece": split_key(ref),
             })
             human.append(float(r["sr"]))
@@ -186,16 +226,20 @@ def main() -> None:
                 if mid_w is not None:
                     pairs.append({"song_id": sid, "sr": target, "chosen": f"maps/{mid}.npz", "rejected": f"maps/{mid_w}.npz",
                                   "kind": "best>worst", "rejected_own": True,
+                                  "segments": preference_segments(m.notes, worst[1], tps, target, pred, power),
                                   "rewards": [round(float(r["reward"]), 3), round(float(worst[0]["reward"]), 3)]})
     data["maps"] = keep + made
     data["dpo_pairs"] = pairs
     _write(index_path, data)
     if pairs:
         print(f"DPO pairs: {len(pairs)} ({sum(p['kind'] == 'human>network' for p in pairs)} human > network, "
-              f"{sum(p['kind'] == 'best>worst' for p in pairs)} best > worst)")
+              f"{sum(p['kind'] == 'best>worst' for p in pairs)} best > worst; "
+              f"{sum(len(p.get('segments', [])) for p in pairs)} bars where the chosen map is clearly better)")
     bins = np.bincount([int(min(d["sr"], 9.99)) for d in made], minlength=10) if made else np.zeros(10, int)
     print(f"\nself-generated maps: {len(made)} from {len(songs)} songs in {time.time() - t0:.0f}s "
           f"(backup: {index_path.with_suffix('.json.bak')})")
+    if n_stitch_tried[0]:
+        print(f"stitched maps: better than every single candidate in {n_stitch_used[0]} of {n_stitch_tried[0]} requests")
     print("per star: " + " ".join(f"{b}*:{int(c)}" for b, c in enumerate(bins) if c))
 
 

@@ -1199,3 +1199,86 @@ class TestRateVersions2(unittest.TestCase):
         # the name rules: tags removed, titles with x in a word kept
         self.assertEqual(piece_name("A - B (130%)"), piece_name("A - B [Sped Up Ver.]"))
         self.assertEqual(piece_name("Camellia - Mx3"), "camellia mx3")
+
+
+class TestNoteRewardsAndStitch(unittest.TestCase):
+    def _tps(self):
+        from osu_mapper.hybrid.beatmap import RawTimingPoint
+        return [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]   # 120 BPM: a bar is 2 s
+
+    def test_penalty_finds_the_bad_spot(self):
+        from osu_mapper.hybrid.beatmap import Note
+        from osu_mapper.hybrid.reward import note_rewards
+        good = [Note(i * 125, [0, 2, 1, 3][i % 4], i * 125, False) for i in range(64)]           # alternating hands
+        bad = [Note(8000 + i * 125, i % 2, 8000 + i * 125, False) for i in range(32)]            # left hand only
+        nr = note_rewards(good + bad, 5.0)
+        self.assertEqual(len(nr["penalty"]), 96)
+        self.assertEqual(len(nr["event_of_note"]), 96)
+        self.assertTrue((nr["penalty"] <= 0).all())
+        self.assertLess(nr["penalty"][64:].mean(), nr["penalty"][:64].mean() - 5)               # long one-hand run
+        self.assertEqual(float(nr["long_run"][:60].sum()), 0.0)
+
+    def test_stitch_takes_the_good_bars(self):
+        from osu_mapper.hybrid.beatmap import Note
+        from osu_mapper.hybrid.stitch import stitch_candidates
+        tps = self._tps()
+
+        def bar(t0, good):
+            lanes = [0, 2, 1, 3] if good else [0, 1]
+            return [Note(t0 + i * 125, lanes[i % len(lanes)], t0 + i * 125, False) for i in range(16)]
+        # candidate A is good in bars 0-3 and bad in 4-7, candidate B the other way round
+        a = sum((bar(b * 2000, b < 4) for b in range(8)), [])
+        b_ = sum((bar(b * 2000, b >= 4) for b in range(8)), [])
+        notes, info = stitch_candidates([a, b_], tps, 5.0)
+        self.assertEqual(info["switches"], 1)
+        self.assertEqual(len(notes), 128)
+        hands_left = sum(n.col < 2 for n in notes)
+        self.assertEqual(hands_left, 64)                                  # all bars alternate hands
+
+    def test_stitch_respects_held_lanes(self):
+        from osu_mapper.hybrid.beatmap import Note
+        from osu_mapper.hybrid.stitch import stitch_candidates
+        tps = self._tps()
+        a = [Note(i * 250, i % 4, i * 250, False) for i in range(8)] + [Note(1900, 0, 2600, True)]
+        a += [Note(2000 + i * 250, [1, 2, 3][i % 3], 2000 + i * 250, False) for i in range(16)]
+        b_ = [Note(2000 + i * 250, i % 4, 2000 + i * 250, False) for i in range(8)]
+        notes, _ = stitch_candidates([a, b_, a], tps, 4.0, switch_margin=0.0)
+        for n in notes:
+            if n.col == 0 and 1900 < n.start < 2630:
+                self.fail("a note starts on a lane still held by a long note")
+
+    def test_quality_weights_frames(self):
+        from osu_mapper.hybrid.dataset import SparseTrack
+        from osu_mapper.hybrid.solver import solve_map
+        notes = [Note(1000 + i * 100, i % 4, 1000 + i * 100, False) for i in range(40)]
+        m = ManiaMap(notes=notes, timing_points=[RawTimingPoint(0.0, 400.0, 4, 2, 1, 60, True, 0)])
+        tr = SparseTrack(solve_map(m, num_frames=700))
+        self.assertTrue((tr.crop_arrays(0, 700)["frame_weight"] == 1.0).all())
+        times = np.array([n.start for n in notes], dtype=np.float64)
+        penalty = np.full(40, -0.3)
+        penalty[20] = -10.0                                       # the note at 3000 ms is a bad spot
+        tr.set_quality(times, penalty)
+        fw = tr.crop_arrays(0, 700)["frame_weight"]
+        self.assertAlmostEqual(float(fw[300]), 0.05, places=3)
+        self.assertEqual(float(fw[200]), 1.0)                       # far from it: full weight
+        self.assertLess(float(fw[312]), 1.0)                        # within 150 ms
+        self.assertEqual(float(fw[320]), 1.0)
+        fw2 = tr.crop_arrays(0, 500, rate=1.2)["frame_weight"]      # rate augmentation keeps the weights
+        self.assertAlmostEqual(float(fw2[250]), 0.05, places=3)
+
+    def test_preference_segments(self):
+        from osu_mapper.hybrid.stitch import preference_segments
+        tps = self._tps()
+
+        def bar(t0, good):
+            lanes = [0, 2, 1, 3] if good else [0, 1]
+            return [Note(t0 + i * 125, lanes[i % len(lanes)], t0 + i * 125, False) for i in range(16)]
+        chosen = sum((bar(b * 2000, True) for b in range(6)), [])
+        rejected = sum((bar(b * 2000, b != 3) for b in range(6)), [])          # broken only in bar 3 (6-8 s)
+        seg = preference_segments(chosen, rejected, tps, 5.0)
+        # bar 3, and possibly bar 4 (the one-hand run of bar 3 continues into its first note)
+        self.assertIn(len(seg), (1, 2))
+        a, b = seg[0]
+        self.assertLessEqual(a, 600)
+        self.assertGreaterEqual(b, 790)
+        self.assertLess(b - a, 260)

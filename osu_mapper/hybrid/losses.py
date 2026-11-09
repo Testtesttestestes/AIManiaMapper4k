@@ -20,7 +20,7 @@ import math
 
 import numpy as np
 from dataclasses import asdict, dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -97,9 +97,12 @@ def compute_losses(
     else:
         sw = torch.ones(B, device=tc.device)
 
-    def wmean(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-        """Mean of per-element losses ``x`` whose crop indices are ``rows``, weighted by the crop weights."""
-        wr = sw[rows]
+    # per-frame weights: bad spots of self-generated maps (dataset SparseTrack.set_quality) count less
+    fw = batch["frame_weight"].float() if "frame_weight" in batch else None
+
+    def wmean(x: torch.Tensor, rows: torch.Tensor, frame_w: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Mean of per-element losses ``x`` whose crop indices are ``rows``, weighted by the crop (and frame) weights."""
+        wr = sw[rows] if frame_w is None else sw[rows] * frame_w
         return (x * wr).sum() / wr.sum().clamp(min=1e-8)
 
     bidx = torch.arange(B, device=tc.device).view(B, 1).expand(B, T)
@@ -117,6 +120,8 @@ def compute_losses(
     logp = F.log_softmax(out["time_logits"].float(), dim=-1)
     ce = -(target * logp).sum(dim=-1)
     w = (1.0 + (event_weight - 1.0) * (1.0 - target[..., 0])) * valid_pred * sw.view(B, 1)
+    if fw is not None:
+        w = w * fw
     loss_time = (ce * w).sum() / w.sum().clamp(min=1.0)
     total = weights.time * loss_time
     logs["time"] = float(loss_time.detach())
@@ -131,31 +136,34 @@ def compute_losses(
     if n_ev > 0:
         # --- lane code -----------------------------------------------------------------------
         rows_ev = bidx[ev]
+        fw_ev = fw[ev] if fw is not None else None
+        fw_m = fw.unsqueeze(-1).expand(B, T, MAX_MEMBERS) if fw is not None else None
         loss_lane = wmean(F.cross_entropy(out["lane_logits"][ev].float(), batch["lane_code"][ev], label_smoothing=label_smoothing,
-                                          reduction="none"), rows_ev)
+                                          reduction="none"), rows_ev, fw_ev)
         # --- members ---------------------------------------------------------------------------
         masks = batch["event_mask"]
         bits = ((masks.unsqueeze(-1) >> torch.arange(4, device=masks.device)) & 1)
         chord = bits.sum(dim=-1)
         member = (torch.arange(MAX_MEMBERS, device=masks.device).view(1, 1, -1) < chord.unsqueeze(-1)) & ev.unsqueeze(-1)
         loss_chord = wmean(F.cross_entropy(out["chord_logits"][ev].float(), (chord[ev] - 1).clamp(0, MAX_MEMBERS - 1),
-                                           reduction="none"), rows_ev)
+                                           reduction="none"), rows_ev, fw_ev)
         bidx_m = bidx.unsqueeze(-1).expand(B, T, MAX_MEMBERS)
         chord_member = member & (chord.unsqueeze(-1) >= 2)
         if chord_member.any():
             loss_stagger = wmean(F.cross_entropy(out["stagger_logits"][chord_member].float(),
                                                  batch["stagger"][chord_member].clamp(0, frame_ms - 1), reduction="none"),
-                                 bidx_m[chord_member])
+                                 bidx_m[chord_member], fw_m[chord_member] if fw_m is not None else None)
         else:
             loss_stagger = zero("stagger_logits")
         loss_lnf = wmean(F.binary_cross_entropy_with_logits(out["ln_logits"][member].float(), batch["ln_flag"][member].float(),
-                                                            reduction="none"), bidx_m[member])
+                                                            reduction="none"), bidx_m[member], fw_m[member] if fw_m is not None else None)
         ln_member = member & (batch["ln_flag"] > 0.5)
         if ln_member.any():
             b_t, r_t = ln_targets(batch["ln_len"][ln_member])
             rows_ln = bidx_m[ln_member]
             loss_lnl = wmean(F.cross_entropy(out["ln_bucket_logits"][ln_member].float(), b_t, reduction="none")
-                             + F.l1_loss(out["ln_resid"][ln_member].float(), r_t, reduction="none"), rows_ln)
+                             + F.l1_loss(out["ln_resid"][ln_member].float(), r_t, reduction="none"), rows_ln,
+                             fw_m[ln_member] if fw_m is not None else None)
         else:
             loss_lnl = zero("ln_bucket_logits", "ln_resid")
     else:

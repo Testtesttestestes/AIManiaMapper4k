@@ -151,6 +151,7 @@ class HybridPredictor:
         progress: Optional[Callable[[int, int], None]] = None,
         sr_guidance: float = 1.0,
         style_guidance: float = 1.0,
+        pattern_guidance: float = 1.0,
         canvas: Optional[tuple] = None,
         plan: Optional[tuple] = None,
     ) -> HeadOutputs:
@@ -160,6 +161,10 @@ class HybridPredictor:
         rating / style hidden (it was trained with them randomly hidden) and the difference is amplified:
         logits = uncond + w_sr * (with_sr - uncond) + w_style * (with_sr_and_style - with_sr).
         1.0 = plain conditional output; 2-3 makes the map follow the request much more strongly.
+        ``sr_guidance`` acts on WHERE the notes go (time head: density, rhythm - what the star rating mostly needs);
+        the lanes, chords and long notes use ``pattern_guidance`` (default 1.0 = the patterns the network learned from
+        human maps): amplifying those too made the patterns clearly less human-like (motif library log-probability
+        -0.6 -> -1.3 against human maps at guidance 3) and added jacks, with no gain in star rating.
         """
         cfg = self.model.cfg
         F, W = inputs.num_frames, self.window
@@ -237,12 +242,13 @@ class HybridPredictor:
 
             out = run(star_rating, True)
             has_style = bool(sm.any())
-            if sr_guidance != 1.0 or (has_style and style_guidance != 1.0):
+            if sr_guidance != 1.0 or pattern_guidance != 1.0 or (has_style and style_guidance != 1.0):
                 uncond = run(0.0, False)
                 with_sr = run(star_rating, False) if has_style else out
                 for key in GUIDED_HEADS:
+                    g = sr_guidance if key in TIME_HEADS else pattern_guidance
                     u, s_, f_ = uncond[key].float(), with_sr[key].float(), out[key].float()
-                    out[key] = u + sr_guidance * (s_ - u) + (style_guidance * (f_ - s_) if has_style else 0.0)
+                    out[key] = u + g * (s_ - u) + (style_guidance * (f_ - s_) if has_style else 0.0)
             tp = torch.softmax(out["time_logits"].float(), dim=-1).cpu().numpy()
             lg = out["lane_logits"].float().cpu().numpy()
             ch = torch.log_softmax(out["chord_logits"].float(), dim=-1).cpu().numpy()
@@ -312,6 +318,7 @@ def threshold_for_sr(table: Dict[int, float], star_rating: float, default: float
 
 
 GUIDED_HEADS = ("time_logits", "lane_logits", "chord_logits", "ln_logits")
+TIME_HEADS = ("time_logits",)          # sr_guidance; the other guided heads use pattern_guidance
 
 
 def star_rating_of(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], od: float = 8.0) -> float:
