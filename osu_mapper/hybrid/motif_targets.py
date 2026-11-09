@@ -22,6 +22,9 @@ lane distribution (codes mapped to masks with the true previous chords) towards 
 
 from __future__ import annotations
 
+import os
+import zipfile
+
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -153,8 +156,8 @@ def targets_for_track(track, sr: float, lib: Optional[MotifLibrary], cache_path=
             z = np.load(cache_path, allow_pickle=False)
             if str(z["tag"]) == tag:
                 return {k: z[k] for k in z.files if k != "tag"}
-        except (OSError, KeyError, ValueError):
-            pass
+        except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile):
+            pass                        # unreadable (an interrupted write): computed again below
     ev = track.event_frames()
     if hasattr(track, "time_class") and track.time_class.shape[0] == ev.shape[0]:  # SparseTrack: arrays are per event
         tc, em, lf, ll = track.time_class, track.event_mask, track.ln_flag, track.ln_len
@@ -162,8 +165,16 @@ def targets_for_track(track, sr: float, lib: Optional[MotifLibrary], cache_path=
         tc, em, lf, ll = track.time_class[ev], track.event_mask[ev], track.ln_flag[ev], track.ln_len[ev]
     out = compute_targets(ev, tc, em, lf, ll, track.timing_points, track.frame_ms, sr, lib)
     if cache_path is not None:
-        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cache_path, tag=np.array(tag), **out)
+        # atomic: several training processes (DDP ranks, loader workers) build the same caches at the same time, and a
+        # reader must never see a half-written file - each writes its own temporary file and renames it into place
+        cache_path = Path(cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_name(f"{cache_path.stem}.{os.getpid()}.tmp.npz")
+        try:
+            np.savez_compressed(tmp, tag=np.array(tag), **out)
+            os.replace(tmp, cache_path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
     return out
 
 

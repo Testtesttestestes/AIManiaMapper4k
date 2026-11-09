@@ -61,7 +61,10 @@ def init_distributed(requested_device: str) -> Tuple[bool, int, int, torch.devic
         dev = torch.device("cpu")
     # NCCL is the fast GPU backend but does not exist on Windows; gloo works everywhere
     backend = "nccl" if (use_cuda and dist.is_nccl_available() and sys.platform != "win32") else "gloo"
-    dist.init_process_group(backend=backend)
+    # long timeout: before the first collective every rank builds the dataset caches (motif targets, star ratings at
+    # every rate), which can take far longer than the default 10 minutes on a big dataset
+    import datetime
+    dist.init_process_group(backend=backend, timeout=datetime.timedelta(hours=3))
     return True, rank, world, dev
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 from pathlib import Path
@@ -174,10 +175,12 @@ def rate_star_ratings(index: "HybridIndex", map_indices: Sequence[int], rates: S
             cache[e["track"]] = {f"{r:g}": float(rosu_pp_py.Difficulty(clock_rate=float(r)).calculate(bm).stars) for r in rates}
             if n % 200 == 0:
                 log(f"  [rate] star ratings at {len(rates)} rates: {n}/{len(todo)} maps ({_time.time() - t0:.0f}s)")
-        try:
-            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        tmp = cache_path.with_name(f"rate_srs.{os.getpid()}.tmp")
+        try:                            # atomic: every DDP rank computes and writes this file at the same time
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            os.replace(tmp, cache_path)
         except OSError:
-            pass
+            tmp.unlink(missing_ok=True)
     return cache
 
 
