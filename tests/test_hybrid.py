@@ -1265,3 +1265,20 @@ class TestNoteRewardsAndStitch(unittest.TestCase):
         self.assertEqual(float(fw[320]), 1.0)
         fw2 = tr.crop_arrays(0, 500, rate=1.2)["frame_weight"]      # rate augmentation keeps the weights
         self.assertAlmostEqual(float(fw2[250]), 0.05, places=3)
+
+    def test_preference_segments(self):
+        from osu_mapper.hybrid.stitch import preference_segments
+        tps = self._tps()
+
+        def bar(t0, good):
+            lanes = [0, 2, 1, 3] if good else [0, 1]
+            return [Note(t0 + i * 125, lanes[i % len(lanes)], t0 + i * 125, False) for i in range(16)]
+        chosen = sum((bar(b * 2000, True) for b in range(6)), [])
+        rejected = sum((bar(b * 2000, b != 3) for b in range(6)), [])          # broken only in bar 3 (6-8 s)
+        seg = preference_segments(chosen, rejected, tps, 5.0)
+        # bar 3, and possibly bar 4 (the one-hand run of bar 3 continues into its first note)
+        self.assertIn(len(seg), (1, 2))
+        a, b = seg[0]
+        self.assertLessEqual(a, 600)
+        self.assertGreaterEqual(b, 790)
+        self.assertLess(b - a, 260)

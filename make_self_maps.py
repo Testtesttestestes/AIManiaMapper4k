@@ -66,7 +66,7 @@ def main() -> None:
     from osu_mapper.hybrid.reward import map_reward, note_rewards
     from osu_mapper.hybrid.solver import STYLE_DIM, SolveStats, compute_style, solve_map
     from osu_mapper.hybrid.sources import stable_id
-    from osu_mapper.hybrid.stitch import stitch_candidates
+    from osu_mapper.hybrid.stitch import preference_segments, stitch_candidates
 
     root = Path(args.data)
     index_path = root / "index.json"
@@ -147,8 +147,11 @@ def main() -> None:
                     continue
                 mid_, _, _ = save_track(fit.notes, f"dpo-rej-human-{hsr:g}", hm, tr_ref.num_frames)
                 if mid_ is not None:
+                    hn = render_track(ParamTrack.load_npz(root / hm["track"]))
+                    seg = preference_segments(hn, fit.notes, tps, hsr, LanePredictor.cached(lib, hsr) if lib is not None
+                                              else None, power)
                     pairs.append({"song_id": sid, "sr": hsr, "chosen": hm["track"], "rejected": f"maps/{mid_}.npz",
-                                  "kind": "human>network", "rejected_own": True})
+                                  "kind": "human>network", "rejected_own": True, "segments": seg})
         for target in targets:
             if any(abs(h - target) < args.min_gap for h in human):
                 continue
@@ -223,13 +226,15 @@ def main() -> None:
                 if mid_w is not None:
                     pairs.append({"song_id": sid, "sr": target, "chosen": f"maps/{mid}.npz", "rejected": f"maps/{mid_w}.npz",
                                   "kind": "best>worst", "rejected_own": True,
+                                  "segments": preference_segments(m.notes, worst[1], tps, target, pred, power),
                                   "rewards": [round(float(r["reward"]), 3), round(float(worst[0]["reward"]), 3)]})
     data["maps"] = keep + made
     data["dpo_pairs"] = pairs
     _write(index_path, data)
     if pairs:
         print(f"DPO pairs: {len(pairs)} ({sum(p['kind'] == 'human>network' for p in pairs)} human > network, "
-              f"{sum(p['kind'] == 'best>worst' for p in pairs)} best > worst)")
+              f"{sum(p['kind'] == 'best>worst' for p in pairs)} best > worst; "
+              f"{sum(len(p.get('segments', [])) for p in pairs)} bars where the chosen map is clearly better)")
     bins = np.bincount([int(min(d["sr"], 9.99)) for d in made], minlength=10) if made else np.zeros(10, int)
     print(f"\nself-generated maps: {len(made)} from {len(songs)} songs in {time.time() - t0:.0f}s "
           f"(backup: {index_path.with_suffix('.json.bak')})")

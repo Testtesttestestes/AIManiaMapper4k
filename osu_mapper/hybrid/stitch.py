@@ -101,3 +101,37 @@ def stitch_candidates(candidates: Sequence[Sequence[Note]], timing_points: Seque
     switches = sum(1 for a, b in zip(choice_seq, choice_seq[1:]) if a != b)
     share = [choice_seq.count(k) / max(1, len(choice_seq)) for k in range(K)]
     return out, {"choice": choice, "switches": switches, "from": share}
+
+
+def preference_segments(chosen: Sequence[Note], rejected: Sequence[Note], timing_points: Sequence[RawTimingPoint],
+                        target_sr: float, lane_predictor=None, power: Optional[np.ndarray] = None, margin: float = 0.5,
+                        frame_ms: int = 10) -> List[Tuple[int, int]]:
+    """Bars (as [start, end) frames) where the chosen map is clearly better than the rejected one by the per-event
+    reward: the mean penalty per event differs by at least ``margin``. DPO trains on windows around them instead of
+    random windows of the whole map, where the two maps are often equally good (the preference there is noise)."""
+    from .reward import note_rewards
+
+    def per_bar(notes):
+        nr = note_rewards(notes, target_sr, lane_predictor, power)
+        bars = bar_index(nr["times"], timing_points)
+        d: Dict[int, List[float]] = {}
+        for b, p in zip(bars.tolist(), nr["penalty"].tolist()):
+            d.setdefault(b, []).append(p)
+        return {b: float(np.mean(v)) for b, v in d.items()}
+
+    if len(chosen) < 8 or len(rejected) < 8:
+        return []
+    pc, pr = per_bar(chosen), per_bar(rejected)
+    good = sorted(b for b in set(pc) & set(pr) if pc[b] - pr[b] >= margin)
+    if not good:
+        return []
+    # bar b -> its time span: invert beat_positions on a fine grid of the map's time range
+    t_all = np.array([n.start for n in list(chosen) + list(rejected)], dtype=np.float64)
+    grid = np.arange(max(0.0, t_all.min() - 4000.0), t_all.max() + 4000.0, float(frame_ms))
+    gb = bar_index(grid, timing_points)
+    out: List[Tuple[int, int]] = []
+    for b in good:
+        sel = np.flatnonzero(gb == b)
+        if sel.size:
+            out.append((int(grid[sel[0]] // frame_ms), int(grid[sel[-1]] // frame_ms) + 1))
+    return out
