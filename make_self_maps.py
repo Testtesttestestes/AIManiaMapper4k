@@ -112,8 +112,9 @@ def main() -> None:
         mid_ = stable_id(ref_map["map_id"], tag)
         tr_.save_npz(root / "maps" / f"{mid_}.npz")
         return mid_, tr_, st_
-    # candidate settings: classifier-free guidance (hears more notes) x lane sampling temperature (other patterns)
-    variants = [(1.0, 0.0), (1.5, 0.0), (2.0, 0.0), (1.5, 0.6), (1.0, 0.6), (2.5, 0.0), (2.0, 0.6), (3.0, 0.3)]
+    # candidate settings: guidance of WHERE the notes go (hears more notes; the lanes keep the patterns the network
+    # learned from humans, see HybridPredictor.predict) x lane sampling temperature (other patterns)
+    variants = [(1.0, 0.0), (1.5, 0.0), (2.0, 0.0), (1.5, 0.5), (1.0, 0.5), (2.5, 0.0), (2.0, 0.5), (3.0, 0.3)]
     for n_song, sid in enumerate(songs, 1):
         maps = by_song[sid]
         ref = max(maps, key=lambda m: float(m.get("sr", 0.0)))
@@ -157,8 +158,12 @@ def main() -> None:
                     worst = (r, fit.notes, g, temp)
             r, notes, g, temp = best
             ok = abs(r["sr"] - target) <= args.max_error and r["reward"] >= args.min_reward
+            why = [] if ok else (["stars"] if abs(r["sr"] - target) > args.max_error else []) + \
+                (["reward"] if r["reward"] < args.min_reward else [])
             print(f"[{n_song}/{len(songs)}] {ref.get('osu_file', sid)[:44]:<44} ask {target:.1f} -> {r['sr']:.2f}* "
-                  f"reward {r['reward']:+.2f} (guidance {g:g}, lanes T {temp:g}){'' if ok else '  - not kept'}", flush=True)
+                  f"reward {r['reward']:+.2f} = stars {3 * r['stars']:+.2f} play {r['play']:+.2f} "
+                  f"patterns {r['pattern']:+.2f} silence {2 * r['silence']:+.2f} (guidance {g:g}, lanes T {temp:g})"
+                  + ("" if ok else f"  - not kept ({', '.join(why)})"), flush=True)
             if not ok:
                 continue
             m = ManiaMap(notes=list(notes), timing_points=tps, overall_difficulty=float(ref.get("od", 8.0)))

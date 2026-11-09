@@ -208,6 +208,10 @@ def main(argv=None) -> None:
                     help="make the map follow --sr more strongly (classifier-free guidance): 1 = off, 2-3 = strong; "
                          "a list (1,2,3) gives one difficulty per value")
     ap.add_argument("--style_guidance", type=float, default=1.0, help="the same for --style / --style_from")
+    ap.add_argument("--pattern_guidance", type=float, default=1.0,
+                    help="guidance of the lanes, chords and long notes (--sr_guidance only moves WHERE the notes go). "
+                         "1 = the patterns learned from human maps (recommended); higher follows the request harder but "
+                         "the patterns get less human-like and jackier")
     ap.add_argument("--reference", default=None, help="reference map (.osz/.osu) of the same audio: prints event F1 / density / missed notes of every generated difficulty against it")
     ap.add_argument("--reference_diff", default="", help="difficulty name (substring) inside --reference")
     ap.add_argument("--ln_threshold", type=float, default=None, help="tap-vs-LN threshold (default: calibrated value from the checkpoint)")
@@ -361,7 +365,7 @@ def main(argv=None) -> None:
                       f"the network extrapolates and the map gets WORSE, not harder (it saturates, then collapses)")
             t1 = time.time()
             out = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
-                                    sr_guidance=guidance, style_guidance=args.style_guidance)
+                                    sr_guidance=guidance, style_guidance=args.style_guidance, pattern_guidance=args.pattern_guidance)
             plan_in = None
             if args.plan != "off" and out.plan_logits is not None:
                 import numpy as np
@@ -373,7 +377,7 @@ def main(argv=None) -> None:
                 fams, cnt = np.unique(plan_in[0], return_counts=True)
                 print("[plan] " + ", ".join(f"{PLAN_FAMILIES[f]} {100 * c / cnt.sum():.0f}%" for f, c in sorted(zip(fams, cnt), key=lambda x: -x[1])))
                 out = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
-                                        sr_guidance=guidance, style_guidance=args.style_guidance, plan=plan_in)
+                                        sr_guidance=guidance, style_guidance=args.style_guidance, pattern_guidance=args.pattern_guidance, plan=plan_in)
             fit_info = ""
             for th in (thresholds if user_thresholds is not None or not predictor.threshold_by_sr else [predictor.threshold_for(target)]):
                 if args.fit_sr == "on" and user_thresholds is None:
@@ -392,7 +396,7 @@ def main(argv=None) -> None:
                         g_ = guidance
                         out, fit = refine(
                             lambda cv: predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
-                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, pattern_guidance=args.pattern_guidance, canvas=cv,
                                                          plan=plan_in),
                             lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
                             out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
@@ -404,7 +408,7 @@ def main(argv=None) -> None:
                         g_ = guidance
                         out, fit = correct(
                             lambda cv: predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
-                                                         sr_guidance=g_, style_guidance=args.style_guidance, canvas=cv,
+                                                         sr_guidance=g_, style_guidance=args.style_guidance, pattern_guidance=args.pattern_guidance, canvas=cv,
                                                          plan=plan_in),
                             lambda o: fit_network_map(o, k_th, timing, target, args.od, **fit_kw),
                             out, fit, out.num_frames, out.frame_ms, lambda f: int(k_th.onset_shift_ms) - int(f.lag_ms),
@@ -418,7 +422,7 @@ def main(argv=None) -> None:
                         # where the rating is reachable without it guidance only blurs the network (F1 0.70 -> 0.70, 3: 0.70)
                         for g2 in (2.0, 3.0):
                             out2 = predictor.predict(inputs, ask, style, smask, batch_size=args.batch_size,
-                                                     sr_guidance=g2, style_guidance=args.style_guidance, plan=plan_in)
+                                                     sr_guidance=g2, style_guidance=args.style_guidance, pattern_guidance=args.pattern_guidance, plan=plan_in)
                             fit2 = fit_network_map(out2, dataclasses.replace(knobs, onset_threshold=th), timing, target, args.od,
                                                    **fit_kw)
                             if abs(fit2.star_rating - target) < abs(fit.star_rating - target):

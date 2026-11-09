@@ -178,6 +178,7 @@ def ergonomics_report(notes: Sequence[Note], jack_ms: float = 150.0, run_ms: flo
     jacks = 0
     prev_cols: set = set()
     run = best_run = 0
+    in_long = 0          # events inside one-hand runs longer than 8 (human maps: almost none)
     prev_hand = None
     prev_t = -10 ** 9
     for ev in events:
@@ -192,6 +193,10 @@ def ergonomics_report(notes: Sequence[Note], jack_ms: float = 150.0, run_ms: flo
         else:
             run = 1 if hand != "B" else 0
         best_run = max(best_run, run)
+        if run == 9:
+            in_long += 9
+        elif run > 9:
+            in_long += 1
         prev_hand, prev_t = hand, t
     times = np.array([n.start for n in notes])
     left = np.array([n.col in LEFT for n in notes])
@@ -204,6 +209,7 @@ def ergonomics_report(notes: Sequence[Note], jack_ms: float = 150.0, run_ms: flo
         "events": float(len(events)),
         "fast_jack_pct": 100.0 * jacks / len(events),
         "max_one_hand_run": float(best_run),
+        "long_run_pct": 100.0 * in_long / len(events),
         "hand_imbalance": float(np.mean(imb)) if imb else 0.0,   # 0 = both hands equal, 1 = one hand only
     }
 

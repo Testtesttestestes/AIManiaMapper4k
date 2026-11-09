@@ -4,7 +4,7 @@ Objective reward of a generated map (no human rating needed): the "RL from feedb
     r = w_sr * stars + w_play * playability + w_pattern * patterns + w_silence * silence
 
 * stars      -|SR - target| (rosu-pp): the network must give what was asked;
-* playability  fast jacks against what real maps of that star rating have, the longest one-hand run, hand balance
+* playability  fast jacks, the share of the map in one-hand runs longer than 8 notes (10 % costs 1), hand balance
                (ergonomics.ergonomics_report);
 * patterns   how real maps of that star rating continue the chords (motif library, LanePredictor): mean
              log-probability of every chord after the six before it, against human maps of that rating (less typical
@@ -73,8 +73,11 @@ def map_reward(notes: Sequence[Note], timing_points: Sequence[RawTimingPoint], t
     sr = float(star_rating_of(notes, timing_points, od)) if sr is None else float(sr)
     er = ergonomics_report(notes)
     jack = float(er.get("fast_jack_pct", 0.0)) / 100.0
+    # long one-hand runs as the SHARE of the map inside them (human maps: ~0 %), not the single longest run: one bad
+    # spot in a 4000-note map used to cost up to -25 and decided the choice between candidates on its own
+    long_runs = float(er.get("long_run_pct", 0.0)) / 100.0
     r_play = -(abs(jack - jack_target) * 4.0 if jack_target is not None else jack) \
-             - 0.25 * max(0.0, float(er.get("max_one_hand_run", 0.0)) - 6.0) - float(er.get("hand_imbalance", 0.0))
+             - 10.0 * long_runs - float(er.get("hand_imbalance", 0.0))
     r_pat = 0.0
     if lane_predictor is not None:
         lp = pattern_logp(notes, lane_predictor)
