@@ -267,7 +267,8 @@ python hybrid_solvability_audit.py --input_dir "F:\mania4k dataset"
 #    ~0.25 ГБ на час аудио на каждый вариант качества (float16); 14.5 ч датасета ≈ 3.5 ГБ (+3.5 ГБ с mp3_48k)
 python prepare_hybrid_dataset.py --input_dir "sample beatmaps" --output_dir dataset_hybrid --quality_variants mp3_48k
 
-# 3) обучение (GPU). Ctrl+C сохраняет hybrid_last.pt, продолжение — --resume
+# 3) обучение (GPU). Ctrl+C сохраняет hybrid_last.pt, продолжение — --resume;
+#    закончить после текущей эпохи: создать файл checkpoints/hybrid/STOP
 #    --workers 4 — параллельная подготовка батчей (на Windows тоже работает)
 python train_hybrid.py --data dataset_hybrid --preset base --epochs 40 --batch_size 16 --workers 4
 python train_hybrid.py --data dataset_hybrid --resume --workers 4
@@ -708,7 +709,7 @@ python generate_composer.py --template "song.osz" --sr 5.5 --ln_ratio 0.44      
 | `--global_dropout` | 0.2 (из конфига) | скрывать сводку всей песни; 0.5 мешает узнавать песню |
 | `--dropout` | 0.1 | dropout внутри сети; 0.2 для небольшого датасета |
 | `--style_dropout` | 0.3 | скрывать вектор стиля |
-| `--patience N` | 0 | остановиться, если N эпох не было улучшения (лучший чекпоинт всё равно `hybrid_best.pt`) |
+| `--patience N` | 0 | остановиться, если N эпох не было улучшения (лучший чекпоинт всё равно `hybrid_best.pt`); работает и на нескольких GPU. Остановить вручную после текущей эпохи: создать файл `<checkpoint_dir>/STOP` (выход без ошибки, `train_console.py` идёт к следующему шагу) |
 
 Все они — настройки обучения, их можно менять при `--resume`. Пример:
 

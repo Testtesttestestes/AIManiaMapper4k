@@ -325,7 +325,9 @@ def main() -> None:
     ap.add_argument("--style_dropout", type=float, default=None, help="probability to hide the whole style vector (default 0.3)")
     ap.add_argument("--dropout", type=float, default=None, help="dropout inside the network (default 0.1; 0.2 for small datasets)")
     ap.add_argument("--patience", type=int, default=0,
-                    help="stop when the validation score did not improve for N epochs (0 = train all epochs)")
+                    help="stop when the validation score did not improve for N epochs (0 = train all epochs); also with "
+                         "several GPUs. hybrid_best.pt keeps the best epoch either way. Creating the file <checkpoint_dir>/STOP "
+                         "ends training after the current epoch")
     ap.add_argument("--val_crops", type=int, default=256)
     ap.add_argument("--val_maps", type=int, default=24, help="complete validation maps rendered per epoch (per-ms metrics)")
     ap.add_argument("--val_sr_response", type=int, default=8,
@@ -648,10 +650,11 @@ def main() -> None:
 
     epoch = start_epoch
     best_epoch = start_epoch
-    if args.patience > 0 and distributed:
-        print("[warn] --patience is not supported with several GPUs (torchrun): training runs all epochs, "
-              "hybrid_best.pt still keeps the best one")
-        args.patience = 0
+    stop_file = ckpt_dir / "STOP"
+    if is_main:
+        stop_file.unlink(missing_ok=True)
+        print(f"[train] to stop after the current epoch (and go on with the next steps), create the file {stop_file}"
+              + (f"; stops by itself after {args.patience} epochs without improvement" if args.patience > 0 else ""))
     try:
         for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
             train_ds.set_epoch(epoch)
@@ -711,34 +714,39 @@ def main() -> None:
                           + (f" dpo {avg['dpo']:.3f} (acc {avg['dpo_acc']:.2f})" if "dpo" in avg else ""), flush=True)
                     run, n_run, run_n = {}, 0, {}
 
-            if not is_main:  # validation and checkpoints happen on rank 0; the others wait
-                dist.barrier()
-                continue
-            record, summary = evaluate(f"epoch {epoch}", epoch, time.time() - t0)
-            history.append(record)
-            if summary:
-                score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
-                if args.response_weight > 0 and "resp_slope" in summary:
-                    score += args.response_weight * float(np.clip(summary["resp_slope"], 0.0, 1.5))
-            elif "val_total" in record:
-                score = -float(record["val_total"])
-            else:
-                score = float(step)                              # no validation data: newest is best
-            save_checkpoint(last_path, **payload(epoch, summary))
-            if score > best_score:
-                best_score = score
-                best_epoch = epoch
-                save_checkpoint(best_path, **payload(epoch, summary))
-                print(f"  * new best ({score:.4f}) -> {best_path}")
-            elif args.patience > 0 and epoch - best_epoch >= args.patience:
-                print(f"[early stop] no improvement for {epoch - best_epoch} epochs (best {best_score:.4f} at epoch {best_epoch})")
+            stop = False
+            if is_main:     # validation and checkpoints happen on rank 0; the others wait for its decision below
+                record, summary = evaluate(f"epoch {epoch}", epoch, time.time() - t0)
+                history.append(record)
+                if summary:
+                    score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
+                    if args.response_weight > 0 and "resp_slope" in summary:
+                        score += args.response_weight * float(np.clip(summary["resp_slope"], 0.0, 1.5))
+                elif "val_total" in record:
+                    score = -float(record["val_total"])
+                else:
+                    score = float(step)                              # no validation data: newest is best
+                save_checkpoint(last_path, **payload(epoch, summary))
+                if score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    save_checkpoint(best_path, **payload(epoch, summary))
+                    print(f"  * new best ({score:.4f}) -> {best_path}")
+                elif args.patience > 0 and epoch - best_epoch >= args.patience:
+                    print(f"[early stop] no improvement for {epoch - best_epoch} epochs (best {best_score:.4f} at epoch {best_epoch})")
+                    stop = True
+                if stop_file.exists():
+                    print(f"[stop] {stop_file} found: training ends here (best {best_score:.4f} at epoch {best_epoch})")
+                    stop_file.unlink(missing_ok=True)
+                    stop = True
                 with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
                     json.dump(history, fh, indent=1)
+            if distributed:     # rank 0 decides for everyone (also acts as the barrier after validation)
+                flag = torch.tensor([1 if stop else 0], device=dev)
+                dist.broadcast(flag, 0)
+                stop = bool(flag.item())
+            if stop:
                 break
-            with open(ckpt_dir / "history.json", "w", encoding="utf-8") as fh:
-                json.dump(history, fh, indent=1)
-            if distributed:
-                dist.barrier()
     except KeyboardInterrupt:
         if is_main:
             print(f"\n[paused] saving {last_path} (resume with: python train_hybrid.py --data {args.data} --resume)")
