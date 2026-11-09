@@ -109,7 +109,18 @@ def run(argv: List[str]) -> int:
     """Runs a step as its own process (the same Python), output straight to the console."""
     title("Запуск")
     print(color(command_text(argv), "2"))
-    return subprocess.call(argv, cwd=str(REPO))
+    proc = subprocess.Popen(argv, cwd=str(REPO))
+    interrupted = False
+    while True:                       # Ctrl+C goes to the step too; wait until it has saved and quit
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:
+            interrupted = True
+    return INTERRUPTED if interrupted else code
+
+
+INTERRUPTED = -1000
 
 
 # ----------------------------------------------------------------------------------------------
@@ -189,6 +200,12 @@ def step_train(last: Dict[str, object], resume: bool = False) -> Optional[List[s
             b += b % 2
             last["batch"] = b
             argv_tail += ["--batch_size", str(b)]
+    pat = ask_int("Остановить обучение, если столько эпох подряд нет улучшения на валидации (0 = все эпохи)",
+                  int(last.get("patience", 5)), 0, 1000)
+    last["patience"] = pat
+    if pat:
+        argv_tail += ["--patience", str(pat)]
+    print(color(f"  Остановить вручную после текущей эпохи и перейти к следующему шагу: создать файл {Path(ckdir) / 'STOP'}", "2"))
     workers = ask_int("Процессов загрузки данных", int(last.get("workers", min(4, max(0, (os.cpu_count() or 2) - 1)))), 0, 32)
     last["workers"] = workers
     argv_tail += ["--workers", str(workers)]
@@ -281,7 +298,14 @@ def execute(argv: List[str]) -> bool:
     cur: List[str] = []
     for a in argv + ["&&"]:
         if a == "&&":
-            if cur and run(cur) != 0:
+            code = run(cur) if cur else 0
+            if code == INTERRUPTED:
+                print(color("\nШаг прерван (Ctrl+C).", "33"))
+                if "train_hybrid.py" in cur:
+                    print("Лучшая эпоха уже сохранена в hybrid_best.pt (по валидации), следующие шаги берут её.")
+                if not ask_yes("Перейти к следующим шагам?", "train_hybrid.py" in cur):
+                    return False
+            elif code != 0:
                 print(color("Шаг завершился с ошибкой: дальше не иду.", "31"))
                 return False
             cur = []
@@ -295,7 +319,7 @@ def main() -> None:
     os.chdir(REPO)
     sys.path.insert(0, str(REPO))
     print(color("AIManiaMapper — обучение нейросети", "1;35"))
-    print(color("Enter = вариант в [скобках]. Ctrl+C — выход. Подробности: HYBRID_GUIDE.md, раздел 4.9.", "2"))
+    print(color("Enter = вариант в [скобках]. Ctrl+C — выход (во время шага — прервать шаг). Подробности: HYBRID_GUIDE.md, раздел 4.9.", "2"))
     while True:
         last = load_settings()
         try:
