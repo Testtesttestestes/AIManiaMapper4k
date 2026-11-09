@@ -44,6 +44,8 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--motifs", default=None, help="motif library for the pattern reward (default: test_NN/motifs.npz)")
     ap.add_argument("--remove", action="store_true", help="only delete the self-generated maps")
+    ap.add_argument("--no_stitch", action="store_true",
+                    help="do not stitch the best bars of the candidates (osu_mapper/hybrid/stitch.py) into one map")
     ap.add_argument("--no_pairs", action="store_true",
                     help="do not save DPO preference pairs (best vs worst candidate, human map vs the network's map at the "
                          "human map's rating; train_hybrid.py --dpo_weight uses them)")
@@ -61,6 +63,7 @@ def main() -> None:
     from osu_mapper.hybrid.reward import map_reward
     from osu_mapper.hybrid.solver import STYLE_DIM, SolveStats, compute_style, solve_map
     from osu_mapper.hybrid.sources import stable_id
+    from osu_mapper.hybrid.stitch import stitch_candidates
 
     root = Path(args.data)
     index_path = root / "index.json"
@@ -100,6 +103,7 @@ def main() -> None:
     if args.max_songs:
         songs = songs[:args.max_songs]
     made: List[Dict[str, Any]] = []
+    n_stitch_tried, n_stitch_used = [0], [0]
     pairs: List[Dict[str, Any]] = []
     t0 = time.time()
 
@@ -146,24 +150,40 @@ def main() -> None:
             pred = LanePredictor.cached(lib, target) if lib is not None else None
             best = None
             worst = None
+            all_notes = []
             for g, temp in variants[:max(1, args.candidates)]:
                 out = predictor.predict(inputs, target, sr_guidance=g)
                 knobs = DecodeKnobs(onset_threshold=predictor.threshold_for(target), ln_threshold=predictor.ln_threshold,
                                     lane_temperature=temp)
                 fit = fit_network_map(out, knobs, tps, target, float(ref.get("od", 8.0)))
                 r = map_reward(fit.notes, tps, target, float(ref.get("od", 8.0)), pred, power, sr=float(fit.star_rating))
+                all_notes.append(fit.notes)
                 if best is None or r["reward"] > best[0]["reward"]:
                     best = (r, fit.notes, g, temp)
                 if worst is None or r["reward"] < worst[0]["reward"]:
                     worst = (r, fit.notes, g, temp)
             r, notes, g, temp = best
+            stitch_note = ""
+            if not args.no_stitch and len(all_notes) >= 2:
+                # the best bars of all candidates (per-event reward); kept only when better as a whole
+                st_notes, info = stitch_candidates(all_notes, tps, target, pred, power)
+                if len(st_notes) >= 20:
+                    rs = map_reward(st_notes, tps, target, float(ref.get("od", 8.0)), pred, power)
+                    better = rs["reward"] > r["reward"] and abs(rs["sr"] - target) <= args.max_error
+                    stitch_note = (f" | stitched {info['switches']} seams: {rs['sr']:.2f}* reward {rs['reward']:+.2f}"
+                                   + (" - used" if better else ""))
+                    n_stitch_tried[0] += 1
+                    if better:
+                        n_stitch_used[0] += 1
+                        r, notes, g, temp = rs, st_notes, "stitched", 0.0
             ok = abs(r["sr"] - target) <= args.max_error and r["reward"] >= args.min_reward
             why = [] if ok else (["stars"] if abs(r["sr"] - target) > args.max_error else []) + \
                 (["reward"] if r["reward"] < args.min_reward else [])
             print(f"[{n_song}/{len(songs)}] {ref.get('osu_file', sid)[:44]:<44} ask {target:.1f} -> {r['sr']:.2f}* "
                   f"reward {r['reward']:+.2f} = stars {3 * r['stars']:+.2f} play {r['play']:+.2f} "
-                  f"patterns {r['pattern']:+.2f} silence {2 * r['silence']:+.2f} (guidance {g:g}, lanes T {temp:g})"
-                  + ("" if ok else f"  - not kept ({', '.join(why)})"), flush=True)
+                  f"patterns {r['pattern']:+.2f} silence {2 * r['silence']:+.2f} "
+                  + ("(stitched)" if g == "stitched" else f"(guidance {g:g}, lanes T {temp:g})")
+                  + ("" if ok else f"  - not kept ({', '.join(why)})") + stitch_note, flush=True)
             if not ok:
                 continue
             m = ManiaMap(notes=list(notes), timing_points=tps, overall_difficulty=float(ref.get("od", 8.0)))
@@ -182,7 +202,7 @@ def main() -> None:
                 "style": [round(float(x), 5) for x in style], "style_mask": [0.0] * STYLE_DIM,
                 "notes": len(m.notes), "events": stats.events, "overflow": stats.overflow,
                 "overflow_reasons": stats.overflow_reasons, "overlaps_in_ln": stats.overlaps_in_ln, "roundtrip_exact": True,
-                "derived": True, "self": True, "parent": ref["map_id"], "requested_sr": target,
+                "derived": True, "self": True, "parent": ref["map_id"], "requested_sr": target, "stitched": g == "stitched",
                 "reward": {k: round(float(v), 4) for k, v in r.items()}, "piece": split_key(ref),
             })
             human.append(float(r["sr"]))
@@ -201,6 +221,8 @@ def main() -> None:
     bins = np.bincount([int(min(d["sr"], 9.99)) for d in made], minlength=10) if made else np.zeros(10, int)
     print(f"\nself-generated maps: {len(made)} from {len(songs)} songs in {time.time() - t0:.0f}s "
           f"(backup: {index_path.with_suffix('.json.bak')})")
+    if n_stitch_tried[0]:
+        print(f"stitched maps: better than every single candidate in {n_stitch_used[0]} of {n_stitch_tried[0]} requests")
     print("per star: " + " ".join(f"{b}*:{int(c)}" for b, c in enumerate(bins) if c))
 
 
