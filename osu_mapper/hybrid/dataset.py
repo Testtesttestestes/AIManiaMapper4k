@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 from pathlib import Path
@@ -109,7 +110,15 @@ class HybridIndex:
         return ParamTrack.load_npz(self.root / self.maps[map_idx]["track"])
 
 
-_RATE_RE = re.compile(r"[\(\[]?\s*(?:x\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*x|rate\s*\d+(?:[.,]\d+)?|nightcore|\bnc\b|daycore)\s*[\)\]]?", re.I)
+# rate / speed tags in titles (the content check in rate_groups.py finds the versions these miss)
+_RATE_RE = re.compile(
+    r"[\(\[\{]?\s*(?:"
+    r"(?<![a-z0-9])[x\u00d7]\s*\d+(?:[.,]\d+)?|(?<![a-z])\d+(?:[.,]\d+)?\s*[x\u00d7](?![a-z0-9])"  # x1.1  1,25x  ×1.2 (not Mx3)
+    r"|rate\s*[:=]?\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*rate"                     # rate 1.2  1.2 rate
+    r"|\d{2,3}(?:[.,]\d+)?\s*%"                                                   # 130%
+    r"|sped[\s-]*up|speed[\s-]*up|speedup|slowed(?:[\s-]*down)?|slow[\s-]*down"     # sped up, slowed
+    r"|double[\s-]*time|half[\s-]*time|\bdt\b|\bht\b|\bnc\b|nightcore|daycore"
+    r")(?:\s*ver(?:sion|\.)?)?\s*[\)\]\}]?", re.I)
 
 
 def piece_name(text: str) -> str:
@@ -166,10 +175,12 @@ def rate_star_ratings(index: "HybridIndex", map_indices: Sequence[int], rates: S
             cache[e["track"]] = {f"{r:g}": float(rosu_pp_py.Difficulty(clock_rate=float(r)).calculate(bm).stars) for r in rates}
             if n % 200 == 0:
                 log(f"  [rate] star ratings at {len(rates)} rates: {n}/{len(todo)} maps ({_time.time() - t0:.0f}s)")
-        try:
-            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        tmp = cache_path.with_name(f"rate_srs.{os.getpid()}.tmp")
+        try:                            # atomic: every DDP rank computes and writes this file at the same time
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            os.replace(tmp, cache_path)
         except OSError:
-            pass
+            tmp.unlink(missing_ok=True)
     return cache
 
 
