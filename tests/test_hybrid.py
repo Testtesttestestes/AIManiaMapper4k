@@ -1246,3 +1246,22 @@ class TestNoteRewardsAndStitch(unittest.TestCase):
         for n in notes:
             if n.col == 0 and 1900 < n.start < 2630:
                 self.fail("a note starts on a lane still held by a long note")
+
+    def test_quality_weights_frames(self):
+        from osu_mapper.hybrid.dataset import SparseTrack
+        from osu_mapper.hybrid.solver import solve_map
+        notes = [Note(1000 + i * 100, i % 4, 1000 + i * 100, False) for i in range(40)]
+        m = ManiaMap(notes=notes, timing_points=[RawTimingPoint(0.0, 400.0, 4, 2, 1, 60, True, 0)])
+        tr = SparseTrack(solve_map(m, num_frames=700))
+        self.assertTrue((tr.crop_arrays(0, 700)["frame_weight"] == 1.0).all())
+        times = np.array([n.start for n in notes], dtype=np.float64)
+        penalty = np.full(40, -0.3)
+        penalty[20] = -10.0                                       # the note at 3000 ms is a bad spot
+        tr.set_quality(times, penalty)
+        fw = tr.crop_arrays(0, 700)["frame_weight"]
+        self.assertAlmostEqual(float(fw[300]), 0.05, places=3)
+        self.assertEqual(float(fw[200]), 1.0)                       # far from it: full weight
+        self.assertLess(float(fw[312]), 1.0)                        # within 150 ms
+        self.assertEqual(float(fw[320]), 1.0)
+        fw2 = tr.crop_arrays(0, 500, rate=1.2)["frame_weight"]      # rate augmentation keeps the weights
+        self.assertAlmostEqual(float(fw2[250]), 0.05, places=3)

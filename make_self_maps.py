@@ -14,7 +14,10 @@ notes in silence) picks the best, and the chosen map is added to the dataset wit
 not the requested one - the network gets hard examples it can actually learn from, labelled honestly.
 
 The new maps are marked "derived": true and "self": true: never used for validation, drawn only with the derived
-share of training crops (train_hybrid.py --derived_weight), no style information. They belong to the song's piece, so
+share of training crops (train_hybrid.py --derived_weight), no style information. Every event of them has a reward
+(maps/<id>_q.npz, reward.note_rewards): around its bad spots (jacks, long one-hand runs, notes in silence, broken
+patterns) the training loss weighs less, so the network does not learn its own mistakes. Several candidates are made
+per request and the best bars of them are stitched into one map (osu_mapper/hybrid/stitch.py) when that is better. They belong to the song's piece, so
 songs of the validation split stay out of training. Repeat after each training round (the next network makes
 better candidates); make_derived_maps.py keeps them.
 """
@@ -60,7 +63,7 @@ def main() -> None:
     from osu_mapper.hybrid.network_fit import fit_network_map
     from osu_mapper.hybrid.params import ParamTrack
     from osu_mapper.hybrid.renderer import DecodeKnobs, render_track
-    from osu_mapper.hybrid.reward import map_reward
+    from osu_mapper.hybrid.reward import map_reward, note_rewards
     from osu_mapper.hybrid.solver import STYLE_DIM, SolveStats, compute_style, solve_map
     from osu_mapper.hybrid.sources import stable_id
     from osu_mapper.hybrid.stitch import stitch_candidates
@@ -72,6 +75,8 @@ def main() -> None:
     old = [m for m in data["maps"] if m.get("self")]
     for m in old:
         (root / m["track"]).unlink(missing_ok=True)
+        if m.get("quality"):
+            (root / m["quality"]).unlink(missing_ok=True)
     if old:
         print(f"removed {len(old)} previous self-generated maps")
     for p_ in data.get("dpo_pairs", []):
@@ -195,6 +200,12 @@ def main() -> None:
             mid = stable_id(ref["map_id"], f"self-{target:g}")
             tr.save_npz(root / "maps" / f"{mid}.npz")
             style, _ = compute_style(tr, m.notes, r["sr"], m.overall_difficulty)
+            # per-event reward: training weighs the bad spots of this map less (dataset SparseTrack.set_quality)
+            nr = note_rewards(m.notes, float(r["sr"]), LanePredictor.cached(lib, float(r["sr"])) if lib is not None else None,
+                              power)
+            np.savez_compressed(root / "maps" / f"{mid}_q.npz", times=nr["times"].astype(np.float32),
+                                penalty=nr["penalty"].astype(np.float32))
+            bad = float((nr["penalty"] < -4.0).mean()) if nr["penalty"].size else 0.0
             made.append({
                 "map_id": mid, "song_id": sid, "track": f"maps/{mid}.npz", "source": ref["source"],
                 "osu_file": f"{ref.get('osu_file', '')} [self {target:g}]", "version": f"self {target:g}", "creator": "network",
@@ -203,6 +214,7 @@ def main() -> None:
                 "notes": len(m.notes), "events": stats.events, "overflow": stats.overflow,
                 "overflow_reasons": stats.overflow_reasons, "overlaps_in_ln": stats.overlaps_in_ln, "roundtrip_exact": True,
                 "derived": True, "self": True, "parent": ref["map_id"], "requested_sr": target, "stitched": g == "stitched",
+                "quality": f"maps/{mid}_q.npz", "bad_spots": round(bad, 4),
                 "reward": {k: round(float(v), 4) for k, v in r.items()}, "piece": split_key(ref),
             })
             human.append(float(r["sr"]))

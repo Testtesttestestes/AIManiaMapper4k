@@ -213,6 +213,34 @@ class SparseTrack:
         self.ln_flag = track.ln_flag[ev].astype(bool)
         self.ln_len = track.ln_len[ev].astype(np.int32)
         self.pat: Optional[Dict[str, np.ndarray]] = None   # per-event pattern targets (motif_targets.py)
+        self.weight: Optional[np.ndarray] = None           # per-event loss weight (self-generated maps, see set_quality)
+
+    def set_quality(self, times_ms: np.ndarray, penalty: np.ndarray, scale: float = 3.0, floor: float = 0.05) -> None:
+        """Loss weights from the per-event reward of a self-generated map (reward.note_rewards): an event with penalty
+        p gets exp((p + 1) / scale), at most 1 (usual spots: p > -1) and at least ``floor`` - the network does not
+        learn its own mistakes (a long one-hand run costs ~-10 -> 0.05)."""
+        ev_ms = self.frames * self.frame_ms + self.time_class.astype(np.int64) - 1
+        w = np.ones(self.frames.size, dtype=np.float32)
+        t = np.asarray(times_ms, dtype=np.float64)
+        if t.size and ev_ms.size:
+            j = np.clip(np.searchsorted(t, ev_ms), 1, t.size - 1) if t.size > 1 else np.zeros(ev_ms.size, np.int64)
+            if t.size > 1:
+                j = np.where(np.abs(t[j - 1] - ev_ms) <= np.abs(t[j] - ev_ms), j - 1, j)
+            near = np.abs(t[j] - ev_ms) <= 10
+            pw = np.clip(np.exp((np.asarray(penalty, np.float64)[j] + 1.0) / scale), floor, 1.0)
+            w[near] = pw[near].astype(np.float32)
+        self.weight = w if (w < 1.0).any() else None
+
+    def _frame_weight(self, rows: np.ndarray, idx: np.ndarray, length: int, radius: int = 15) -> np.ndarray:
+        """Per-frame loss weight of a window: the lowest event weight within ``radius`` frames (150 ms)."""
+        fw = np.ones(length, dtype=np.float32)
+        if self.weight is None or not len(idx):
+            return fw
+        ew = self.weight[idx]
+        for r, w in zip(np.asarray(rows)[ew < 1.0].tolist(), ew[ew < 1.0].tolist()):
+            a, b = max(0, r - radius), min(length, r + radius + 1)
+            fw[a:b] = np.minimum(fw[a:b], w)
+        return fw
 
     def event_frames(self) -> np.ndarray:
         return self.frames
@@ -271,6 +299,7 @@ class SparseTrack:
             out["stagger"][rows] = np.clip(np.round(self.stagger[idx] / rate), 0, H - 1)
             out["ln_flag"][rows] = self.ln_flag[idx]
             out["ln_len"][rows] = np.where(self.ln_flag[idx], np.maximum(1, np.round(self.ln_len[idx] / rate)), 0)
+        out["frame_weight"] = self._frame_weight(rows, idx, length)
         if self.pat is not None:
             from .motif_targets import PATTERN_HEADS
             for k in PATTERN_HEADS:
@@ -309,6 +338,7 @@ class SparseTrack:
             out["stagger"][rows] = self.stagger[i0:i1]
             out["ln_flag"][rows] = self.ln_flag[i0:i1]
             out["ln_len"][rows] = self.ln_len[i0:i1]
+        out["frame_weight"] = self._frame_weight(rows if i1 > i0 else np.zeros(0, np.int64), np.arange(i0, i1), length)
         if self.pat is not None:
             from .motif_targets import PATTERN_HEADS
             for k in PATTERN_HEADS:
@@ -400,6 +430,17 @@ class HybridCropDataset(Dataset):
                 tr.pat = targets_for_track(tr, float(e.get("sr", 0.0)), motifs, cache)
                 if n_done % 200 == 0:
                     log(f"  [patterns] targets of {n_done}/{len(self.tracks)} maps ({_time.time() - t0:.0f}s)")
+        n_q = 0
+        for tr, e in zip(self.tracks, self.entries):
+            if e.get("quality"):
+                try:
+                    z = np.load(index.root / e["quality"])
+                    tr.set_quality(z["times"], z["penalty"])
+                    n_q += tr.weight is not None
+                except (OSError, KeyError, ValueError):
+                    pass
+        if n_q:
+            log(f"[data] {n_q} self-generated maps weigh their bad spots less in the loss (per-note reward)")
         self.spans: List[Tuple[int, int]] = []
         for tr in self.tracks:
             ev = tr.event_frames()
