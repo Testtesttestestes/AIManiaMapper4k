@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Консольная программа для обучения: чистка датасета, подготовка, обучение сети, диагностика, самообучение - по шагам.
+Консольная программа для обучения: чистка датасета, подготовка, обучение сети, диагностика - по шагам.
 
     python train_console.py            (на Windows: двойной клик по train_console.bat)
 
 Как mapper_console.py: простые вопросы с вариантами по умолчанию в [скобках], итог перед запуском, та же команда в
 конце (её можно сохранить и запускать без вопросов), выбор запоминается до следующего раза. Несколько видеокарт
 находятся сами, обучение на них запускается через torchrun.
+
+Обучение идёт только по настоящим картам датасета (--real_only): облегчённые (make_derived_maps.py) и
+сгенерированные сетью (make_self_maps.py) карты и DPO-пары портили веса, поэтому консоль их больше не делает и не
+использует. Перекос датасета в сторону лёгких карт выравнивается выборкой: сложные карты берутся чаще
+(--sr_balance и --hard_tilt), так что паттерны сложных мест сеть учит по самим сложным картам.
 """
 
 from __future__ import annotations
@@ -40,13 +45,20 @@ LENGTHS = [  # (name, hint, epochs, steps per epoch)
 # training techniques: (key, question, hint, flags when off)
 TECHNIQUES = [
     ("rate", "Ускорение карт для сложных звёзд", "x1.1-x1.3 вместе с музыкой, с пометкой «ускорено»", ["--rate_aug", "0"]),
-    ("rare", "Больший вес редких сложностей", "сложные карты весят больше в потерях", ["--sr_rare", "0", "--sr_balance", "0"]),
+    ("rare", "Больший вес редких сложностей в потерях", "кроп редкой (сложной) карты весит больше", ["--sr_rare", "0"]),
     ("patterns", "Знания паттернов и библиотеки мотивов", "структура карты и как реальные карты продолжают аккорды",
      ["--pattern_weight", "0", "--prior_weight", "0", "--plan_prob", "0"]),
     ("plan", "План по тактам («сначала подумать»)", "техника каждого такта как цель и как вход", ["--plan_prob", "0"]),
     ("fix", "«Сломай и почини» (самокоррекция)", "сеть учится находить и исправлять ошибки", ["--corrupt_prob", "0"]),
     ("canvas", "Холст карты (дорисовка с оглядкой на уже поставленное)", "", ["--canvas_prob", "0", "--corrupt_prob", "0"]),
     ("ladder", "Лестница сложностей", "какие удары остаются на всех сложностях, какие только на сложных", ["--ladder_weight", "0"]),
+]
+# how much more often hard maps are drawn: (name, hint, sr_balance, hard_tilt)
+SAMPLING = [
+    ("Сложные заметно чаще", "рекомендуется: звёздные корзины почти выровнены, плюс наклон к сложным", 0.75, 1.5),
+    ("Сложные немного чаще", "мягкое выравнивание", 0.5, 0.75),
+    ("Сложные намного чаще", "все звёзды поровну и сильный наклон к сложным (риск переобучиться на редких картах)", 1.0, 2.5),
+    ("Как в датасете", "по длине карт, без выравнивания", 0.0, 0.0),
 ]
 
 
@@ -146,12 +158,20 @@ def step_prepare(last: Dict[str, object]) -> Optional[List[str]]:
     folder = ask_folder("Папка с .osz", str(last.get("beatmaps", "sample beatmaps")))
     out = ask_folder("Куда положить датасет", str(last.get("data", "dataset_hybrid")), must_exist=False)
     last.update(beatmaps=folder, data=out)
-    argv = [sys.executable, "prepare_hybrid_dataset.py", "--input_dir", folder, "--output_dir", out]
-    if ask_yes("Добавить облегчённые версии сложных карт (прореживание)?", bool(last.get("derived", True))):
-        last["derived"] = True
-        return argv + ["&&", sys.executable, "make_derived_maps.py", "--data", out]
-    last["derived"] = False
-    return argv
+    print(color("  Облегчённые (прореженные) версии карт больше не добавляются: обучение идёт только по настоящим картам.", "2"))
+    return [sys.executable, "prepare_hybrid_dataset.py", "--input_dir", folder, "--output_dir", out]
+
+
+def sampling_argv(last: Dict[str, object]) -> List[str]:
+    """Real maps only + how much more often the hard ones are drawn."""
+    argv = ["--real_only"]
+    print(color("  Только настоящие карты датасета: облегчённые и сгенерированные сетью карты (если они есть в датасете)"
+                " и DPO не используются.", "2"))
+    k = ask_choice("Как часто брать сложные карты (в датасете обычно перевес лёгких)",
+                   [(n, h) for n, h, _, _ in SAMPLING], min(len(SAMPLING), int(last.get("sampling_i", 1))))
+    last["sampling_i"] = k
+    _, _, bal, tilt = SAMPLING[k - 1]
+    return argv + ["--sr_balance", f"{bal:g}", "--hard_tilt", f"{tilt:g}"]
 
 
 def step_train(last: Dict[str, object], resume: bool = False) -> Optional[List[str]]:
@@ -206,6 +226,7 @@ def step_train(last: Dict[str, object], resume: bool = False) -> Optional[List[s
     if pat:
         argv_tail += ["--patience", str(pat)]
     print(color(f"  Остановить вручную после текущей эпохи и перейти к следующему шагу: создать файл {Path(ckdir) / 'STOP'}", "2"))
+    argv_tail += sampling_argv(last)
     workers = ask_int("Процессов загрузки данных", int(last.get("workers", min(4, max(0, (os.cpu_count() or 2) - 1)))), 0, 32)
     last["workers"] = workers
     argv_tail += ["--workers", str(workers)]
@@ -238,24 +259,6 @@ def step_diagnose(last: Dict[str, object]) -> Optional[List[str]]:
     return [sys.executable, "sr_diagnose.py", "-c", ck, "--songs", songs, "--max_songs", str(n), "--write_calibration", "sr_cal.json"]
 
 
-def step_self(last: Dict[str, object]) -> Optional[List[str]]:
-    title("Самообучение по награде + DPO")
-    print("Сеть делает несколько вариантов для звёзд, где карт мало; лучшие по награде попадают в датасет с их настоящими")
-    print("звёздами, плюс пары «человек лучше сети» для DPO. Потом второй раунд обучения на одной видеокарте.")
-    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
-    ck = ask_folder("Чекпойнт", str(last.get("checkpoint", "checkpoints/hybrid/hybrid_best.pt")), must_exist=False)
-    targets = ask("Звёзды (через запятую)", str(last.get("self_targets", "5.5,6.5,7.5,8.5")))
-    cands = ask_int("Вариантов на песню и звёзды", int(last.get("self_cands", 4)), 1, 8)
-    epochs = ask_int("Эпох второго раунда (0 = только сгенерировать)", int(last.get("self_epochs", 5)), 0)
-    last.update(data=data, checkpoint=ck, self_targets=targets, self_cands=cands, self_epochs=epochs)
-    argv = [sys.executable, "make_self_maps.py", "--data", data, "--checkpoint", ck, "--targets", targets,
-            "--candidates", str(cands)]
-    if epochs > 0:
-        argv += ["&&", sys.executable, "train_hybrid.py", "--data", data, "--checkpoint_dir", str(Path(ck).parent), "--resume",
-                 "--epochs", str(epochs), "--dpo_weight", "0.1"]
-    return argv
-
-
 def step_finetune(last: Dict[str, object]) -> Optional[List[str]]:
     title("Дообучение на сложных")
     data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")))
@@ -263,8 +266,9 @@ def step_finetune(last: Dict[str, object]) -> Optional[List[str]]:
     sr = ask_float("Только карты от скольких звёзд", float(last.get("ft_sr", 5.0)))
     e = ask_int("Эпох", int(last.get("ft_epochs", 3)))
     last.update(data=data, ckdir=ckdir, ft_sr=sr, ft_epochs=e)
+    print(color("  Только настоящие сложные карты датасета: сеть сравнивает себя с самими сложными картами, не с синтетикой.", "2"))
     return [sys.executable, "train_hybrid.py", "--data", data, "--checkpoint_dir", ckdir, "--resume", "--epochs", str(e),
-            "--lr", "5e-5", "--finetune_min_sr", f"{sr:g}"]
+            "--lr", "5e-5", "--finetune_min_sr", f"{sr:g}", "--real_only"]
 
 
 def step_models(last: Dict[str, object]) -> Optional[List[str]]:
@@ -281,13 +285,12 @@ def step_models(last: Dict[str, object]) -> Optional[List[str]]:
 
 
 STEPS = [
-    ("Полный цикл", "чистка → подготовка → обучение → диагностика → самообучение"),
+    ("Полный цикл", "чистка → подготовка → обучение → диагностика"),
     ("Чистка архивов", "только нужное для обучения"),
     ("Подготовка датасета", "признаки аудио и параметры карт"),
     ("Обучение сети с нуля", ""),
     ("Продолжить обучение", "с последнего чекпойнта"),
     ("Диагностика звёзд", "где теряются звёзды"),
-    ("Самообучение по награде + DPO", "сложные карты, которых не хватает"),
     ("Дообучение на сложных", "короткий второй этап только на сложных картах"),
     ("Модель паттернов / библиотека мотивов", ""),
 ]
@@ -323,17 +326,17 @@ def main() -> None:
     while True:
         last = load_settings()
         try:
-            k = ask_choice("\nЧто сделать?", STEPS, int(last.get("step", 4)))
+            k = ask_choice("\nЧто сделать?", STEPS, min(len(STEPS), int(last.get("step", 4))))
             last["step"] = k
             plan: List[List[str]] = []
             if k == 1:
-                for fn in (step_clean, step_prepare, step_train, step_diagnose, step_self):
+                for fn in (step_clean, step_prepare, step_train, step_diagnose):
                     a = fn(last)
                     if a:
                         plan.append(a)
             else:
                 fn = {2: step_clean, 3: step_prepare, 4: step_train, 5: lambda l: step_train(l, resume=True),
-                      6: step_diagnose, 7: step_self, 8: step_finetune, 9: step_models}[k]
+                      6: step_diagnose, 7: step_finetune, 8: step_models}[k]
                 a = fn(last)
                 if a:
                     plan.append(a)

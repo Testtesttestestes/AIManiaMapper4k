@@ -1,4 +1,9 @@
 """
+DEPRECATED as a map generator (compose / generate_composer.py): it adds many unneeded notes but does not densify the
+places that really need it, and it is no longer offered by the consoles. Use the network (generate_hybrid.py). The
+song-analysis helpers here (analyze_song, segment_sections, star_rating, find_repeats) are still used by other
+modules and stay supported.
+
 Composer: a planning map generator that never "averages" the difficulty.
 
 Why the plain hybrid decoder averages
@@ -1898,6 +1903,8 @@ def compose(
     motifs=None,
 ) -> ComposeResult:
     """Composes the best of ``cfg.variants`` maps whose star rating matches ``target_sr``."""
+    import warnings
+    warnings.warn("composer.compose is deprecated: use the network (generate_hybrid.py)", DeprecationWarning, stacklevel=2)
     cfg = cfg or ComposerConfig()
     secs = sections if sections is not None else segment_sections(an)
     comp = Composer(an, secs, cfg, hints, log, patterns=patterns, target_sr=target_sr, motifs=motifs)

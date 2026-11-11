@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+DEPRECATED: the composer is no longer maintained and is not offered by mapper_console.py. It adds many notes that
+are not needed but does not make the places that really need denser notes denser. Use the network instead:
+python generate_hybrid.py (or mapper_console.py). Kept only for reference and comparisons; may be removed.
+
 Composer: planned osu!mania 4K maps that hit the requested star rating exactly (osu_mapper/hybrid/composer.py).
 
     python generate_composer.py --template "song.osz" --sr 2,3,4,5,6
@@ -58,6 +62,7 @@ def load_all_maps(path: str, diff: str = "") -> List[ManiaMap]:
 
 
 def main(argv=None) -> None:
+    print("[deprecated] generate_composer.py is deprecated: use generate_hybrid.py / mapper_console.py", file=sys.stderr)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("audio", nargs="?", default=None, help="audio file or template .osz/.osu")
     ap.add_argument("--template", default=None, help="template .osz / .osu / folder: its audio and timing points are used")

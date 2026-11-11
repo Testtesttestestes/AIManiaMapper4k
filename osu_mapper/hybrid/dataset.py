@@ -403,6 +403,7 @@ class HybridCropDataset(Dataset):
         corrupt_prob: float = 0.0,
         plan_prob: float = 0.0,
         rate_max: float = 1.3,
+        hard_tilt: float = 0.0,
     ):
         self.index = index
         self.map_indices = list(map_indices)
@@ -453,6 +454,11 @@ class HybridCropDataset(Dataset):
             bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in self.entries]) + 10 * derived
             counts = np.bincount(bins, minlength=20).astype(np.float64)
             span_len = span_len * counts[bins] ** (-float(sr_balance))
+        if hard_tilt > 0:
+            # harder maps are drawn more often on top of the bin balance: weight x (1 + SR)^hard_tilt
+            # (tilt 1: an 8* map ~3x as often as a 2* map of the same length, tilt 2: ~9x)
+            srs = np.array([max(0.0, float(e.get("sr", 0.0))) for e in self.entries])
+            span_len = span_len * (1.0 + srs) ** float(hard_tilt)
         if derived.any() and (~derived).any() and 0.0 <= derived_weight < 1.0:
             # derived (thinned) maps get a fixed share of the draws, whatever their number
             span_len = span_len.copy()

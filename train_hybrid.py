@@ -319,6 +319,12 @@ def main() -> None:
                          "second stage after the full training, e.g. --resume --finetune_min_sr 5 --epochs 3 --lr 5e-5")
     ap.add_argument("--sr_balance", type=float, default=0.5,
                     help="draw maps of rare star ratings more often: 0 = by length (default), 0.5 = sqrt-balanced, 1 = every 1-star bin equally")
+    ap.add_argument("--hard_tilt", type=float, default=0.0,
+                    help="draw harder maps more often on top of --sr_balance: weight x (1 + SR)^hard_tilt (1 = an 8* map ~3x as "
+                         "often as a 2* map, 2 = ~9x); 0 = off")
+    ap.add_argument("--real_only", action="store_true",
+                    help="train only on the real maps of the dataset: derived (thinned, make_derived_maps.py) and self-generated "
+                         "(make_self_maps.py) maps are left out, and so is DPO (its pairs come from network maps)")
     ap.add_argument("--pitch_shift", type=float, default=0.5,
                     help="share of training crops transposed by +-1..2 semitones in feature space (stops the network from "
                          "recognizing songs; 0 = off)")
@@ -374,6 +380,15 @@ def main() -> None:
     if not train_idx:
         sys.exit("No training maps (did every map fail the roundtrip check?)")
     val_idx = [i for i in val_idx if not index.maps[i].get("derived")]  # validation = real maps only
+    if args.real_only:
+        before = len(train_idx)
+        train_idx = [i for i in train_idx if not index.maps[i].get("derived") and not index.maps[i].get("self")]
+        print(f"[data] real maps only: {len(train_idx)} of {before} training maps (derived / self-generated left out)")
+        if args.dpo_weight > 0:
+            print("[dpo] off with --real_only (the pairs compare human maps with network maps)")
+            args.dpo_weight = 0.0
+        if not train_idx:
+            sys.exit("--real_only: no real training maps")
     if args.finetune_min_sr > 0:
         reach = {}
         if args.rate_aug > 0:
@@ -391,7 +406,8 @@ def main() -> None:
           + f" / val {len(val_idx)} maps (split by {args.split})")
     sr_hist = np.bincount([int(np.clip(float(index.maps[i].get("sr", 0.0)), 0, 9.99)) for i in train_idx], minlength=10)
     print("[data] train maps per star rating: " + ", ".join(f"{b}-{b + 1}*: {int(c)}" for b, c in enumerate(sr_hist) if c)
-          + (f" | sr_balance {args.sr_balance:g}" if args.sr_balance > 0 else ""))
+          + (f" | sr_balance {args.sr_balance:g}" if args.sr_balance > 0 else "")
+          + (f" | hard_tilt {args.hard_tilt:g}" if args.hard_tilt > 0 else ""))
 
     ckpt_dir = Path(args.checkpoint_dir)
     if is_main:
@@ -523,7 +539,11 @@ def main() -> None:
                                  pattern_targets=(args.pattern_weight > 0 or args.prior_weight > 0), motifs=motif_lib,
                                  rate_aug=args.rate_aug, sr_rare=args.sr_rare, rate_max=args.rate_max,
                                  corrupt_prob=args.corrupt_prob if args.canvas_prob > 0 else 0.0,
-                                 plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0)
+                                 plan_prob=args.plan_prob if args.pattern_weight > 0 else 0.0, hard_tilt=args.hard_tilt)
+    draw_bins = np.array([int(np.clip(float(e.get("sr", 0.0)), 0, 9.99)) for e in train_ds.entries])
+    draw_share = np.bincount(draw_bins, weights=train_ds.weights, minlength=10)
+    print("[data] share of training draws per star rating: "
+          + ", ".join(f"{b}-{b + 1}*: {100 * w:.0f}%" for b, w in enumerate(draw_share) if sr_hist[b] or w > 0))
     if auto_batch:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
         probe_items = [train_ds[i] for i in range(12)]

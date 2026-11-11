@@ -435,10 +435,10 @@ def main(argv=None) -> None:
                                 break
                     if not fit.reached:
                         print(f"    [!] {target:.2f}* is not reachable without notes the network does not hear: the closest is "
-                              f"{fit.star_rating:.2f}* (try --min_threshold lower, the composer, or another difficulty)"
+                              f"{fit.star_rating:.2f}* (try --min_threshold lower or another difficulty)"
                               if fit.star_rating < target else
                               f"    [!] even with only the notes the network is sure about the map is {fit.star_rating:.2f}* "
-                              f"(harder than {target:.2f}*): use a lower --sr for this song or the composer")
+                              f"(harder than {target:.2f}*): use a lower --sr for this song")
                 else:
                     notes = decode_outputs(out, dataclasses.replace(knobs, onset_threshold=th), timing)
                 if args.ergonomics > 0:
