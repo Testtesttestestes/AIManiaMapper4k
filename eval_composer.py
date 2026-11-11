@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+DEPRECATED together with the composer (see generate_composer.py).
+
 How close the composer gets to the human maps of the same songs: one table, one number per measure.
 
     python eval_composer.py --songs originals/ --per_song 2 --workers 3
@@ -27,6 +29,7 @@ import dataclasses
 import json
 import math
 import tempfile
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -239,6 +242,7 @@ def table(rows: List[dict]) -> str:
 
 
 def main() -> None:
+    print("[deprecated] eval_composer.py evaluates the deprecated composer", file=sys.stderr)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--songs", required=True, help="folder of .osz files with audio (or one .osz)")
     ap.add_argument("--cache", default="eval_cache")

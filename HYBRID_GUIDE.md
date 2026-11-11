@@ -543,12 +543,17 @@ python mapper_console.py     # или так (Linux/macOS: ./composer.sh)
 
 Программа по шагам спрашивает: файл песни (можно перетащить `.osz` или аудио в окно), сложности («4», «2 4 6»,
 «2,5 3,5», «2-8»), сколько лонгнот (без LN / почти без / немного / смешанно / много / почти одни LN / точный
-процент), насколько смело, какие перепады плотности, сколько вариантов перебрать, использовать ли нейросеть,
-с какой картой архива сравнить, хитсаунды, автора и куда сохранить. Показывает итог, генерирует, печатает ту же
-генерацию одной командой `generate_composer.py` и запоминает ответы (`~/.aimaniamapper/composer_console.json`):
+процент), с какой картой архива сравнить, хитсаунды, автора и куда сохранить. Карту строит нейросеть (без
+обученной сети программа не запускается: композитор устарел и из консоли убран). Показывает итог, генерирует,
+печатает ту же генерацию одной командой `generate_hybrid.py` и запоминает ответы (`~/.aimaniamapper/composer_console.json`):
 в следующий раз можно ответить «да» на «взять настройки прошлого раза» и указать только песню и звёзды.
 
-## 4.6 Композитор: карта нужной сложности без усреднения (`generate_composer.py`)
+## 4.6 Композитор: карта нужной сложности без усреднения (`generate_composer.py`) — УСТАРЕЛ (deprecated)
+
+> **Deprecated.** Композитор больше не развивается и не предлагается консолью: он ставит много лишних нот, но не
+> уплотняет те места, где плотнее действительно нужно. Используйте нейросеть (`generate_hybrid.py`, раздел 4.4.1).
+> Его функции анализа песни (`analyze_song`, `segment_sections`, `star_rating`) по-прежнему используются другими модулями.
+> Ниже — описание для справки.
 
 **Почему обычный гибридный декодер «усредняет».** Сеть предсказывает для каждых 10 мс вероятность ноты. У большинства
 песен одна-две сложности, поэтому вероятность учится как *среднее по мапперам и сложностям*: необязательные ноты
@@ -740,17 +745,28 @@ python train_hybrid.py --data dataset_hybrid --preset base --pitch_shift 0.5 --g
   находить испорченное — это критик самокоррекции;
 * DPO по парам (`--dpo_weight 0.1`, только на одной GPU, пары из `make_self_maps.py`).
 
+**Только настоящие карты (так обучает `train_console.py`).** На практике облегчённые (`make_derived_maps.py`) и
+сгенерированные сетью (`make_self_maps.py`) карты, а также DPO по парам «человек / сеть» делали сеть хуже: паттерны
+сложных мест надо сравнивать с самими сложными картами, а не с синтетикой. Поэтому консоль их больше не создаёт, а
+обучение и дообучение запускает с `--real_only`: производные и `self`-карты, даже если они уже лежат в датасете,
+в обучение не попадают, DPO выключается. Перекос датасета в лёгкие карты выравнивается выборкой:
+* `--sr_balance B` — вес карты × (карт в её звёздной корзине)^−B (1 = все корзины поровну);
+* `--hard_tilt T` — сверху ещё × (1 + SR)^T: при T = 1 карта 8★ берётся ~в 3 раза чаще карты 2★ той же длины, при T = 2 —
+  ~в 9 раз.
+Консоль предлагает: «заметно чаще» (`--sr_balance 0.75 --hard_tilt 1.5`, по умолчанию), «немного чаще» (0.5 / 0.75),
+«намного чаще» (1.0 / 2.5; риск переобучиться на немногих сложных картах) и «как в датасете» (0 / 0). В начале
+обучения печатается итог: `[data] share of training draws per star rating: ...`.
+
 **Порядок (3 GPU):**
 ```powershell
 python audit_dataset_compatibility.py --clean --apply                 # 1. только нужное для обучения
 python prepare_hybrid_dataset.py --input_dir "sample beatmaps" --output_dir dataset_hybrid
-python make_derived_maps.py --data dataset_hybrid                     # (по желанию) облегчённые версии
-torchrun --standalone --nproc_per_node=3 train_hybrid.py --data dataset_hybrid --preset base --batch_size auto --workers 4
+torchrun --standalone --nproc_per_node=3 train_hybrid.py --data dataset_hybrid --preset base --batch_size auto --workers 4 --real_only --sr_balance 0.75 --hard_tilt 1.5
 python sr_diagnose.py -c checkpoints/hybrid/hybrid_best.pt --songs "sample beatmaps" --max_songs 30 --write_calibration sr_cal.json
-python make_self_maps.py --data dataset_hybrid --checkpoint checkpoints/hybrid/hybrid_best.pt   # лучшие по награде + пары
-python train_hybrid.py --data dataset_hybrid --resume --epochs 5 --dpo_weight 0.1               # 2-й раунд с DPO (одна GPU)
-python train_hybrid.py --data dataset_hybrid --resume --epochs 3 --lr 5e-5 --finetune_min_sr 5  # (по желанию) хвост сложных
+python train_hybrid.py --data dataset_hybrid --resume --epochs 3 --lr 5e-5 --finetune_min_sr 5 --real_only  # (по желанию) хвост сложных
 ```
+Устаревший путь (консоль его больше не предлагает): `make_derived_maps.py`, затем `make_self_maps.py` и второй раунд
+`--resume --epochs 5 --dpo_weight 0.1`.
 `--batch_size auto` подбирает батч под память: пробные шаги на настоящих отрезках со всеми потерями прогона, пиковая
 память как прямая от батча, батч на `--mem_fraction 0.9` карты (минус чужие программы, плюс состояние Adam и буферы
 DDP), проверка настоящим шагом, при нехватке памяти −15 %; на нескольких GPU решает самая маленькая карта. Если памяти
