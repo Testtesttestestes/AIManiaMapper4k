@@ -128,6 +128,9 @@ def generate_song(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, tim
     continuations of every phrase (higher = better); without it the first sample is kept."""
     model.eval()
     dev = device or next(model.parameters()).device
+    # inputs are built as features + attacks + sections (data.song_inputs); a model without some of them reads the
+    # first columns only
+    feats_all = feats_all[:, :sum(model.cfg.groups.values())]
     v = model.cfg.vocab()
     W = model.cfg.window_frames
     H = model.cfg.frame_ms

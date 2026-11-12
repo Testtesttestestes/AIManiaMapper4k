@@ -31,7 +31,7 @@ from osu_mapper.hybrid.dataset import HybridIndex, _crop_rows
 from osu_mapper.hybrid.inference import resolve_device
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.v5.critic import CriticConfig, CriticNet, blandify, corrupt, map_frames
-from osu_mapper.v5.data import SongCache
+from osu_mapper.v5.data import SongCache, song_inputs
 
 KINDS = ("human", "bland", "broken", "self", "network")
 
@@ -66,7 +66,7 @@ class CriticData(Dataset):
             win = corrupt(win, rng)
         elif kind in ("self", "network"):
             win = given
-        feats = self.cache.window(e["song_id"], start, self.W)
+        feats = self.cache.window(e["song_id"], start, self.W, tps, sections=False)   # sound + stem attacks
         beat = beat_features(tps, start, self.W, 10)
         return (torch.from_numpy(feats), torch.from_numpy(beat.astype(np.float32)),
                 torch.from_numpy(map_frames(win, s_ms, self.W)), torch.tensor(1.0 if kind == "human" else 0.0),
@@ -112,9 +112,8 @@ def network_maps(index: HybridIndex, cache: SongCache, maps: List[int], ckpt: st
     for mi in maps[:n_maps]:
         e = index.maps[mi]
         tr = index.track(mi)
-        feats = np.asarray(index.features(e["song_id"], 0))
-        att = cache.attacks(e["song_id"])
-        fa = np.concatenate([feats, att], axis=1) if att is not None else np.asarray(feats)
+        fa = song_inputs(np.asarray(index.features(e["song_id"], 0)), cache.slices, tr.timing_points,
+                         highlight=net.cfg.highlight)
         Fr = min(fa.shape[0], int(max_sec * 100))
         out[mi] = generate_song(net, fa[:Fr], beat_features(tr.timing_points, 0, Fr, 10), tr.timing_points,
                                 float(e.get("sr", 0.0)), device=dev)
@@ -151,7 +150,7 @@ def main() -> None:
         pick = random.Random(args.seed).sample(tr_idx, min(len(tr_idx), args.network_windows)) + va_idx
         network = network_maps(index, cache, pick, args.v5, len(pick), dev, args.network_max_sec)
         print(f"[critic] the v5 network mapped {len(network)} songs for negatives ({time.time() - t0:.0f}s)")
-    probe = cache.window(index.maps[tr_idx[0]]["song_id"], 0, 4)
+    probe = cache.window(index.maps[tr_idx[0]]["song_id"], 0, 4, None, sections=False)
     cfg = CriticConfig(feat_dim=probe.shape[1], d_model=args.d_model, window_frames=W)
     net = CriticNet(cfg).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.05)

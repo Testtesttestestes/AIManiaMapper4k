@@ -24,14 +24,16 @@ from ..hybrid.causes import STEMS, note_causes, stem_attacks
 from ..hybrid.dataset import HybridIndex, _crop_rows
 from ..hybrid.metrics import SUBDIV_NAMES, subdivision_classes
 from ..hybrid.renderer import render_track
+from .sections import SECTION_DIM, find_sections, section_features
 from .tokens import Vocab, encode
 
 PHASE_NONE = len(SUBDIV_NAMES)
 
 
-def group_columns(slices: Dict[str, Tuple[int, int]]) -> Dict[str, int]:
-    """Input groups of the source selector, in column order of ``feats + attacks``: every representation, the four
-    demucs stems separately, and the stems' attack curves ("attacks", 4 columns appended after the features)."""
+def group_columns(slices: Dict[str, Tuple[int, int]], sections: bool = True) -> Dict[str, int]:
+    """Input groups of the source selector, in column order of ``feats + attacks + sections``: every representation,
+    the four demucs stems separately, the stems' attack curves ("attacks", 4 columns after the features) and the part
+    of the song ("section", osu_mapper/v5/sections.py, last)."""
     out: Dict[str, int] = {}
     for name, (a, b) in sorted(slices.items(), key=lambda kv: kv[1][0]):
         if name == "demucs_stems" and b - a == 128:
@@ -41,33 +43,62 @@ def group_columns(slices: Dict[str, Tuple[int, int]]) -> Dict[str, int]:
             out[name] = b - a
     if "demucs_stems" in slices:
         out["attacks"] = 4
+    if sections:
+        out["section"] = SECTION_DIM
     return out
 
 
-class SongCache:
-    """Attack curves per song (they need the whole song: robust statistics)."""
+def song_inputs(feats: np.ndarray, slices: Dict[str, Tuple[int, int]], timing_points, sections: bool = True,
+                frame_ms: int = 10, highlight=None) -> np.ndarray:
+    """[F, D] network input of a whole song: features + stem attacks (+ the part of the song of every frame)."""
+    parts = [np.asarray(feats, dtype=np.float32)]
+    att = stem_attacks(feats, slices)
+    if att is not None:
+        parts.append(att)
+    if sections:
+        parts.append(section_features(find_sections(feats, slices, timing_points, frame_ms, highlight=highlight),
+                                      feats.shape[0]))
+    return np.concatenate(parts, axis=1)
 
-    def __init__(self, index: HybridIndex):
+
+class SongCache:
+    """Per-song inputs that need the whole song: stem attack curves (robust statistics) and its parts (sections)."""
+
+    def __init__(self, index: HybridIndex, sections: bool = True, highlight=None):
         self.index = index
-        self.slices = index.data.get("feature_slices") or index.feature_config.slices()
+        self.highlight = list(highlight or [])
+        self.slices = {k: tuple(v) for k, v in (index.data.get("feature_slices") or index.feature_config.slices()).items()}
+        self.use_sections = bool(sections)
         self._att: Dict[str, Optional[np.ndarray]] = {}
+        self._sec: Dict[str, np.ndarray] = {}
 
     def __getstate__(self):
         d = dict(self.__dict__)
         d["_att"] = {}
+        d["_sec"] = {}
         return d
+
+    def sections(self, song_id: str, timing_points) -> np.ndarray:
+        """[F, SECTION_DIM] of the song (with the red lines of the first map that asks for it)."""
+        if song_id not in self._sec:
+            feats = np.asarray(self.index.features(song_id, 0))
+            secs = find_sections(feats, self.slices, timing_points, highlight=self.highlight)
+            self._sec[song_id] = section_features(secs, feats.shape[0])
+        return self._sec[song_id]
 
     def attacks(self, song_id: str) -> Optional[np.ndarray]:
         if song_id not in self._att:
             self._att[song_id] = stem_attacks(np.asarray(self.index.features(song_id, 0)), self.slices)
         return self._att[song_id]
 
-    def window(self, song_id: str, start: int, length: int) -> np.ndarray:
-        f = _crop_rows(self.index.features(song_id, 0), start, length)
+    def window(self, song_id: str, start: int, length: int, timing_points=None, sections: Optional[bool] = None) -> np.ndarray:
+        parts = [_crop_rows(self.index.features(song_id, 0), start, length)]
         att = self.attacks(song_id)
-        if att is None:
-            return f.astype(np.float32)
-        return np.concatenate([f, _crop_rows(att, start, length)], axis=1).astype(np.float32)
+        if att is not None:
+            parts.append(_crop_rows(att, start, length))
+        if self.use_sections if sections is None else sections:
+            parts.append(_crop_rows(self.sections(song_id, timing_points), start, length))
+        return np.concatenate(parts, axis=1).astype(np.float32)
 
 
 def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame: int, vocab: Vocab, W: int,
@@ -88,7 +119,7 @@ def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame
     if ev_ms.size:
         c = note_causes(start_ms + ev_ms, cache.attacks(entry["song_id"]), frame_ms)
         cause[np.clip(ev_ms // frame_ms, 0, W - 1)] = c
-    feats = cache.window(entry["song_id"], start_frame, W)
+    feats = cache.window(entry["song_id"], start_frame, W, timing_points)
     beat = beat_features(timing_points, start_frame, W, frame_ms) if timing_points else np.zeros((W, BEAT_DIM), np.float32)
     style = np.asarray(entry["style"], dtype=np.float32)
     smask = np.asarray(entry["style_mask"], dtype=np.float32) if style_known else np.zeros_like(style)
@@ -117,9 +148,9 @@ class V5Dataset(Dataset):
     def __init__(self, index: HybridIndex, map_indices: Sequence[int], vocab: Vocab, window_frames: int,
                  samples: int, seed: int = 0, train: bool = True, sr_balance: float = 0.5, hard_tilt: float = 0.0,
                  hard_share: float = 0.0, style_known_prob: float = 0.5, fixed: Optional[List[Tuple[int, int]]] = None,
-                 max_tokens: int = 1536):
+                 max_tokens: int = 1536, sections: bool = True, highlight=None):
         self.index = index
-        self.cache = SongCache(index)
+        self.cache = SongCache(index, sections, highlight)
         self.map_indices = list(map_indices)
         self.vocab = vocab
         self.W = int(window_frames)

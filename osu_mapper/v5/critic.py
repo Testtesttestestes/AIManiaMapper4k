@@ -160,6 +160,7 @@ class Critic:
         from ..hybrid.dataset import _crop_rows
 
         W = self.net.cfg.window_frames
+        feats_all = feats_all[:, :self.net.cfg.feat_dim]
         s = max(0, end_ms // frame_ms - W)
         f = torch.from_numpy(_crop_rows(feats_all, s, W).astype(np.float32))[None].to(self.dev)
         b = torch.from_numpy(_crop_rows(beat_all, s, W).astype(np.float32))[None].to(self.dev)

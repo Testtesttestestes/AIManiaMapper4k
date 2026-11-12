@@ -49,6 +49,10 @@ class V5Config:
     max_tokens: int = 1536
     window_ms: int = 10240
     len_steps: int = 1000
+    regimes: int = 16                    # slots of latent regimes of the song's parts (RegimeModule)
+    regimes_active: int = 4              # slots in use; train_v5.py --grow_every splits the worst one (MarI/O-like)
+    regime_rank: int = 32
+    highlight: List[float] = field(default_factory=list)   # climax model of osu_mapper/v5/sections.py (from kiai)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -96,6 +100,78 @@ class SourceSelector(nn.Module):
         e = torch.stack([m(x) for m, x in zip(self.embed, parts)], dim=2)          # [B, T, G, d]
         w = torch.softmax(self.score(e.flatten(2)), dim=-1)                          # [B, T, G]
         return (e * w.unsqueeze(-1)).sum(dim=2), w
+
+
+class RegimeModule(nn.Module):
+    """Latent regimes of the song's parts, learned only from the maps (no names, no labels).
+
+    The encoder states of every part of the song (boundaries from osu_mapper/v5/sections.py; 2 s blocks without them)
+    are pooled; a part picks one of the active regimes (straight-through Gumbel-softmax in training, argmax at
+    generation), and the regime adds its own embedding and its own low-rank adapter ("its own handwriting") to every
+    frame of the part. Nothing tells the network what a solo or a drop is: if mappers treat two kinds of parts
+    differently, separating them into two regimes lowers the loss, so it learns to.
+
+    ``grow(src)`` copies regime ``src`` into the next free slot with a little noise and splits its probability in
+    two (Net2Net-style growth, the "grow where it errs" of MarI/O / NEAT): the copies then specialise."""
+
+    def __init__(self, d: int, slots: int, active: int, rank: int):
+        super().__init__()
+        self.slots = int(slots)
+        self.register_buffer("active", torch.tensor(int(min(active, slots))))
+        self.score = nn.Linear(d, slots)
+        self.emb = nn.Parameter(torch.randn(slots, d) * 0.02)
+        self.down = nn.Parameter(torch.randn(slots, d, rank) * (1.0 / math.sqrt(d)))
+        self.up = nn.Parameter(torch.zeros(slots, rank, d))
+        self.tau = 1.0
+
+    def forward(self, x: torch.Tensor, seg: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """x [B, T, d], seg [B, T] part index inside the window -> (x with the regimes added, regime of every frame)."""
+        B, T, d = x.shape
+        S = int(seg.max()) + 1
+        pooled = torch.zeros(B, S, d, device=x.device, dtype=x.dtype).scatter_add_(1, seg[..., None].expand(-1, -1, d), x)
+        cnt = torch.zeros(B, S, device=x.device, dtype=x.dtype).scatter_add_(1, seg, torch.ones_like(seg, dtype=x.dtype))
+        pooled = pooled / cnt.clamp(min=1.0)[..., None]
+        logits = self.score(pooled).float()
+        mask = torch.arange(self.slots, device=x.device) >= self.active
+        logits = logits.masked_fill(mask, float("-inf"))
+        if self.training:
+            g = -torch.log(-torch.log(torch.rand_like(logits).clamp(1e-9, 1 - 1e-9)))
+            soft = torch.softmax((logits + g) / self.tau, dim=-1)
+            hard = F.one_hot(soft.argmax(-1), self.slots).float()
+            z = hard + soft - soft.detach()                                                    # [B, S, K]
+        else:
+            z = F.one_hot(logits.argmax(-1), self.slots).float()
+        zf = torch.gather(z, 1, seg[..., None].expand(-1, -1, self.slots)).to(x.dtype)          # [B, T, K]
+        h = torch.einsum("btd,kdr->btkr", x, self.down.to(x.dtype))
+        h = torch.einsum("btkr,krd->btkd", F.gelu(h), self.up.to(x.dtype))
+        out = x + zf @ self.emb.to(x.dtype) + (zf.unsqueeze(-1) * h).sum(2)
+        return out, zf.argmax(-1)
+
+    @torch.no_grad()
+    def grow(self, src: int, noise: float = 0.01) -> Optional[int]:
+        k = int(self.active)
+        if k >= self.slots:
+            return None
+        self.emb[k] = self.emb[src] + noise * torch.randn_like(self.emb[src])
+        self.down[k] = self.down[src] + noise * torch.randn_like(self.down[src]) / math.sqrt(self.down.shape[1])
+        self.up[k] = self.up[src].clone()
+        self.score.weight[k] = self.score.weight[src]
+        self.score.bias[k] = self.score.bias[src] - math.log(2.0)
+        self.score.bias[src] -= math.log(2.0)
+        self.active.fill_(k + 1)
+        return k
+
+
+def part_index(section_cols: Optional[torch.Tensor], T: int, B: int, device, block: int = 200) -> torch.Tensor:
+    """[B, T] index of the song part of every frame inside the window: a new part where the 'position in the part'
+    column of the section features restarts (sections.section_features), else 2 s blocks."""
+    if section_cols is None:
+        return (torch.arange(T, device=device) // block)[None].expand(B, -1).contiguous()
+    from .sections import LABELS
+    pos = section_cols[..., len(LABELS) + 9]
+    new = torch.zeros(B, T, dtype=torch.long, device=device)
+    new[:, 1:] = (pos[:, 1:] < pos[:, :-1] - 1e-6).long()
+    return new.cumsum(1)
 
 
 class MHA(nn.Module):
@@ -185,6 +261,7 @@ class V5Net(nn.Module):
         self.conv = nn.Sequential(nn.Conv1d(d, d, 7, padding=3), nn.GELU(), nn.Conv1d(d, d, 7, padding=3), nn.GELU())
         self.enc = nn.ModuleList([EncLayer(d, cfg.n_heads, cfg.ff_mult, cfg.dropout) for _ in range(cfg.enc_layers)])
         self.enc_norm = nn.LayerNorm(d)
+        self.regime = RegimeModule(d, cfg.regimes, cfg.regimes_active, cfg.regime_rank) if cfg.regimes > 0 else None
         self.cause_head = nn.Linear(d, len(CAUSES))
         V = cfg.vocab().size
         self.tok = nn.Embedding(V, d)
@@ -236,10 +313,18 @@ class V5Net(nn.Module):
         x, w = self.selector(self.split_groups(feats, beat))
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
         x = x + sinusoid(x.shape[1], x.shape[2], x.device)[None]
-        for layer in self.enc:
+        half = len(self.enc) // 2
+        regime = None
+        for i, layer in enumerate(self.enc):
+            if i == half and self.regime is not None:
+                sec = None
+                if "section" in self.cfg.groups:
+                    a = sum(wd for n, wd in self.cfg.groups.items() if list(self.cfg.groups).index(n) < list(self.cfg.groups).index("section"))
+                    sec = feats[..., a:a + self.cfg.groups["section"]]
+                x, regime = self.regime(x, part_index(sec, x.shape[1], x.shape[0], x.device))
             x = layer(x)
         x = self.enc_norm(x)
-        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x)}
+        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x), "regime": regime}
 
     def condition(self, sr: torch.Tensor, style: torch.Tensor, style_mask: torch.Tensor,
                   drop: Optional[torch.Tensor] = None) -> torch.Tensor:

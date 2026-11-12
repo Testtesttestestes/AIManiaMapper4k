@@ -30,7 +30,9 @@ from osu_mapper.hybrid.beatmap import ManiaMap, RawTimingPoint, map_to_osu_text
 from osu_mapper.hybrid.causes import CAUSES, stem_attacks
 from osu_mapper.hybrid.inference import estimated_timing_points, prepare_song_inputs, resolve_device, star_rating_of
 from osu_mapper.v5.generate import generate_song
+from osu_mapper.v5.data import song_inputs
 from osu_mapper.v5.model import V5Config, V5Net
+from osu_mapper.v5.sections import describe, find_sections, kiai_timing_points
 
 
 def make_scorer(critic, feats_all, beat_all, timing, sr, lane_pred, power, critic_weight: float, reward_weight: float):
@@ -101,6 +103,8 @@ def main(argv=None) -> None:
     ap.add_argument("--od", type=float, default=8.0)
     ap.add_argument("--hp", type=float, default=8.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no_kiai", action="store_true",
+                    help="do not add kiai time: by default the climaxes the network finds (chorus / drop) get kiai")
     ap.add_argument("--why", action="store_true", help="print what the network listened to and what the notes follow")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -135,8 +139,9 @@ def main(argv=None) -> None:
             print(f"[timing] estimated red line: {60000.0 / timing[0].beat_len:.2f} BPM, offset {timing[0].time:.0f} ms "
                   "(use --bpm/--offset or a template for exact timing)")
         feats = inputs.feats
-        att = stem_attacks(feats, fcfg.slices())
-        feats_all = np.concatenate([feats, att], axis=1) if att is not None else feats
+        feats_all = song_inputs(feats, fcfg.slices(), timing, highlight=cfg.highlight)   # features + attacks + parts
+        secs = find_sections(feats, fcfg.slices(), timing, highlight=cfg.highlight)
+        print(f"[sections] {describe(secs)}")
         beat_all = beat_features(timing, 0, feats.shape[0], fcfg.frame_ms)
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, features in {time.time() - t0:.1f}s")
 
@@ -178,7 +183,8 @@ def main(argv=None) -> None:
                   f"(asked {target:.2f}) in {time.time() - t1:.1f}s")
             if args.why:
                 explain(model, feats_all, beat_all, notes, dev)
-            m = ManiaMap(notes=notes, timing_points=timing, overall_difficulty=args.od, hp_drain=args.hp,
+            tps_out = timing if args.no_kiai else kiai_timing_points(secs, timing)
+            m = ManiaMap(notes=notes, timing_points=tps_out, overall_difficulty=args.od, hp_drain=args.hp,
                          metadata={"Title": title, "Artist": artist, "Creator": args.creator, "Version": version,
                                    "AudioFilename": audio_path.name})
             items.append((BeatmapMetadata(title=title, artist=artist, creator=args.creator, version=version,
