@@ -59,6 +59,8 @@ class V5Config:
 
     @staticmethod
     def from_dict(d: Dict) -> "V5Config":
+        d = dict(d)
+        d.setdefault("regimes", 0)          # checkpoints made before the regimes existed
         return V5Config(**d)
 
     def vocab(self) -> Vocab:

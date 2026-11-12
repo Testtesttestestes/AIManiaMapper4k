@@ -243,6 +243,21 @@ def step_v5(last: Dict[str, object], resume: bool = False) -> Optional[List[str]
     return launcher(last, "train_v5.py") + tail + ["--workers", str(workers)]
 
 
+def step_meta(last: Dict[str, object]) -> Optional[List[str]]:
+    title("Мета-модель риса v5")
+    print("Мета-разметка (как в трейдинге: первая модель предлагает сделку, вторая решает, входить ли): сеть предлагает рис,")
+    print("мета-модель по звуку места, части песни и форме вспышки решает, сыпал бы его здесь человек на этой сложности.")
+    print("Учится на рисе соседних сложностей той же песни (и на рисе самой сети). При генерации отклонённый рис → 1/2.")
+    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    ckdir = ask_folder("Папка чекпойнтов v5", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
+    last.update(data=data, ckdir_v5=ckdir)
+    argv = [sys.executable, "train_meta.py", "--data", data, "--checkpoint_dir", ckdir]
+    best = Path(ckdir) / "v5_best.pt"
+    if best.exists() and ask_yes("Добавить рис самой сети v5 как предложения (дольше, но точнее для её ошибок)", True):
+        argv += ["--v5", str(best)]
+    return argv
+
+
 def step_critic(last: Dict[str, object]) -> Optional[List[str]]:
     title("Критик v5")
     print("Сеть-оценщик «похоже на работу человека?» для поиска при генерации (generate_v5.py --search 4).")
@@ -393,6 +408,7 @@ STEPS = [
     ("Обучение v5", "новая сеть: ноты по очереди, слышит вокал/барабаны отдельно"),
     ("Дообучение v5", "продолжить или дообучить с малой скоростью"),
     ("Критик v5", "оценщик для поиска лучшего варианта фразы при генерации"),
+    ("Мета-модель риса v5", "решает, сыпал бы человек рис в этом месте (иначе рис → 1/2)"),
 ]
 
 
@@ -437,7 +453,7 @@ def main() -> None:
             else:
                 fn = {2: step_clean, 3: step_prepare, 4: step_train, 5: lambda l: step_train(l, resume=True),
                       6: step_diagnose, 7: step_finetune, 8: step_models, 9: step_v2_recipe, 10: step_v5,
-                      11: lambda l: step_v5(l, resume=True), 12: step_critic}[k]
+                      11: lambda l: step_v5(l, resume=True), 12: step_critic, 13: step_meta}[k]
                 a = fn(last)
                 if a:
                     plan.append(a)

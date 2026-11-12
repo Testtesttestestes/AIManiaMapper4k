@@ -53,9 +53,30 @@ def make_scorer(critic, feats_all, beat_all, timing, sr, lane_pred, power, criti
 
 
 @torch.no_grad()
-def explain(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, notes, dev, phrase_s: float = 5.0) -> None:
-    """Per phrase: the source selector's mean weight of every input group, and the causes of the notes."""
+def why_notes(model: V5Net, feats_all, beat_all, notes, timing, sr, dev, max_events: int = 40) -> None:
+    """Per-note attribution (integrated gradients) of the bursts and of the other notes of the generated map."""
+    from osu_mapper.hybrid.metrics import bursts
+    from osu_mapper.v5.explain import explain_notes, format_shares, summarize
+
+    t = np.array(sorted({n.start for n in notes}), dtype=np.float64)
+    if not t.size:
+        return
+    inb = np.zeros(t.size, dtype=bool)
+    for a, b in bursts(t, timing):
+        inb |= (t >= a) & (t <= b)
+    for name, sel in (("burst notes", inb), ("other notes", ~inb)):
+        if sel.any():
+            rows = explain_notes(model, feats_all, beat_all, notes, timing, sr, times=t[sel].tolist(),
+                                 max_events=max_events, steps=8, device=dev)
+            print(f"[why] {name} ({int(sel.sum())}): decided by {format_shares(summarize(rows), 5)} "
+                  f"| input groups: {format_shares(summarize(rows, groups=True), 4)}")
+
+
+def explain(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, notes, dev, secs=None, phrase_s: float = 5.0) -> None:
+    """Per phrase: the part of the song, the source selector's mean weight of every input group, the causes of the notes."""
     from osu_mapper.hybrid.dataset import _crop_rows
+
+    feats_all = feats_all[:, :sum(model.cfg.groups.values())]
 
     W = model.cfg.window_frames
     names = list(model.cfg.groups) + ["beat"]
@@ -77,7 +98,8 @@ def explain(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, notes, de
             if 0 <= fr < W:
                 causes.append(int(enc["cause_logits"][0, fr].argmax()))
         cs = np.bincount(causes, minlength=len(CAUSES)) / max(1, len(causes))
-        print(f"  {s / 100:6.1f}s  listens: " + ", ".join(f"{names[i]} {100 * w[i]:.0f}%" for i in top)
+        part = next((x.label for x in (secs or []) if x.start <= s < x.end), "")
+        print(f"  {s / 100:6.1f}s {part:<9} listens: " + ", ".join(f"{names[i]} {100 * w[i]:.0f}%" for i in top)
               + f" | {len(ns):3d} notes follow: " + (", ".join(f"{CAUSES[k]} {100 * cs[k]:.0f}%" for k in np.argsort(-cs)[:3] if cs[k] > 0) or "-"))
 
 
@@ -103,6 +125,9 @@ def main(argv=None) -> None:
     ap.add_argument("--od", type=float, default=8.0)
     ap.add_argument("--hp", type=float, default=8.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--meta", default=None, help="meta model of bursts (train_meta.py; default: meta.pt next to the checkpoint)")
+    ap.add_argument("--no_meta", action="store_true", help="keep every burst the network makes")
+    ap.add_argument("--meta_threshold", type=float, default=None)
     ap.add_argument("--no_kiai", action="store_true",
                     help="do not add kiai time: by default the climaxes the network finds (chorus / drop) get kiai")
     ap.add_argument("--why", action="store_true", help="print what the network listened to and what the notes follow")
@@ -145,6 +170,13 @@ def main(argv=None) -> None:
         beat_all = beat_features(timing, 0, feats.shape[0], fcfg.frame_ms)
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, features in {time.time() - t0:.1f}s")
 
+        meta = None
+        mpath = Path(args.meta) if args.meta else Path(args.checkpoint).with_name("meta.pt")
+        if not args.no_meta and mpath.exists():
+            from osu_mapper.v5.meta import MetaFilter
+            mck = torch.load(mpath, map_location="cpu", weights_only=False)
+            meta = MetaFilter.load(mpath, dev, args.meta_threshold if args.meta_threshold is not None else mck.get("threshold", 0.35))
+            print(f"[meta] bursts checked by {mpath} (threshold {meta.threshold:g}): a rejected burst collapses to 1/2")
         critic = None
         cpath = Path(args.critic) if args.critic else Path(args.checkpoint).with_name("critic.pt")
         if args.search > 1 and cpath.exists():
@@ -177,12 +209,17 @@ def main(argv=None) -> None:
             notes = generate_song(model, feats_all, beat_all, timing, target, candidates=args.search, score_fn=score_fn,
                                   temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed,
                                   device=dev)
+            meta_info = ""
+            if meta is not None:
+                notes, rep = meta.apply(feats_all, beat_all, notes, timing, target)
+                meta_info = f", meta: {int(rep['sized_down'])} of {int(rep['bursts'])} bursts sized down to 1/2"
             sr_val = star_rating_of(notes, timing, args.od)
             version = f"v5 {target:.2f}*"
             print(f"[{version}] {len(notes)} notes ({sum(n.ln for n in notes)} LN), star rating {sr_val:.2f} "
-                  f"(asked {target:.2f}) in {time.time() - t1:.1f}s")
+                  f"(asked {target:.2f}) in {time.time() - t1:.1f}s{meta_info}")
             if args.why:
-                explain(model, feats_all, beat_all, notes, dev)
+                explain(model, feats_all, beat_all, notes, dev, secs)
+                why_notes(model, feats_all, beat_all, notes, timing, target, dev)
             tps_out = timing if args.no_kiai else kiai_timing_points(secs, timing)
             m = ManiaMap(notes=notes, timing_points=tps_out, overall_difficulty=args.od, hp_drain=args.hp,
                          metadata={"Title": title, "Artist": artist, "Creator": args.creator, "Version": version,
