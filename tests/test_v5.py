@@ -89,7 +89,7 @@ class TestModel(unittest.TestCase):
         notes = [n for n in random_notes(1, 80) if n.start < 1280 and not (n.ln and n.end - n.start > 9000)]
         b = self._batch(cfg, notes)
         with torch.no_grad():
-            full = m(b)["logits"][0]
+            full = m.full_logprobs(m(b)["parts"])[0]
             enc = m.encode(b["feats"], b["beat"])
             cond = m.condition(b["sr"], b["style"], b["style_mask"])
             mem = m.memory_kv(enc["memory"])
@@ -115,7 +115,7 @@ class TestModel(unittest.TestCase):
         notes = [n for n in random_notes(2, 60) if n.start < 1280 and not n.ln]
         b = self._batch(cfg, notes)
         m.train()
-        loss, logs = v5_losses(m(b), b)
+        loss, logs = v5_losses(m(b), b, window_ms=cfg.window_ms)
         loss.backward()
         self.assertTrue(np.isfinite(logs["total"]))
         m.eval()
@@ -285,3 +285,33 @@ class TestLongNotes(unittest.TestCase):
         out, rep = mf.apply(np.zeros((500, 4), np.float32), np.zeros((500, 13), np.float32), notes, tps, 5.0)
         self.assertEqual(rep["ln_bursts_kept"], rep["bursts"])
         self.assertEqual(sorted(out), sorted(notes))
+
+
+class TestFactorizedTime(unittest.TestCase):
+    def test_loss_equals_full_cross_entropy(self):
+        """The factorized loss is the cross-entropy of the full distribution (which sums to 1)."""
+        from osu_mapper.v5.model import V5Config, V5Net, v5_losses
+        from osu_mapper.v5.tokens import encode
+        from osu_mapper.v5.data import collate, PHASE_NONE
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+                       window_ms=1280, max_tokens=256, regimes=0)
+        m = V5Net(cfg).eval()
+        v = cfg.vocab()
+        notes = [Note(100 + 97 * i, i % 4, 100 + 97 * i + (300 if i % 3 == 0 else 0), i % 3 == 0) for i in range(10)]
+        toks = torch.tensor(encode(notes, 0, v)[0])
+        is_t = torch.from_numpy(v.is_time(toks.numpy()).astype(np.int64))
+        fr, cur = [], -1
+        for t in toks.tolist():
+            cur = t - v.time0 if v.time0 <= t < v.mask0 else cur
+            fr.append(cur // 10 if cur >= 0 else -1)
+        b = collate([{"feats": torch.randn(128, 6), "beat": torch.randn(128, 13), "tokens": toks,
+                      "phase": torch.full_like(toks, PHASE_NONE), "tok_frame": torch.tensor(fr), "is_time": is_t,
+                      "cause": torch.full((128,), -1), "sr": torch.tensor([4.0]), "style": torch.zeros(11),
+                      "style_mask": torch.zeros(11)}])
+        with torch.no_grad():
+            out = m(b)
+            full = m.full_logprobs(out["parts"])[0, :-1]
+            self.assertTrue(torch.allclose(full.exp().sum(-1), torch.ones(full.shape[0]), atol=1e-4))
+            ref = -full.gather(-1, toks[1:].unsqueeze(-1)).squeeze(-1).mean()
+            _, logs = v5_losses(out, b, label_smoothing=0.0, window_ms=cfg.window_ms)
+        self.assertAlmostEqual(logs["tokens"], float(ref), places=4)
