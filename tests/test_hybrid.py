@@ -1282,3 +1282,36 @@ class TestNoteRewardsAndStitch(unittest.TestCase):
         self.assertLessEqual(a, 600)
         self.assertGreaterEqual(b, 790)
         self.assertLess(b - a, 260)
+
+
+class TestCausesAndExpressive(unittest.TestCase):
+    def test_causes_follow_the_attacking_stem(self):
+        from osu_mapper.hybrid.causes import CAUSES, note_causes, stem_attacks
+        F = 1000
+        feats = np.zeros((F, 128), np.float32)
+        feats[:, :] = np.random.default_rng(0).normal(0, 0.01, (F, 128))
+        for f in range(50, F, 100):
+            feats[f:f + 5, 96:128] += 3.0           # vocal syllables
+        for f in range(100, F, 200):
+            feats[f:f + 3, 0:32] += 5.0             # drum hits
+        att = stem_attacks(feats, {"demucs_stems": (0, 128)})
+        self.assertEqual(att.shape, (F, 4))
+        c = note_causes([505, 1000, 3333], att)
+        self.assertEqual(CAUSES[c[0]], "vocals")
+        self.assertEqual(CAUSES[c[1]], "drums")
+        self.assertEqual(CAUSES[c[2]], "grid")
+        self.assertTrue((note_causes([505], None) == len(CAUSES) - 1).all())
+
+    def test_expressive_report(self):
+        from osu_mapper.hybrid.metrics import bursts, expressive_report, expressive_score
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        halves = [Note(i * 250, i % 4, i * 250, False) for i in range(64)]
+        rice = halves[:32] + [Note(8000 + i * 125, i % 4, 8000 + i * 125, False) for i in range(16)] + halves[40:]
+        self.assertEqual(len(bursts(np.array([n.start for n in rice]), tps)), 1)
+        same = expressive_report(rice, rice, tps)
+        self.assertAlmostEqual(same["burst_f1"], 1.0)
+        self.assertAlmostEqual(expressive_score(same), 1.0)
+        bland = expressive_report(halves, rice, tps)          # the bland map leaves the burst out
+        self.assertEqual(bland["burst_f1"], 0.0)
+        self.assertGreater(bland["subdiv_tv"], 0.1)
+        self.assertLess(expressive_score(bland), expressive_score(same))
