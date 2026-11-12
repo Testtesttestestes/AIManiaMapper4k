@@ -174,7 +174,7 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
-            tot, n = tot + float(loss), n + 1
+            tot, n = tot + loss.item(), n + 1
         net.eval()
         right = {k: [0, 0] for k in KINDS}
         with torch.no_grad():
@@ -184,9 +184,11 @@ def main() -> None:
                     right[KINDS[ki]][0] += int(pi == (yi > 0.5))
                     right[KINDS[ki]][1] += 1
         acc = {k: c / t for k, (c, t) in right.items() if t}
-        bal = float(np.mean(list(acc.values()))) if acc else 0.0
+        neg = [v for k, v in acc.items() if k != "human"]
+        # half human, half the negatives: "everything is fake" scores 0.5, not 2/3
+        bal = 0.5 * acc.get("human", 0.0) + 0.5 * (float(np.mean(neg)) if neg else 0.0)
         print(f"[critic {ep}] train loss {tot / max(1, n):.4f} ({time.time() - t0:.0f}s) | held-out accuracy "
-              + " ".join(f"{k} {v:.2f}" for k, v in acc.items()) + f" | mean {bal:.3f}", flush=True)
+              + " ".join(f"{k} {v:.2f}" for k, v in acc.items()) + f" | balanced {bal:.3f}", flush=True)
         if bal > best:
             best = bal
             torch.save({"config": cfg.to_dict(), "model": net.state_dict(), "accuracy": acc}, out / "critic.pt")

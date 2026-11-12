@@ -163,6 +163,12 @@ def main() -> None:
     model = V5Net(cfg).to(dev)
     if resume:
         model.load_state_dict(resume["model"])
+    else:
+        gaps = []
+        for i in train_idx[:2000]:
+            t = np.unique([n.start // cfg.frame_ms for n in render_track(index.track(i))])
+            gaps.append(np.diff(t))
+        model.init_distance_prior(np.concatenate(gaps) if gaps else [10])
     ema = copy.deepcopy(model).eval() if args.ema > 0 else None
     if resume and ema is not None and resume.get("ema"):
         ema.load_state_dict(resume["ema"])

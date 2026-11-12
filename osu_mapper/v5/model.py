@@ -208,6 +208,20 @@ class V5Net(nn.Module):
         self.dist_bias = nn.Embedding(MAX_DIST + 2, 1)
         nn.init.zeros_(self.dist_bias.weight)
 
+    @torch.no_grad()
+    def init_distance_prior(self, gaps_frames) -> None:
+        """Starts the distance bias of the time pointer at the log-frequency of the gaps between events in the
+        training maps (a learned bias from zero moves ~1e-3 per step and would take thousands of steps to say "the
+        next note is near"); earlier frames start very unlikely."""
+        import numpy as np
+
+        g = np.clip(np.asarray(gaps_frames, dtype=np.int64), 0, MAX_DIST)
+        h = np.bincount(g, minlength=MAX_DIST + 1).astype(np.float64) + 1.0
+        logp = np.log(h / h.sum())
+        w = self.dist_bias.weight
+        w[0, 0] = float(logp.min()) - 5.0
+        w[1:, 0] = torch.from_numpy(logp - logp.max()).to(w)
+
     # --- encoder ---------------------------------------------------------------------------------------------------
     def split_groups(self, feats: torch.Tensor, beat: torch.Tensor) -> List[torch.Tensor]:
         parts, a = [], 0

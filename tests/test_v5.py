@@ -155,3 +155,14 @@ class TestCriticAndMining(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDistancePrior(unittest.TestCase):
+    def test_prior_prefers_usual_gaps(self):
+        from osu_mapper.v5.model import V5Config, V5Net
+        m = V5Net(V5Config(groups={"a": 4}, d_model=16, enc_layers=1, dec_layers=1, n_heads=2, window_frames=64,
+                           window_ms=640, max_tokens=64))
+        m.init_distance_prior([12] * 50 + [25] * 20 + [3] * 2)
+        w = m.dist_bias.weight[:, 0]
+        self.assertEqual(int(w[1:].argmax()) , 12)        # index = distance + 1, weights[1:] start at distance 0
+        self.assertLess(float(w[0]), float(w[1:].min()))  # the past is least likely
