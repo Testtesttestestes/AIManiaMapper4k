@@ -408,6 +408,9 @@ def main() -> None:
                           f"| rhythm distance {summary.get('subdiv_tv', float('nan')):.3f} | 1/4 and finer "
                           f"{100 * summary.get('fine_share_pred', 0):.0f}% vs {100 * summary.get('fine_share_ref', 0):.0f}% "
                           f"| density per bar r={summary.get('bar_density_corr', 0):.2f}")
+                    print(f"[epoch {epoch}] long notes: {100 * summary.get('ln_share_pred', 0):.0f}% of notes vs "
+                          f"{100 * summary.get('ln_share_ref', 0):.0f}% | LN starts F1 {summary.get('ln_start_f1', 0):.3f} "
+                          f"| LN lengths distance {summary.get('ln_len_tv', float('nan')):.3f} | LN F1 {summary.get('ln_f1', 0):.3f}")
                     score = summary.get("event_f1@16", 0.0) + args.expressive_weight * summary.get("expressive", 0.0)
                 else:
                     score = -rec.get("val_tokens", float(step))

@@ -244,3 +244,44 @@ class TestSectionsRegimesExplainMeta(unittest.TestCase):
         self.assertEqual(net(torch.from_numpy(fr.astype(np.float32))[None], torch.from_numpy(sh)[None]).shape, (1,))
         self.assertTrue(span_has_burst((0, 1000), [(400, 1200)]))
         self.assertFalse(span_has_burst((0, 1000), [(900, 1200)]))
+
+
+class TestLongNotes(unittest.TestCase):
+    def test_ln_counts_in_expressiveness(self):
+        from osu_mapper.hybrid.metrics import expressive_report, expressive_score
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        ln_map = [Note(i * 500, i % 4, i * 500 + 1000, True) for i in range(40)]
+        taps = [Note(n.start, n.col, n.start, False) for n in ln_map]
+        good = expressive_report(ln_map, ln_map, tps)
+        bad = expressive_report(taps, ln_map, tps)               # same rhythm, the long notes lost
+        self.assertAlmostEqual(good["ln_start_f1"], 1.0)
+        self.assertEqual(bad["ln_share_pred"], 0.0)
+        self.assertLess(expressive_score(bad), expressive_score(good) - 0.3)
+        # a map without long notes is judged by its rhythm only
+        r = expressive_report(taps, taps, tps)
+        rhythm = 0.4 * r["burst_f1"] + 0.3 * (1 - r["subdiv_tv"]) + 0.3 * max(0.0, r["bar_density_corr"])
+        self.assertAlmostEqual(expressive_score(r), rhythm)
+
+    def test_critic_ln_damage_and_meta_keeps_ln_bursts(self):
+        import random as _r
+        from osu_mapper.v5.critic import corrupt
+        from osu_mapper.v5.meta import MetaFilter, BurstMeta, MetaConfig
+        notes = [Note(1000 + i * 125, i % 4, 1000 + i * 125 + 400, True) for i in range(16)]
+        rng = _r.Random(0)
+        kinds = set()
+        for _ in range(40):
+            out = corrupt(notes, rng)
+            kinds.add((sum(n.ln for n in out), len(out)))
+            for c in range(4):
+                lane = sorted((n for n in out if n.col == c), key=lambda n: n.start)
+                for a, b in zip(lane, lane[1:]):
+                    self.assertGreaterEqual(b.start, (a.end if a.ln else a.start) + 30)
+        self.assertGreater(len(kinds), 2)
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        net = BurstMeta(MetaConfig(feat_dim=4, cols=[0, 1, 2, 3]))
+        with torch.no_grad():
+            net.head[-1].bias.fill_(-20.0)                         # rejects everything
+        mf = MetaFilter(net, torch.device("cpu"), 0.35)
+        out, rep = mf.apply(np.zeros((500, 4), np.float32), np.zeros((500, 13), np.float32), notes, tps, 5.0)
+        self.assertEqual(rep["ln_bursts_kept"], rep["bursts"])
+        self.assertEqual(sorted(out), sorted(notes))

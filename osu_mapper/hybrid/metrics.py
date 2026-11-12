@@ -241,15 +241,57 @@ def expressive_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], tim
     bars_p = bars_p[(bars_p >= lo) & (bars_p <= hi)]
     cp = np.bincount(bars_p - lo, minlength=hi - lo + 1).astype(np.float64)
     rep["bar_density_corr"] = float(np.corrcoef(cp, cr)[0, 1]) if cp.std() > 0 and cr.std() > 0 else 0.0
+    rep.update(ln_report(pred_notes, ref_notes, timing_points))
+    return rep
+
+
+LN_BEAT_BINS = (0.0, 0.5, 1.0, 2.0, 4.0, 1e9)      # long note lengths in beats: < 1/2, 1/2-1, 1-2, 2-4, > 4
+
+
+def ln_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], timing_points) -> Dict[str, float]:
+    """Long notes against the reference: ``ln_share_pred/ref`` (share of notes that are LNs), ``ln_start_f1`` (LN
+    starts matched within 32 ms, any lane), ``ln_len_tv`` (distance of the LN length histograms in beats)."""
+    from .motifs import beat_positions
+
+    def lens(notes):
+        ln = [n for n in notes if n.ln and n.end > n.start]
+        if not ln:
+            return np.zeros(0), np.zeros(0)
+        st = np.array([n.start for n in ln], dtype=np.float64)
+        _, bl, _ = beat_positions(st, timing_points)
+        return st, np.array([n.end - n.start for n in ln]) / bl
+
+    ps, pl = lens(pred_notes)
+    rs, rl = lens(ref_notes)
+    rep = {"ln_share_pred": len(ps) / max(1, len(pred_notes)), "ln_share_ref": len(rs) / max(1, len(ref_notes))}
+    if not len(rs) and not len(ps):
+        rep.update({"ln_start_f1": 1.0, "ln_len_tv": 0.0})
+        return rep
+    pairs = match_times(np.sort(ps), np.sort(rs), 32)
+    rep["ln_start_f1"] = _f1(len(pairs), len(ps), len(rs))[2]
+    hp = np.histogram(pl, bins=LN_BEAT_BINS)[0].astype(np.float64)
+    hr = np.histogram(rl, bins=LN_BEAT_BINS)[0].astype(np.float64)
+    rep["ln_len_tv"] = float(0.5 * np.abs(hp / max(1, hp.sum()) - hr / max(1, hr.sum())).sum()) if hp.sum() and hr.sum() else 1.0
     return rep
 
 
 def expressive_score(rep: Dict[str, float]) -> float:
-    """One number in [0, 1]: 0.4 x burst F1 + 0.3 x (1 - subdivision distance) + 0.3 x bar density correlation (>= 0)."""
+    """One number in [0, 1]: rhythm part = 0.4 x burst F1 + 0.3 x (1 - subdivision distance) + 0.3 x bar density
+    correlation (>= 0); long-note part = 0.4 x LN start F1 + 0.3 x (1 - LN length distance) + 0.3 x how close the
+    LN shares are. The LN part weighs as much as the reference has long notes (up to half: an LN map is judged half by
+    its long notes, a rice map without LNs only by its rhythm)."""
     if "subdiv_tv" not in rep:
         return 0.0
-    return float(0.4 * rep.get("burst_f1", 0.0) + 0.3 * (1.0 - rep.get("subdiv_tv", 1.0))
-                 + 0.3 * max(0.0, rep.get("bar_density_corr", 0.0)))
+    rhythm = (0.4 * rep.get("burst_f1", 0.0) + 0.3 * (1.0 - rep.get("subdiv_tv", 1.0))
+              + 0.3 * max(0.0, rep.get("bar_density_corr", 0.0)))
+    ref_ln = float(rep.get("ln_share_ref", 0.0))
+    a = min(0.5, ref_ln * 1.5)
+    if "ln_start_f1" not in rep:
+        return float(rhythm)
+    sp, sr_ = float(rep.get("ln_share_pred", 0.0)), ref_ln
+    close = min(sp, sr_) / max(sp, sr_) if max(sp, sr_) > 0 else 1.0
+    ln = 0.4 * rep.get("ln_start_f1", 0.0) + 0.3 * (1.0 - rep.get("ln_len_tv", 1.0)) + 0.3 * close
+    return float((1 - a) * rhythm + a * ln)
 
 
 def summarize_reports(reports: Sequence[Dict[str, float]]) -> Dict[str, float]:

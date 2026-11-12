@@ -13,6 +13,7 @@ whether the human map of that difficulty has a burst over at least half of the s
 
 At generation (generate_v5.py --meta) every burst of the network's map gets its probability; a burst below the
 threshold is not deleted but "sized down" (the position is reduced, not closed): its notes collapse to 1/2 beats.
+Bursts that are mostly long notes (LN stairs, LN streams) are never touched: they are not rice.
 """
 
 from __future__ import annotations
@@ -137,13 +138,17 @@ class MetaFilter:
         ps = self.probs(feats_all, beat_all, notes, timing_points, sr)
         keep = list(notes)
         cut = 0
+        ln_kept = 0
         for (a, b), p in ps:
             if p >= self.threshold:
                 continue
             inside = [n for n in keep if a <= n.start <= b]
+            if inside and sum(n.ln for n in inside) / len(inside) > 0.5:
+                ln_kept += 1           # LN stairs / LN bursts are not rice: never collapsed
+                continue
             outside = [n for n in keep if not (a <= n.start <= b)]
             keep = _no_overlap(sorted(outside + blandify(inside, timing_points)))
             cut += 1
-        rep = {"bursts": float(len(ps)), "sized_down": float(cut),
+        rep = {"bursts": float(len(ps)), "sized_down": float(cut), "ln_bursts_kept": float(ln_kept),
                "mean_p": float(np.mean([p for _, p in ps])) if ps else float("nan")}
         return keep, rep
