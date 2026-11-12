@@ -38,7 +38,7 @@ from osu_mapper.hybrid.dataset import HybridCropDataset, HybridIndex, collate_hy
 from osu_mapper.hybrid.inference import CHECKPOINT_FORMAT, HybridPredictor, SongInputs, resolve_device, star_rating_of
 from osu_mapper.hybrid.calibration import calibrate
 from osu_mapper.hybrid.losses import LossWeights, compute_losses, crop_metrics
-from osu_mapper.hybrid.metrics import per_ms_report, summarize_reports
+from osu_mapper.hybrid.metrics import expressive_score, per_ms_report, summarize_reports
 from osu_mapper.hybrid.model import HybridModelConfig, HybridParamNet, PRESETS, build_config, count_parameters
 from osu_mapper.hybrid.params import PARAM_VERSION
 from osu_mapper.hybrid.renderer import DecodeKnobs, decode_outputs, render_track
@@ -154,6 +154,7 @@ def validate_full_maps(
     ln_thresholds: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6),
     style_known: bool = False,
     min_maps_per_bin: int = 2,
+    expressive_weight: float = 0.0,
 ) -> Tuple[Dict[str, float], float, float, Dict[int, float]]:
     """Renders complete validation maps and compares them with the references per millisecond.
 
@@ -178,11 +179,14 @@ def validate_full_maps(
         cache.append((out, ref, track.timing_points, float(entry.get("sr", 0.0))))
         for th in thresholds:
             notes = decode_outputs(out, DecodeKnobs(onset_threshold=th), track.timing_points)
-            per_threshold[th].append(per_ms_report(notes, ref))
+            rep = per_ms_report(notes, ref, timing_points=track.timing_points)
+            rep["expressive"] = expressive_score(rep)
+            per_threshold[th].append(rep)
     best_th, best_score, best_summary = thresholds[0], -1.0, {}
     for th, reps in per_threshold.items():
         summ = summarize_reports(reps)
-        score = summ.get("event_f1@16", 0.0)
+        # F1 alone prefers the threshold (and the network) that leaves the bursts out: see metrics.expressive_report
+        score = summ.get("event_f1@16", 0.0) + expressive_weight * summ.get("expressive", 0.0)
         if score > best_score:
             best_th, best_score, best_summary = th, score, summ
     by_bin: Dict[int, List[int]] = {}
@@ -231,6 +235,11 @@ def measure_sr_response(model, index: HybridIndex, map_indices: List[int], crop_
         inputs = SongInputs(feats=feats, coarse=index.coarse(entry["song_id"]), beat=beat_features(track.timing_points, 0, F, track.frame_ms), duration_ms=F * track.frame_ms)
         items.append((inputs, render_track(track), list(track.timing_points), float(entry["sr"])))
     return sr_response(predictor, items)
+
+
+def summary_score_kind(ckpt: Dict[str, Any]) -> float:
+    """The --expressive_weight a checkpoint's best score was measured with (0 for checkpoints made before it existed)."""
+    return float((ckpt.get("args") or {}).get("expressive_weight", 0.0))
 
 
 def save_checkpoint(path: Path, **payload: Any) -> None:
@@ -341,6 +350,9 @@ def main() -> None:
     ap.add_argument("--val_maps", type=int, default=24, help="complete validation maps rendered per epoch (per-ms metrics)")
     ap.add_argument("--val_sr_response", type=int, default=8,
                     help="validation maps generated at -1/0/+1 star around their SR to measure whether the model obeys the request (0 = off)")
+    ap.add_argument("--expressive_weight", type=float, default=0.3,
+                    help="best checkpoint (and event threshold) = F1@16 + this x expressiveness (bursts of 1/4 and faster, beat "
+                         "subdivisions, density per bar against the human maps, metrics.expressive_score); 0 = F1 only")
     ap.add_argument("--response_weight", type=float, default=0.0,
                     help="best checkpoint score = F1@16 + this x SR-response slope (clipped to 0..1.5); e.g. 0.1")
     ap.add_argument("--val_style_known", action="store_true", help="give the reference style to the model during validation")
@@ -629,7 +641,8 @@ def main() -> None:
                   f"| offset exact {vc.get('offset_exact', 0):.3f} (+-1ms {vc.get('offset_within1ms', 0):.3f}) | lane acc {vc.get('lane_acc', 0):.3f} | chord acc {vc.get('chord_acc', 0):.3f}")
         if val_full:
             t1 = time.time()
-            summary, decode_threshold, ln_threshold, threshold_by_sr = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known)
+            summary, decode_threshold, ln_threshold, threshold_by_sr = validate_full_maps(eval_model, index, val_full, crop_frames, dev, style_known=args.val_style_known,
+                                                                                         expressive_weight=args.expressive_weight)
             record.update({f"map_{k}": v for k, v in summary.items()})
             record["decode_threshold"] = decode_threshold
             record["ln_threshold"] = ln_threshold
@@ -644,6 +657,12 @@ def main() -> None:
             print(f"[{tag}] surplus vs reference notes: duplicate events (<=30 ms from a hit) {summary.get('surplus_duplicate_events_pct', float('nan')):.2f}% "
                   f"| isolated extra events {summary.get('surplus_isolated_events_pct', float('nan')):.2f}% | extra chord notes {summary.get('surplus_chord_notes_pct', float('nan')):.2f}% "
                   f"|| missing: events {summary.get('missed_events_pct', float('nan')):.2f}%, chord notes {summary.get('missing_chord_notes_pct', float('nan')):.2f}%")
+            if "expressive" in summary:
+                print(f"[{tag}] expressiveness {summary['expressive']:.3f}: bursts (1/4 and faster) F1 {summary.get('burst_f1', 0):.3f} "
+                      f"(precision {summary.get('burst_precision', 0):.2f}, recall {summary.get('burst_recall', 0):.2f}, length "
+                      f"x{summary.get('burst_ms_ratio', float('nan')):.2f}) | rhythm distance {summary.get('subdiv_tv', float('nan')):.3f} "
+                      f"| 1/4 and finer {100 * summary.get('fine_share_pred', 0):.0f}% vs {100 * summary.get('fine_share_ref', 0):.0f}% "
+                      f"| density per bar r={summary.get('bar_density_corr', 0):.2f}")
             if threshold_by_sr:
                 print(f"[{tag}] event threshold by star rating: " + " ".join(f"{b}*={t:g}" for b, t in sorted(threshold_by_sr.items())))
             if args.val_sr_response > 0:
@@ -673,6 +692,14 @@ def main() -> None:
 
     epoch = start_epoch
     best_epoch = start_epoch
+    if (resume_ckpt is not None and is_main and val_full and summary_score_kind(resume_ckpt) != args.expressive_weight):
+        # the stored best score was measured with another score (e.g. F1 only): measure the loaded network again, so a
+        # worse epoch does not replace it just because the new score has an extra term
+        print(f"[resume] the checkpoint's best score used another expressive weight: measuring it again")
+        _rec, _summ = evaluate("resume", start_epoch, 0.0)
+        if _summ:
+            best_score = float(_summ.get("event_f1@16", 0.0)) + args.expressive_weight * float(_summ.get("expressive", 0.0))
+            print(f"[resume] best score to beat: {best_score:.4f}")
     # Ctrl+C (SIGINT, also forwarded by torchrun) and SIGTERM: the first one interrupts training, later ones are ignored
     # so that the checkpoint is saved in one piece
     got_signal = {"n": 0}
@@ -758,6 +785,7 @@ def main() -> None:
                 history.append(record)
                 if summary:
                     score = float(summary.get("event_f1@16", 0.0))   # rendered-map quality on held-out songs
+                    score += args.expressive_weight * float(summary.get("expressive", 0.0))
                     if args.response_weight > 0 and "resp_slope" in summary:
                         score += args.response_weight * float(np.clip(summary["resp_slope"], 0.0, 1.5))
                 elif "val_total" in record:
