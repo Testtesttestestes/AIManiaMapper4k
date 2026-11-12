@@ -137,33 +137,42 @@ def generate_song(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, tim
     style = np.zeros(sd, np.float32) if style is None else style
     style_mask = np.zeros(sd, np.float32) if style_mask is None else style_mask
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
-    starts = list(range(0, max(1, F_ - hop), hop))
+    song_ms = F_ * H
     notes: List[Note] = []
-    for w, s in enumerate(starts):
+    # the cursor moves to the last note that was placed: when the network ends a window early (EOS before its end),
+    # the next window starts there and decides again; at least ``min_step_ms`` of progress per window
+    cursor = 0
+    min_step_ms = 1000
+    w = 0
+    while cursor < song_ms:
+        s = max(0, cursor // H - hop)
         s_ms = s * H
+        min_time = cursor - s_ms
         f = torch.from_numpy(_rows(feats_all, s, W).astype(np.float32)).to(dev)
         b = torch.from_numpy(_rows(beat_all, s, W).astype(np.float32)).to(dev)
-        min_time = 0 if w == 0 else hop * H
-        prefix_notes = [n for n in notes if s_ms <= n.start < s_ms + min_time]
+        prefix_notes = [n for n in notes if s_ms <= n.start < cursor]
         prefix, _, _ = encode(prefix_notes, s_ms, v, add_eos=False)
         k = max(1, int(candidates))
         seqs = _sample_cpu_gen(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, timing_points, k,
                                temperature, top_p, cfg_scale, gen)
-        cands = []
-        for q in seqs:
-            got = decode(q, s_ms, v)
-            cands.append([n for n in got if n.start >= s_ms + min_time])
+        end_ms = s_ms + W * H
+        cands = [[n for n in decode(q, s_ms, v) if cursor <= n.start < end_ms] for q in seqs]
         if k > 1 and score_fn is not None:
-            end_ms = s_ms + W * H
-            scores = [score_fn(c, notes, s_ms + min_time, end_ms) for c in cands]
+            scores = [score_fn(c, notes, cursor, end_ms) for c in cands]
             best = int(np.argmax(scores))
             if log is not None:
-                log(f"  phrase {w + 1}/{len(starts)}: scores " + " ".join(f"{x:+.2f}" for x in scores) + f" -> {best + 1}")
+                log(f"  phrase at {cursor / 1000:.1f}s: scores " + " ".join(f"{x:+.2f}" for x in scores) + f" -> {best + 1}")
         else:
             best = 0
-        notes.extend(cands[best])
+        chosen = cands[best]
+        notes.extend(chosen)
+        w += 1
         if progress is not None:
-            progress(w + 1, len(starts))
+            progress(min(cursor, song_ms), song_ms)
+        if end_ms >= song_ms:
+            break
+        last = max((n.start for n in chosen), default=cursor)
+        cursor = min(end_ms, max(last + 1, cursor + min_step_ms))
     return _resolve_overlaps(sorted(notes))
 
 
