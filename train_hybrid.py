@@ -662,7 +662,9 @@ def main() -> None:
                       f"(precision {summary.get('burst_precision', 0):.2f}, recall {summary.get('burst_recall', 0):.2f}, length "
                       f"x{summary.get('burst_ms_ratio', float('nan')):.2f}) | rhythm distance {summary.get('subdiv_tv', float('nan')):.3f} "
                       f"| 1/4 and finer {100 * summary.get('fine_share_pred', 0):.0f}% vs {100 * summary.get('fine_share_ref', 0):.0f}% "
-                      f"| density per bar r={summary.get('bar_density_corr', 0):.2f}")
+                      f"| density per bar r={summary.get('bar_density_corr', 0):.2f} | long notes "
+                      f"{100 * summary.get('ln_share_pred', 0):.0f}% vs {100 * summary.get('ln_share_ref', 0):.0f}%, LN starts F1 "
+                      f"{summary.get('ln_start_f1', 0):.3f}, LN lengths distance {summary.get('ln_len_tv', float('nan')):.3f}")
             if threshold_by_sr:
                 print(f"[{tag}] event threshold by star rating: " + " ".join(f"{b}*={t:g}" for b, t in sorted(threshold_by_sr.items())))
             if args.val_sr_response > 0:

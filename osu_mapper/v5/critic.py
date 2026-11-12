@@ -106,9 +106,25 @@ def blandify(notes: Sequence[Note], timing_points) -> List[Note]:
 
 
 def corrupt(notes: Sequence[Note], rng: random.Random) -> List[Note]:
-    """One random kind of damage: lanes shuffled / timing jittered / notes removed / random extra notes."""
-    kind = rng.randrange(4)
+    """One random kind of damage: lanes shuffled / timing jittered / notes removed / random extra notes, and for
+    long notes: every LN made a tap / taps made LNs of random length / LN lengths scrambled (x0.3..3) / releases
+    moved off the beat by 20-60 ms."""
     ns = list(notes)
+    has_ln = any(n.ln for n in ns)
+    kind = rng.randrange(8 if has_ln else 5)
+    if kind == 4:                      # taps -> random long notes
+        out = [Note(n.start, n.col, n.start + rng.randint(80, 1500), True) if not n.ln and rng.random() < 0.5 else n for n in ns]
+        return _no_overlap(sorted(out))
+    if kind == 5:                      # LN -> tap
+        return _no_overlap(sorted(Note(n.start, n.col, n.start, False) if n.ln else n for n in ns))
+    if kind == 6:                      # LN lengths scrambled
+        out = [Note(n.start, n.col, n.start + max(30, int((n.end - n.start) * rng.uniform(0.3, 3.0))), True) if n.ln else n
+               for n in ns]
+        return _no_overlap(sorted(out))
+    if kind == 7:                      # releases off the beat
+        out = [Note(n.start, n.col, max(n.start + 30, n.end + rng.choice([-1, 1]) * rng.randint(20, 60)), True) if n.ln else n
+               for n in ns]
+        return _no_overlap(sorted(out))
     if kind == 0:
         out = [Note(n.start, rng.randrange(4), n.end, n.ln) for n in ns]
     elif kind == 1:
