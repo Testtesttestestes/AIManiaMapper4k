@@ -159,7 +159,117 @@ def step_prepare(last: Dict[str, object]) -> Optional[List[str]]:
     out = ask_folder("Куда положить датасет", str(last.get("data", "dataset_hybrid")), must_exist=False)
     last.update(beatmaps=folder, data=out)
     print(color("  Облегчённые (прореженные) версии карт больше не добавляются: обучение идёт только по настоящим картам.", "2"))
-    return [sys.executable, "prepare_hybrid_dataset.py", "--input_dir", folder, "--output_dir", out]
+    argv = [sys.executable, "prepare_hybrid_dataset.py", "--input_dir", folder, "--output_dir", out]
+    ext = ask_yes("Нейросетевые признаки звука: demucs (вокал / барабаны / бас / остальное отдельно) и MERT"
+                  + color(" (рекомендуется: без них сеть не слышит, где поёт вокал; v2 обучалась с ними; дольше, нужен "
+                          "pip install demucs transformers)", "2"), bool(last.get("external", True)))
+    last["external"] = ext
+    if ext:
+        argv += ["--external", "demucs_stems", "mert95m"]
+    return argv
+
+
+def dataset_has_stems(data: str) -> Optional[bool]:
+    try:
+        d = json.loads((Path(data) / "index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return "demucs_stems" in (d.get("feature_config", {}).get("external") or [])
+
+
+def warn_no_stems(data: str) -> None:
+    if dataset_has_stems(data) is False:
+        print(color("  [!] В этом датасете нет дорожек demucs и MERT (подготовлен без --external): сеть слышит только "
+                    "общий микс и не отличит вокал от барабанов. Пересоберите датасет (пункт «Подготовка датасета», "
+                    "ответ «да» на вопрос про нейросетевые признаки).", "33"))
+
+
+V2_RECIPE = ["--real_only", "--preset", "base", "--canvas_prob", "0", "--corrupt_prob", "0", "--pair_prob", "0",
+             "--pair_weight", "0", "--ladder_weight", "0", "--jack_weight", "0", "--error_weight", "0",
+             "--pattern_weight", "0", "--prior_weight", "0", "--plan_weight", "0", "--plan_prob", "0", "--rate_aug", "0",
+             "--sr_balance", "0", "--sr_rare", "0", "--pitch_shift", "0", "--density_weight", "0"]
+
+
+def step_v2_recipe(last: Dict[str, object]) -> Optional[List[str]]:
+    title("Рецепт v2 (контроль)")
+    print("Та же сеть и обучение, что у v2 из test_NN: все добавки v3/v4 выключены (холст, порча, пары, лесенка, паттерны,")
+    print("план, ускорение, баланс звёзд). Сравните с обычным обучением на том же датасете: так видно, что дали добавки.")
+    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    warn_no_stems(data)
+    ckdir = ask_folder("Папка для чекпойнтов", str(last.get("ckdir_v2", "checkpoints/v2_recipe")), must_exist=False)
+    last.update(data=data, ckdir_v2=ckdir)
+    e = ask_int("Эпох", int(last.get("epochs", 40)))
+    tail = ["--data", data, "--checkpoint_dir", ckdir, "--epochs", str(e), "--batch_size", "auto", "--patience", "5"] + V2_RECIPE
+    return launcher(last, "train_hybrid.py") + tail
+
+
+def launcher(last: Dict[str, object], script: str) -> List[str]:
+    found = gpus()
+    n_gpu = ask_int("Сколько видеокарт использовать", int(last.get("gpus", max(1, len(found)))), 1, max(1, len(found))) if len(found) > 1 else 1
+    last["gpus"] = n_gpu
+    if n_gpu > 1:
+        return [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={n_gpu}", script]
+    return [sys.executable, script]
+
+
+V5_PRESETS = [("Маленькая", "быстро, для проверки", "tiny"), ("Обычная", "рекомендуется", "base"),
+              ("Большая", "больше памяти и данных", "large")]
+
+
+def step_v5(last: Dict[str, object], resume: bool = False) -> Optional[List[str]]:
+    title("Дообучение v5" if resume else "Обучение v5")
+    print("v5: сеть ставит ноты по очереди, как пишут текст (авторегрессия), а не решает за каждый кадр отдельно по порогу;")
+    print("слышит дорожки отдельно и учит, за каким звуком идёт каждая нота; лучший чекпойнт выбирается по F1 и")
+    print("выразительности (рис/вспышки, ритм, плотность по тактам). Подробности: HYBRID_GUIDE.md, раздел v5.")
+    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    warn_no_stems(data)
+    ckdir = ask_folder("Папка для чекпойнтов", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
+    last.update(data=data, ckdir_v5=ckdir)
+    tail = ["--data", data, "--checkpoint_dir", ckdir, "--batch_size", "auto"]
+    if resume:
+        e = ask_int("Сколько эпох", int(last.get("v5_more", 5)))
+        last["v5_more"] = e
+        tail += ["--resume", "--epochs", str(e)]
+        if ask_yes("Новое короткое расписание с малой скоростью обучения (дообучение, а не продолжение)", True):
+            tail += ["--finetune"]
+    else:
+        k = ask_choice("Размер сети", [(n, h) for n, h, _ in V5_PRESETS], int(last.get("v5_preset", 2)))
+        last["v5_preset"] = k
+        e = ask_int("Эпох (остановится раньше, если 6 эпох нет улучшения)", int(last.get("v5_epochs", 40)))
+        last["v5_epochs"] = e
+        tail += ["--preset", V5_PRESETS[k - 1][2], "--epochs", str(e)]
+    workers = ask_int("Процессов загрузки данных", int(last.get("workers", min(4, max(0, (os.cpu_count() or 2) - 1)))), 0, 32)
+    last["workers"] = workers
+    return launcher(last, "train_v5.py") + tail + ["--workers", str(workers)]
+
+
+def step_meta(last: Dict[str, object]) -> Optional[List[str]]:
+    title("Мета-модель риса v5")
+    print("Мета-разметка (как в трейдинге: первая модель предлагает сделку, вторая решает, входить ли): сеть предлагает рис,")
+    print("мета-модель по звуку места, части песни и форме вспышки решает, сыпал бы его здесь человек на этой сложности.")
+    print("Учится на рисе соседних сложностей той же песни (и на рисе самой сети). При генерации отклонённый рис → 1/2.")
+    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    ckdir = ask_folder("Папка чекпойнтов v5", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
+    last.update(data=data, ckdir_v5=ckdir)
+    argv = [sys.executable, "train_meta.py", "--data", data, "--checkpoint_dir", ckdir]
+    best = Path(ckdir) / "v5_best.pt"
+    if best.exists() and ask_yes("Добавить рис самой сети v5 как предложения (дольше, но точнее для её ошибок)", True):
+        argv += ["--v5", str(best)]
+    return argv
+
+
+def step_critic(last: Dict[str, object]) -> Optional[List[str]]:
+    title("Критик v5")
+    print("Сеть-оценщик «похоже на работу человека?» для поиска при генерации (generate_v5.py --search 4).")
+    print("Учится отличать карты людей от «пресных» (всё на 1/2, рис срезан), испорченных и карт самой сети.")
+    data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    ckdir = ask_folder("Папка чекпойнтов v5", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
+    last.update(data=data, ckdir_v5=ckdir)
+    argv = [sys.executable, "train_critic.py", "--data", data, "--checkpoint_dir", ckdir]
+    best = Path(ckdir) / "v5_best.pt"
+    if best.exists() and ask_yes("Добавить карты самой сети v5 как отрицательные примеры (дольше, но критик точнее)", True):
+        argv += ["--v5", str(best)]
+    return argv
 
 
 def sampling_argv(last: Dict[str, object]) -> List[str]:
@@ -177,6 +287,7 @@ def sampling_argv(last: Dict[str, object]) -> List[str]:
 def step_train(last: Dict[str, object], resume: bool = False) -> Optional[List[str]]:
     title("Продолжить обучение" if resume else "Обучение сети")
     data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
+    warn_no_stems(data)
     ckdir = ask_folder("Папка для чекпойнтов", str(last.get("ckdir", "checkpoints/hybrid")), must_exist=False)
     last.update(data=data, ckdir=ckdir)
     found = gpus()
@@ -293,6 +404,11 @@ STEPS = [
     ("Диагностика звёзд", "где теряются звёзды"),
     ("Дообучение на сложных", "короткий второй этап только на сложных картах"),
     ("Модель паттернов / библиотека мотивов", ""),
+    ("Рецепт v2 (контроль)", "то же обучение, что у v2: все добавки v3/v4 выключены"),
+    ("Обучение v5", "новая сеть: ноты по очереди, слышит вокал/барабаны отдельно"),
+    ("Дообучение v5", "продолжить или дообучить с малой скоростью"),
+    ("Критик v5", "оценщик для поиска лучшего варианта фразы при генерации"),
+    ("Мета-модель риса v5", "решает, сыпал бы человек рис в этом месте (иначе рис → 1/2)"),
 ]
 
 
@@ -304,9 +420,9 @@ def execute(argv: List[str]) -> bool:
             code = run(cur) if cur else 0
             if code == INTERRUPTED:
                 print(color("\nШаг прерван (Ctrl+C).", "33"))
-                if "train_hybrid.py" in cur:
-                    print("Лучшая эпоха уже сохранена в hybrid_best.pt (по валидации), следующие шаги берут её.")
-                if not ask_yes("Перейти к следующим шагам?", "train_hybrid.py" in cur):
+                if "train_hybrid.py" in cur or "train_v5.py" in cur:
+                    print("Лучшая эпоха уже сохранена (hybrid_best.pt / v5_best.pt, по валидации), следующие шаги берут её.")
+                if not ask_yes("Перейти к следующим шагам?", "train_hybrid.py" in cur or "train_v5.py" in cur):
                     return False
             elif code != 0:
                 print(color("Шаг завершился с ошибкой: дальше не иду.", "31"))
@@ -336,7 +452,8 @@ def main() -> None:
                         plan.append(a)
             else:
                 fn = {2: step_clean, 3: step_prepare, 4: step_train, 5: lambda l: step_train(l, resume=True),
-                      6: step_diagnose, 7: step_finetune, 8: step_models}[k]
+                      6: step_diagnose, 7: step_finetune, 8: step_models, 9: step_v2_recipe, 10: step_v5,
+                      11: lambda l: step_v5(l, resume=True), 12: step_critic, 13: step_meta}[k]
                 a = fn(last)
                 if a:
                     plan.append(a)

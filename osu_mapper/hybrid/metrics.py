@@ -7,12 +7,18 @@ All metrics work on rendered notes, so they measure the final map, not the netwo
 * lane-aware note F1 at the same tolerances,
 * timing MAE of matched events, chord-size accuracy, LN start/end errors, density ratio,
 * ``per_ms_loss`` - mean of (1 - event F1) over all tolerances: 0.0 means bit-exact timing,
-  1.0 means nothing within 64 ms. It is the single number used for checkpoint selection.
+  1.0 means nothing within 64 ms.
+
+F1 alone rewards bland maps: a burst ("rice") placed a little differently from the human one costs twice (extra and
+missed notes), leaving it out costs once. With the red lines of the map, ``expressive_report`` also measures whether
+the map has the human's rhythm and its bursts: the distribution of beat subdivisions of the notes, the bursts of
+1/4 and faster (precision / recall by overlap in time) and the density of every bar; ``expressive_score`` folds them
+into one number in [0, 1] for checkpoint selection (train_hybrid.py --expressive_weight).
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,7 +61,9 @@ def _events(notes: Sequence[Note]) -> Tuple[np.ndarray, Dict[int, List[Note]]]:
     return times, groups
 
 
-def per_ms_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], tolerances: Sequence[int] = TOLERANCES_MS) -> Dict[str, float]:
+def per_ms_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], tolerances: Sequence[int] = TOLERANCES_MS,
+                  timing_points=None) -> Dict[str, float]:
+    """All metrics of the module docstring; with ``timing_points`` also those of :func:`expressive_report`."""
     pred = sorted(pred_notes)
     ref = sorted(ref_notes)
     pt, pg = _events(pred)
@@ -137,7 +145,111 @@ def per_ms_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], toleran
     rep["missing_chord_notes_pct"] = 100.0 * missing_chord / n_ref
     rep["missed_events_pct"] = 100.0 * (len(rt) - len(pairs16)) / max(1, len(rt))
     rep["exact_match"] = float(pred == ref)
+    if timing_points:
+        rep.update(expressive_report(pred, ref, timing_points))
     return rep
+
+
+# beat subdivisions a note can sit on (1/1 ... 1/16), and the names of the classes of the histogram
+SUBDIVISIONS: Tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
+SUBDIV_NAMES: Tuple[str, ...] = ("1/1", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12", "1/16", "off")
+
+
+def subdivision_classes(times_ms: np.ndarray, timing_points, tol_ms: float = 6.0) -> np.ndarray:
+    """Class of every time: the coarsest subdivision of the beat of the red lines it sits on (within ``tol_ms``),
+    index into SUBDIV_NAMES (last = off the grid)."""
+    from .motifs import beat_positions
+
+    t = np.asarray(times_ms, dtype=np.float64)
+    out = np.full(t.size, len(SUBDIVISIONS), dtype=np.int64)
+    if not t.size:
+        return out
+    beats, beat_len, _ = beat_positions(t, timing_points)
+    frac = beats - np.floor(beats)
+    for k, d in enumerate(SUBDIVISIONS):
+        dist = np.abs(frac * d - np.round(frac * d)) / d * beat_len          # ms to the nearest 1/d line
+        sel = (out == len(SUBDIVISIONS)) & (dist <= tol_ms)
+        out[sel] = k
+    return out
+
+
+def bursts(times_ms: np.ndarray, timing_points, min_notes: int = 4, max_step_beats: float = 0.26) -> List[Tuple[float, float]]:
+    """Runs of at least ``min_notes`` events whose steps are all 1/4 beat or shorter ("rice", streams), as (start, end) ms."""
+    from .motifs import beat_positions
+
+    t = np.unique(np.asarray(times_ms, dtype=np.float64))
+    if t.size < min_notes:
+        return []
+    _, beat_len, _ = beat_positions(t, timing_points)
+    short = np.diff(t) <= max_step_beats * beat_len[1:] + 1.0
+    out: List[Tuple[float, float]] = []
+    i = 0
+    while i < short.size:
+        if not short[i]:
+            i += 1
+            continue
+        j = i
+        while j < short.size and short[j]:
+            j += 1
+        if j - i + 1 >= min_notes:
+            out.append((float(t[i]), float(t[j])))
+        i = j
+    return out
+
+
+def _overlap(a: List[Tuple[float, float]], b: List[Tuple[float, float]]) -> float:
+    tot = 0.0
+    for s0, e0 in a:
+        for s1, e1 in b:
+            tot += max(0.0, min(e0, e1) - max(s0, s1))
+    return tot
+
+
+def expressive_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], timing_points) -> Dict[str, float]:
+    """Rhythm and bursts against the reference: ``subdiv_tv`` (total variation distance of the subdivision histograms,
+    0 = the same rhythm), ``fine_share_pred/ref`` (share of events on 1/4 or finer), ``burst_precision/recall/f1``
+    (overlap in time of the runs of 1/4 and faster), ``bar_density_corr`` (correlation of the notes per bar)."""
+    from .stitch import bar_index
+
+    pt = np.unique([n.start for n in pred_notes]).astype(np.float64)
+    rt = np.unique([n.start for n in ref_notes]).astype(np.float64)
+    rep: Dict[str, float] = {}
+    if not rt.size or not timing_points:
+        return rep
+    K = len(SUBDIV_NAMES)
+    hp = np.bincount(subdivision_classes(pt, timing_points), minlength=K).astype(np.float64)
+    hr = np.bincount(subdivision_classes(rt, timing_points), minlength=K).astype(np.float64)
+    hp /= max(1.0, hp.sum())
+    hr /= max(1.0, hr.sum())
+    rep["subdiv_tv"] = float(0.5 * np.abs(hp - hr).sum())
+    fine = [k for k, d in enumerate(SUBDIVISIONS) if d >= 4] + [K - 1]
+    rep["fine_share_pred"] = float(hp[fine].sum())
+    rep["fine_share_ref"] = float(hr[fine].sum())
+    bp, br = bursts(pt, timing_points), bursts(rt, timing_points)
+    dur_p = sum(e - s for s, e in bp)
+    dur_r = sum(e - s for s, e in br)
+    ov = _overlap(bp, br)
+    prec = ov / dur_p if dur_p > 0 else (1.0 if dur_r == 0 else 0.0)
+    rec = ov / dur_r if dur_r > 0 else (1.0 if dur_p == 0 else 0.0)
+    rep["burst_precision"], rep["burst_recall"] = float(prec), float(rec)
+    rep["burst_f1"] = float(2 * prec * rec / (prec + rec)) if prec + rec > 0 else 0.0
+    rep["burst_ms_ratio"] = float(dur_p / dur_r) if dur_r > 0 else float("nan")
+    bars_r = bar_index(rt, timing_points)
+    lo, hi = int(bars_r.min()), int(bars_r.max())
+    cr = np.bincount(bars_r - lo, minlength=hi - lo + 1).astype(np.float64)
+    bars_p = bar_index(pt, timing_points) if pt.size else np.zeros(0, np.int64)
+    bars_p = bars_p[(bars_p >= lo) & (bars_p <= hi)]
+    cp = np.bincount(bars_p - lo, minlength=hi - lo + 1).astype(np.float64)
+    rep["bar_density_corr"] = float(np.corrcoef(cp, cr)[0, 1]) if cp.std() > 0 and cr.std() > 0 else 0.0
+    return rep
+
+
+def expressive_score(rep: Dict[str, float]) -> float:
+    """One number in [0, 1]: 0.4 x burst F1 + 0.3 x (1 - subdivision distance) + 0.3 x bar density correlation (>= 0)."""
+    if "subdiv_tv" not in rep:
+        return 0.0
+    return float(0.4 * rep.get("burst_f1", 0.0) + 0.3 * (1.0 - rep.get("subdiv_tv", 1.0))
+                 + 0.3 * max(0.0, rep.get("bar_density_corr", 0.0)))
 
 
 def summarize_reports(reports: Sequence[Dict[str, float]]) -> Dict[str, float]:
