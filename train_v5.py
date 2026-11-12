@@ -62,7 +62,7 @@ def val_tokens(model: V5Net, loader, dev) -> Dict[str, float]:
     for b in loader:
         b = to_dev(b, dev)
         out = model(b)
-        _, logs = v5_losses(out, b)
+        _, logs = v5_losses(out, b, window_ms=model.cfg.window_ms)
         for k, v in logs.items():
             sums[k] = sums.get(k, 0.0) + v
         n += 1
@@ -95,7 +95,7 @@ def fit_climaxes(index: HybridIndex, train_idx: List[int], val_idx: List[int], s
     """Climax model of the song parts from the mappers' kiai time (osu_mapper/v5/sections.py), kept only when it beats
     "the loud parts are the climaxes" on the validation maps; [] = the loudness rule."""
     import hashlib
-    from osu_mapper.v5.sections import fit_highlight, highlight_samples
+    from osu_mapper.v5.sections import fit_highlight
 
     key = hashlib.sha1(json.dumps(sorted(index.maps[i]["track"] for i in train_idx)).encode()).hexdigest()
     try:
@@ -107,11 +107,23 @@ def fit_climaxes(index: HybridIndex, train_idx: List[int], val_idx: List[int], s
         pass
 
     def samples(idx):
-        out, done = [], set()
+        """Parts are found once per song (red lines of its first map); every map with kiai labels them."""
+        from osu_mapper.v5.sections import descriptor, find_sections, kiai_frames
+        by_song: Dict[str, List[int]] = {}
         for i in idx:
-            e = index.maps[i]
-            tr = index.track(i)
-            out += highlight_samples(np.asarray(index.features(e["song_id"], 0)), slices, tr.timing_points)
+            by_song.setdefault(index.maps[i]["song_id"], []).append(i)
+        out = []
+        for sid, ids in by_song.items():
+            tps = [list(index.track(i).timing_points) for i in ids]
+            kiais = [any(int(getattr(tp, "effects", 0)) & 1 for tp in t) for t in tps]
+            if not any(kiais):
+                continue
+            feats = np.asarray(index.features(sid, 0))
+            secs = find_sections(feats, slices, tps[0])
+            for t, has in zip(tps, kiais):
+                if has:
+                    k = kiai_frames(t, feats.shape[0])
+                    out += [(descriptor(s_), float(k[s_.start:s_.end].mean())) for s_ in secs]
         return out
     t0 = time.time()
     tr_s, va_s = samples(train_idx), samples(val_idx)
@@ -187,6 +199,7 @@ def main() -> None:
                          "arpeggio ..., osu_mapper/v5/sections.py)")
     args = ap.parse_args()
 
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # windows of very different lengths
     distributed, rank, world, dev = init_distributed(args.device)
     is_main = rank == 0
     if not is_main:
@@ -218,7 +231,14 @@ def main() -> None:
                        regimes=args.regimes_max if args.regimes > 0 else 0, regimes_active=max(1, args.regimes),
                        **PRESETS[args.preset])
         if not args.no_sections:
-            cfg.highlight = fit_climaxes(index, train_idx, val_idx, slices, Path(args.data) / "v5_climaxes.json")
+            # one process fits the climax model (minutes of CPU work), the others wait and read its cached result
+            cache_file = Path(args.data) / "v5_climaxes.json"
+            if is_main:
+                cfg.highlight = fit_climaxes(index, train_idx, val_idx, slices, cache_file)
+            if distributed:
+                dist.barrier()
+            if not is_main:
+                cfg.highlight = fit_climaxes(index, train_idx, val_idx, slices, cache_file)
     if group_columns(slices, sections="section" in cfg.groups) != cfg.groups:
         sys.exit("the dataset's features differ from the checkpoint's (e.g. other --external): use the same dataset")
     model = V5Net(cfg).to(dev)
@@ -251,14 +271,16 @@ def main() -> None:
                          max_tokens=cfg.max_tokens, sections="section" in cfg.groups, highlight=cfg.highlight)
     if auto:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
-        probe = [train_ds[i] for i in range(8)]
+        # the memory of a step grows with the token count: probe with the longest of 64 random windows
+        cand = [train_ds[i] for i in range(64)]
+        probe = sorted(cand, key=lambda it: -int(it["tokens"].shape[0]))[:4]
 
         def probe_step(n: int) -> None:
             b = to_dev(repeat_batch(probe, n, collate), dev)
             model.train()
             with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(b)
-                loss, _ = v5_losses(out, b, args.cause_weight)
+                loss, _ = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms)
             loss.backward()
             model.zero_grad(set_to_none=True)
         found = find_batch_size(probe_step, model, dev, args.mem_fraction, distributed=distributed, log=print)
@@ -336,7 +358,7 @@ def main() -> None:
                     g["lr"] = lr
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                     out = train_model(b)
-                    loss, logs = v5_losses(out, b, args.cause_weight)
+                    loss, logs = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)

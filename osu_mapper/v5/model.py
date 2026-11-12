@@ -275,7 +275,9 @@ class V5Net(nn.Module):
         self.at_time = nn.Linear(d, d)
         self.dec = nn.ModuleList([DecLayer(d, cfg.n_heads, cfg.ff_mult, cfg.dropout) for _ in range(cfg.dec_layers)])
         self.dec_norm = nn.LayerNorm(d)
-        self.out = nn.Linear(d, V)
+        # every token except the TIME tokens, plus one "an event starts" slot (index time0): the time itself is
+        # factorized below, so a step never holds a [batch, tokens, 10240] table
+        self.out = nn.Linear(d, V - cfg.window_ms + 1)
         # TIME tokens are a pointer at the encoder frames (which 10 ms frame) + the millisecond inside the frame
         # (from the frame's own sound): the choice of "where" is tied to the audio directly
         self.ptr_q = nn.Linear(d, d)
@@ -352,14 +354,16 @@ class V5Net(nn.Module):
         off = torch.log_softmax(self.off_head(memory).float(), dim=-1)                # [B, T, frame_ms]
         return {"kv": kv, "ptr_k": ptr_k, "ptr_b": ptr_b, "off": off}
 
-    def decode(self, x: torch.Tensor, mem, caches: Optional[List[Dict]] = None, key_pad=None,
-               tok_frame: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Logits of the next token for every position; ``tok_frame`` [B, L] = frame of the event each position is in
-        (-1 before the first event), for the distance bias of the time pointer."""
+    def decode_parts(self, x: torch.Tensor, mem, caches: Optional[List[Dict]] = None, key_pad=None,
+                     tok_frame: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """Factorized next-token distribution (log-probabilities):
+        ``kind`` [B, L, V - window_ms + 1] over the non-time tokens and the "TIME" slot (index time0),
+        ``frame`` [B, L, frames] which 10 ms frame (the pointer at the encoder), ``off`` [B, frames, frame_ms] the
+        millisecond inside a frame. log p(TIME = 10 f + o) = kind[time0] + frame[f] + off[f, o]."""
         for i, layer in enumerate(self.dec):
             x = layer(x, mem["kv"][i], None if caches is None else caches[i], key_pad=key_pad)
         h = self.dec_norm(x)
-        logits = self.out(h).float()
+        kind = torch.log_softmax(self.out(h).float(), dim=-1)
         v = self.cfg.vocab()
         T = mem["ptr_k"].shape[1]
         n_frames = min(T, v.window_ms // self.cfg.frame_ms)
@@ -368,10 +372,21 @@ class V5Net(nn.Module):
         if tok_frame is not None:
             dist = torch.arange(n_frames, device=h.device)[None, None, :] - tok_frame[:, :, None]
             ptr = ptr + self.dist_bias(dist.clamp(-1, MAX_DIST) + 1).squeeze(-1).float()
-        t_logits = (ptr.unsqueeze(-1) + mem["off"][:, None, :n_frames]).flatten(2)   # [B, L, frames x ms]
-        full = torch.full((*logits.shape[:2], v.window_ms), float("-inf"), device=logits.device, dtype=logits.dtype)
-        full[..., : t_logits.shape[-1]] = t_logits
-        return torch.cat([logits[..., : v.time0], full, logits[..., v.mask0:]], dim=-1)
+        return {"kind": kind, "frame": torch.log_softmax(ptr, dim=-1), "off": mem["off"][:, :n_frames]}
+
+    def full_logprobs(self, parts: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """[B, L, V] log-probabilities of every token (for sampling a few positions; training uses the parts)."""
+        v = self.cfg.vocab()
+        kind, fr, off = parts["kind"], parts["frame"], parts["off"]
+        t = (kind[..., v.time0:v.time0 + 1].unsqueeze(-1) + fr.unsqueeze(-1) + off[:, None]).flatten(2)
+        full = torch.full((*kind.shape[:2], v.window_ms), float("-inf"), device=kind.device, dtype=kind.dtype)
+        full[..., : t.shape[-1]] = t
+        return torch.cat([kind[..., : v.time0], full, kind[..., v.time0 + 1:]], dim=-1)
+
+    def decode(self, x: torch.Tensor, mem, caches: Optional[List[Dict]] = None, key_pad=None,
+               tok_frame: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Log-probabilities of the next token for every position, over the whole vocabulary (generation)."""
+        return self.full_logprobs(self.decode_parts(x, mem, caches, key_pad, tok_frame))
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         enc = self.encode(batch["feats"], batch["beat"])
@@ -381,19 +396,37 @@ class V5Net(nn.Module):
             drop = torch.rand(B, device=batch["tokens"].device) < self.cfg.cond_dropout
         cond = self.condition(batch["sr"], batch["style"], batch["style_mask"], drop)
         x = self.embed_tokens(batch["tokens"], batch["phase"], batch["tok_frame"], enc["memory"], cond)
-        logits = self.decode(x, self.memory_kv(enc["memory"]), key_pad=batch["tokens"] == 0, tok_frame=batch["tok_frame"])
-        return {"logits": logits, **enc}
+        parts = self.decode_parts(x, self.memory_kv(enc["memory"]), key_pad=batch["tokens"] == 0, tok_frame=batch["tok_frame"])
+        return {"parts": parts, **enc}
 
 
 def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cause_weight: float = 0.2,
-              label_smoothing: float = 0.02) -> Tuple[torch.Tensor, Dict[str, float]]:
+              label_smoothing: float = 0.02, window_ms: int = 10240) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Next-token cross-entropy (+ the cause head on event frames). Per-item weights (hard mining) via
     batch['item_weight']; returns (loss, logs) with the per-item token loss in logs['_per_item'] for hard mining."""
-    logits = out["logits"][:, :-1].float()
+    from .tokens import N_SPECIAL
+
+    parts = out["parts"]
+    kind = parts["kind"][:, :-1]                                             # [B, L, V_kind] log-probabilities
+    fr = parts["frame"][:, :-1]                                              # [B, L, frames]
+    off = parts["off"]                                                       # [B, frames, ms]
     tgt = batch["tokens"][:, 1:]
     valid = (tgt != 0).float()
-    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1), reduction="none",
-                         label_smoothing=label_smoothing).view_as(tgt) * valid
+    time0 = N_SPECIAL
+    is_t = batch["is_time"][:, 1:] > 0
+    # kind index of every target: a TIME token -> the time0 slot; the tokens after the time range shift down
+    tk = torch.where(is_t, torch.full_like(tgt, time0), tgt)
+    tk = torch.where(tgt >= time0 + window_ms, tgt - window_ms + 1, tk)
+    lp_kind = kind.gather(-1, tk.clamp(0, kind.shape[-1] - 1).unsqueeze(-1)).squeeze(-1)
+    t_ms = torch.where(is_t, tgt - time0, torch.zeros_like(tgt))
+    f_idx = (t_ms // off.shape[-1]).clamp(max=fr.shape[-1] - 1)
+    o_idx = t_ms % off.shape[-1]
+    lp_frame = fr.gather(-1, f_idx.unsqueeze(-1)).squeeze(-1)
+    lp_off = off.gather(1, f_idx.unsqueeze(-1).expand(-1, -1, off.shape[-1])).gather(-1, o_idx.unsqueeze(-1)).squeeze(-1)
+    nll = -(lp_kind + torch.where(is_t, lp_frame + lp_off, torch.zeros_like(lp_kind)))
+    if label_smoothing > 0:                                                  # on the token kind only
+        nll = (1 - label_smoothing) * nll - label_smoothing * kind.mean(-1)
+    ce = nll * valid
     per_item = ce.sum(1) / valid.sum(1).clamp(min=1.0)
     w = batch.get("item_weight")
     w = torch.ones_like(per_item) if w is None else w.float().view(-1)
