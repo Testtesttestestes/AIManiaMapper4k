@@ -52,7 +52,6 @@ def make_scorer(critic, feats_all, beat_all, timing, sr, lane_pred, power, criti
     return score
 
 
-@torch.no_grad()
 def why_notes(model: V5Net, feats_all, beat_all, notes, timing, sr, dev, max_events: int = 40) -> None:
     """Per-note attribution (integrated gradients) of the bursts and of the other notes of the generated map."""
     from osu_mapper.hybrid.metrics import bursts
@@ -72,6 +71,7 @@ def why_notes(model: V5Net, feats_all, beat_all, notes, timing, sr, dev, max_eve
                   f"| input groups: {format_shares(summarize(rows, groups=True), 4)}")
 
 
+@torch.no_grad()
 def explain(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, notes, dev, secs=None, phrase_s: float = 5.0) -> None:
     """Per phrase: the part of the song, the source selector's mean weight of every input group, the causes of the notes."""
     from osu_mapper.hybrid.dataset import _crop_rows
@@ -170,13 +170,13 @@ def main(argv=None) -> None:
         beat_all = beat_features(timing, 0, feats.shape[0], fcfg.frame_ms)
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, features in {time.time() - t0:.1f}s")
 
-        meta = None
+        meta_filter = None
         mpath = Path(args.meta) if args.meta else Path(args.checkpoint).with_name("meta.pt")
         if not args.no_meta and mpath.exists():
             from osu_mapper.v5.meta import MetaFilter
             mck = torch.load(mpath, map_location="cpu", weights_only=False)
-            meta = MetaFilter.load(mpath, dev, args.meta_threshold if args.meta_threshold is not None else mck.get("threshold", 0.35))
-            print(f"[meta] bursts checked by {mpath} (threshold {meta.threshold:g}): a rejected burst collapses to 1/2")
+            meta_filter = MetaFilter.load(mpath, dev, args.meta_threshold if args.meta_threshold is not None else mck.get("threshold", 0.35))
+            print(f"[meta] bursts checked by {mpath} (threshold {meta_filter.threshold:g}): a rejected burst collapses to 1/2")
         critic = None
         cpath = Path(args.critic) if args.critic else Path(args.checkpoint).with_name("critic.pt")
         if args.search > 1 and cpath.exists():
@@ -210,8 +210,8 @@ def main(argv=None) -> None:
                                   temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed,
                                   device=dev)
             meta_info = ""
-            if meta is not None:
-                notes, rep = meta.apply(feats_all, beat_all, notes, timing, target)
+            if meta_filter is not None:
+                notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)
                 meta_info = f", meta: {int(rep['sized_down'])} of {int(rep['bursts'])} bursts sized down to 1/2"
             sr_val = star_rating_of(notes, timing, args.od)
             version = f"v5 {target:.2f}*"
