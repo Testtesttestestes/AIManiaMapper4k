@@ -144,10 +144,16 @@ class RegimeModule(nn.Module):
         else:
             z = F.one_hot(logits.argmax(-1), self.slots).float()
         zf = torch.gather(z, 1, seg[..., None].expand(-1, -1, self.slots)).to(x.dtype)          # [B, T, K]
-        h = torch.einsum("btd,kdr->btkr", x, self.down.to(x.dtype))
-        h = torch.einsum("btkr,krd->btkd", F.gelu(h), self.up.to(x.dtype))
-        out = x + zf @ self.emb.to(x.dtype) + (zf.unsqueeze(-1) * h).sum(2)
-        return out, zf.argmax(-1)
+        # the embedding carries the (straight-through) gradient to the choice; the adapter is applied only for the
+        # regime each frame chose (computing all slots for every frame cost [B, T, slots, d] of memory)
+        out = x + zf @ self.emb.to(x.dtype)
+        pick = zf.argmax(-1)                                                                   # [B, T]
+        add = torch.zeros_like(x)
+        for k in torch.unique(pick).tolist():
+            sel = pick == k
+            xs = x[sel]
+            add[sel] = F.gelu(xs @ self.down[k].to(x.dtype)) @ self.up[k].to(x.dtype)
+        return out + add, pick
 
     @torch.no_grad()
     def grow(self, src: int, noise: float = 0.01) -> Optional[int]:
