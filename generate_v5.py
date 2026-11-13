@@ -130,6 +130,8 @@ def main(argv=None) -> None:
     ap.add_argument("--style", nargs="*", default=[],
                     help="style key=value, e.g. ln_ratio=0.4 (share of long notes), chord_mean=1.6, jack_ratio=0.1 - "
                          "keys of generate_hybrid.py --style")
+    ap.add_argument("--no_ln_guess", action="store_true",
+                    help="without --style ln_ratio, do not estimate the LN share from the music (the network decides)")
     ap.add_argument("--style_from", default=None, help="take the style of an existing map (.osz/.osu): LN share, chords...")
     ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from")
     ap.add_argument("--meta", default=None, help="meta model of bursts (train_meta.py; default: meta.pt next to the checkpoint)")
@@ -224,7 +226,16 @@ def main(argv=None) -> None:
                 lp = LanePredictor.cached(lib, target) if lib is not None else None
                 score_fn = make_scorer(critic, feats_all, beat_all, timing, target, lp, power, args.critic_weight,
                                        args.reward_weight)
-            notes = generate_song(model, feats_all, beat_all, timing, target, style=style, style_mask=smask,
+            st_t, sm_t = style.copy(), smask.copy()
+            from osu_mapper.hybrid.solver import STYLE_KEYS as _SK
+            j_ln = _SK.index("ln_ratio")
+            if sm_t[j_ln] == 0 and cfg.ln_model and not args.no_ln_guess:
+                from osu_mapper.v5.lnstyle import predict as ln_predict, song_descriptor
+                st_t[j_ln] = ln_predict(cfg.ln_model, song_descriptor(feats, fcfg.slices(), timing, target))
+                sm_t[j_ln] = 1.0
+                print(f"[style] LN share from the music at {target:.2f}*: {st_t[j_ln]:.2f} "
+                      "(--style ln_ratio=... sets it, --no_ln_guess leaves it to the network)")
+            notes = generate_song(model, feats_all, beat_all, timing, target, style=st_t, style_mask=sm_t,
                                   candidates=args.search, score_fn=score_fn, temperature=args.temperature,
                                   top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev)
             meta_info = ""

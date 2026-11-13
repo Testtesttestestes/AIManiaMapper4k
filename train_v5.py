@@ -167,6 +167,61 @@ def fit_climaxes(index: HybridIndex, train_idx: List[int], val_idx: List[int], s
     return weights
 
 
+def fit_ln_share(index: HybridIndex, train_idx: List[int], val_idx: List[int], slices, cache_path: Path) -> List[float]:
+    """LN share of a map from its music and star rating (osu_mapper/v5/lnstyle.py), kept only when it beats the
+    dataset's average share on the validation maps; [] = leave the share to the network when none is given."""
+    import hashlib
+    from osu_mapper.hybrid.solver import STYLE_KEYS
+    from osu_mapper.v5.lnstyle import fit, predict, song_descriptor
+
+    key = hashlib.sha1(json.dumps(sorted(index.maps[i]["track"] for i in train_idx)).encode()).hexdigest()
+    try:
+        d = json.loads(cache_path.read_text(encoding="utf-8"))
+        if d.get("key") == key:
+            print(f"[style] LN share model from cache: {d['note']}")
+            return list(d["weights"])
+    except (OSError, ValueError, KeyError):
+        pass
+    j = STYLE_KEYS.index("ln_ratio")
+
+    def samples(idx):
+        by_song: Dict[str, List[int]] = {}
+        for i in idx:
+            by_song.setdefault(index.maps[i]["song_id"], []).append(i)
+        out = []
+        for sid, ids in by_song.items():
+            feats = np.asarray(index.features(sid, 0))
+            for i in ids:
+                e = index.maps[i]
+                out.append((song_descriptor(feats, slices, index.track(i).timing_points, float(e.get("sr", 0.0))),
+                            float(e["style"][j])))
+        return out
+    t0 = time.time()
+    tr_s, va_s = samples(train_idx), samples(val_idx)
+    weights: List[float] = []
+    note = "too few maps"
+    if len(tr_s) >= 20:
+        w = fit(tr_s)
+        mean = float(np.mean([y for _, y in tr_s]))
+        if va_s:
+            e_m = float(np.mean([abs(predict(w, x) - y) for x, y in va_s]))
+            e_b = float(np.mean([abs(mean - y) for _, y in va_s]))
+            keep = e_m < 0.95 * e_b
+            note = (f"LN share from the audio: error {e_m:.3f} on validation maps, dataset average {e_b:.3f} -> "
+                    + ("model used when no --style ln_ratio is given" if keep else "not used (the network decides)"))
+            weights = w if keep else []
+        else:
+            weights, note = w, "LN share from the audio (no validation maps)"
+    print(f"[style] {note} ({len(tr_s)} maps, {time.time() - t0:.0f}s)")
+    try:
+        tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "weights": weights, "note": note}), encoding="utf-8")
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+    return weights
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="dataset_hybrid")
@@ -213,6 +268,8 @@ def main() -> None:
     ap.add_argument("--grow_every", type=int, default=3,
                     help="every N epochs the regime with the highest loss is split in two (its copy specialises): "
                          "'grow where it errs' as in MarI/O / NEAT; 0 = never")
+    ap.add_argument("--no_ln_model", action="store_true",
+                    help="do not fit the model of the LN share from the audio (osu_mapper/v5/lnstyle.py)")
     ap.add_argument("--no_sections", action="store_true",
                     help="do not give the network the parts of the song (intro / verse / chorus / drop / bridge / solo / "
                          "arpeggio ..., osu_mapper/v5/sections.py)")
@@ -258,6 +315,15 @@ def main() -> None:
                 dist.barrier()
             if not is_main:
                 cfg.highlight = fit_climaxes(index, train_idx, val_idx, slices, cache_file)
+    if not cfg.ln_model and not args.no_ln_model:
+        # LN share from the audio, for generation without --style ln_ratio (also on --resume: the weights are not touched)
+        ln_cache = Path(args.data) / "v5_ln_share.json"
+        if is_main:
+            cfg.ln_model = fit_ln_share(index, train_idx, val_idx, slices, ln_cache)
+        if distributed:
+            dist.barrier()
+        if not is_main:
+            cfg.ln_model = fit_ln_share(index, train_idx, val_idx, slices, ln_cache)
     if group_columns(slices, sections="section" in cfg.groups) != cfg.groups:
         sys.exit("the dataset's features differ from the checkpoint's (e.g. other --external): use the same dataset")
     model = V5Net(cfg).to(dev)
