@@ -5,6 +5,8 @@ osu!mania 4K maps with the v5 network (autoregressive, osu_mapper/v5).
     python generate_v5.py song.mp3 --sr 4.5
     python generate_v5.py --template my_template.osz --sr 3.5,5,6.5 --search 4
     python generate_v5.py song.mp3 --sr 6 --search 6 --critic checkpoints/v5/critic.pt --why
+    python generate_v5.py song.mp3 --sr 4 --style ln_ratio=0.5          # an LN map
+    python generate_v5.py song.mp3 --sr 4 --style_from "some LN map.osz"
 
 Every 5 s phrase is sampled ``--search`` times; the critic (train_critic.py: "would a human have mapped this?") and
 the per-note reward (jacks, one-hand runs, notes in silence, patterns) choose the continuation that is kept.
@@ -24,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from generate_hybrid import AUDIO_EXTS, read_template
+from generate_hybrid import AUDIO_EXTS, parse_style, read_template, reference_style
 from osu_mapper.hybrid.audio_features import beat_features, load_audio
 from osu_mapper.hybrid.beatmap import ManiaMap, RawTimingPoint, map_to_osu_text
 from osu_mapper.hybrid.causes import CAUSES, stem_attacks
@@ -125,6 +127,11 @@ def main(argv=None) -> None:
     ap.add_argument("--od", type=float, default=8.0)
     ap.add_argument("--hp", type=float, default=8.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--style", nargs="*", default=[],
+                    help="style key=value, e.g. ln_ratio=0.4 (share of long notes), chord_mean=1.6, jack_ratio=0.1 - "
+                         "keys of generate_hybrid.py --style")
+    ap.add_argument("--style_from", default=None, help="take the style of an existing map (.osz/.osu): LN share, chords...")
+    ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from")
     ap.add_argument("--meta", default=None, help="meta model of bursts (train_meta.py; default: meta.pt next to the checkpoint)")
     ap.add_argument("--no_meta", action="store_true", help="keep every burst the network makes")
     ap.add_argument("--meta_threshold", type=float, default=None)
@@ -199,6 +206,17 @@ def main(argv=None) -> None:
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         items = []
         targets = [float(x) for s in args.sr for x in str(s).split(",") if x.strip()]
+        # style: what the audio does not decide - an LN map or a rice map of the same song is the mapper's choice
+        from osu_mapper.hybrid.inference import style_from_dict
+        style, smask = style_from_dict(parse_style(args.style))
+        if args.style_from:
+            ref_style, ref_mask = reference_style(args.style_from, args.style_diff)
+            take = (ref_mask > 0) & (smask == 0)
+            style[take], smask[take] = ref_style[take], 1.0
+        if smask.any():
+            from osu_mapper.hybrid.solver import STYLE_KEYS
+            print("[style] " + ", ".join(f"{k}={style[i] * (10 if k in ('sr', 'od') else 1):.2f}" for i, k in enumerate(STYLE_KEYS)
+                                         if smask[i] > 0))
         for target in targets:
             t1 = time.time()
             score_fn = None
@@ -206,9 +224,9 @@ def main(argv=None) -> None:
                 lp = LanePredictor.cached(lib, target) if lib is not None else None
                 score_fn = make_scorer(critic, feats_all, beat_all, timing, target, lp, power, args.critic_weight,
                                        args.reward_weight)
-            notes = generate_song(model, feats_all, beat_all, timing, target, candidates=args.search, score_fn=score_fn,
-                                  temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed,
-                                  device=dev)
+            notes = generate_song(model, feats_all, beat_all, timing, target, style=style, style_mask=smask,
+                                  candidates=args.search, score_fn=score_fn, temperature=args.temperature,
+                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

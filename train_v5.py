@@ -70,8 +70,22 @@ def val_tokens(model: V5Net, loader, dev) -> Dict[str, float]:
 
 
 @torch.no_grad()
+def val_style(entry: Dict[str, Any], keys: str):
+    """Style given to the network for a validation map: 'ln' = only the share of long notes of the human map (a
+    mapper's choice that the audio does not decide), 'all' = the whole style, 'none' = nothing."""
+    from osu_mapper.hybrid.solver import STYLE_KEYS
+    st = np.asarray(entry["style"], dtype=np.float32)
+    known = np.asarray(entry.get("style_mask", [1.0] * len(st)), dtype=np.float32)
+    m = np.zeros_like(st)
+    if keys == "all":
+        m = known
+    elif keys == "ln" and "ln_ratio" in STYLE_KEYS:
+        m[STYLE_KEYS.index("ln_ratio")] = known[STYLE_KEYS.index("ln_ratio")]
+    return st, m
+
+
 def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[int], dev, temperature: float,
-             cfg_scale: float, max_sec: float) -> Dict[str, float]:
+             cfg_scale: float, max_sec: float, style_keys: str = "ln") -> Dict[str, float]:
     reps = []
     for i in map_idx:
         e = index.maps[i]
@@ -82,8 +96,9 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         F = min(fa.shape[0], int(max_sec * 100)) if max_sec > 0 else fa.shape[0]
         fa = fa[:F]
         ba = beat_features(tr.timing_points, 0, F, 10)
-        notes = generate_song(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), temperature=temperature,
-                              cfg_scale=cfg_scale, device=dev)
+        st, sm = val_style(e, style_keys)
+        notes = generate_song(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), style=st, style_mask=sm,
+                              temperature=temperature, cfg_scale=cfg_scale, device=dev)
         ref = [n for n in ref if n.start < F * 10]
         rep = per_ms_report(notes, ref, timing_points=tr.timing_points)
         rep["expressive"] = expressive_score(rep)
@@ -178,6 +193,9 @@ def main() -> None:
     ap.add_argument("--val_maps", type=int, default=8, help="complete validation maps generated per epoch")
     ap.add_argument("--val_max_sec", type=float, default=120.0, help="first N seconds of each validation map (0 = all)")
     ap.add_argument("--expressive_weight", type=float, default=0.3)
+    ap.add_argument("--val_style", default="ln", choices=["ln", "all", "none"],
+                    help="what the network is told about each validation map: ln = its share of long notes (an LN map or "
+                         "a rice map of the same song is the mapper's choice, the audio does not decide it)")
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--cfg_scale", type=float, default=1.0)
     ap.add_argument("--patience", type=int, default=6)
@@ -424,7 +442,8 @@ def main() -> None:
                           f"| cause acc {vt.get('cause_acc', float('nan')):.3f}")
                 if val_full:
                     t1 = time.time()
-                    summary = val_maps(em, index, cache, val_full, dev, args.temperature, args.cfg_scale, args.val_max_sec)
+                    summary = val_maps(em, index, cache, val_full, dev, args.temperature, args.cfg_scale, args.val_max_sec,
+                                       args.val_style)
                     rec.update({f"map_{k}": v for k, v in summary.items()})
                     print(f"[epoch {epoch}] GENERATED MAPS vs human ({len(val_full)} songs, {time.time() - t1:.0f}s): event F1 "
                           f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | density "
