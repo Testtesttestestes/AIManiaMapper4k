@@ -31,7 +31,7 @@ from osu_mapper.hybrid.audio_features import beat_features, load_audio
 from osu_mapper.hybrid.beatmap import ManiaMap, RawTimingPoint, map_to_osu_text
 from osu_mapper.hybrid.causes import CAUSES, stem_attacks
 from osu_mapper.hybrid.inference import estimated_timing_points, prepare_song_inputs, resolve_device, star_rating_of
-from osu_mapper.v5.generate import generate_song
+from osu_mapper.v5.generate import generate_passes
 from osu_mapper.v5.data import song_inputs
 from osu_mapper.v5.model import V5Config, V5Net
 from osu_mapper.v5.sections import describe, find_sections, kiai_timing_points
@@ -112,6 +112,11 @@ def main(argv=None) -> None:
     ap.add_argument("--sr", nargs="*", default=["4"])
     ap.add_argument("--checkpoint", "-c", default="checkpoints/v5/v5_best.pt")
     ap.add_argument("--critic", default=None, help="critic.pt (default: next to the checkpoint, if it exists)")
+    ap.add_argument("--passes", type=int, default=2,
+                    help="1 = one pass; 2+ = draft, then every window mapped again with the whole draft in view "
+                         "(networks trained with --draft_prob; others make one pass)")
+    ap.add_argument("--no_keep_better", action="store_true",
+                    help="take every later pass as it is (default: per bar the better of draft and new pass)")
     ap.add_argument("--search", type=int, default=1, help="continuations sampled per phrase; the best is kept")
     ap.add_argument("--critic_weight", type=float, default=1.0)
     ap.add_argument("--reward_weight", type=float, default=0.5)
@@ -235,9 +240,12 @@ def main(argv=None) -> None:
                 sm_t[j_ln] = 1.0
                 print(f"[style] LN share from the music at {target:.2f}*: {st_t[j_ln]:.2f} "
                       "(--style ln_ratio=... sets it, --no_ln_guess leaves it to the network)")
-            notes = generate_song(model, feats_all, beat_all, timing, target, style=st_t, style_mask=sm_t,
-                                  candidates=args.search, score_fn=score_fn, temperature=args.temperature,
-                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev)
+            lp_pass = LanePredictor.cached(lib, target) if lib is not None else None
+            notes = generate_passes(model, feats_all, beat_all, timing, target, passes=args.passes, style=st_t,
+                                    style_mask=sm_t, candidates=args.search, score_fn=score_fn,
+                                    temperature=args.temperature, top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed,
+                                    device=dev, log=print if args.passes > 1 else None,
+                                    keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

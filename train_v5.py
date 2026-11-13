@@ -39,7 +39,7 @@ from osu_mapper.hybrid.dataset import HybridIndex
 from osu_mapper.hybrid.metrics import expressive_score, per_ms_report, summarize_reports
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.v5.data import SongCache, V5Dataset, collate, group_columns, song_inputs
-from osu_mapper.v5.generate import generate_song
+from osu_mapper.v5.generate import generate_passes, generate_song
 from osu_mapper.v5.model import PRESETS, V5Config, V5Net, count_parameters, v5_losses
 from train_hybrid import init_distributed, lr_at
 
@@ -85,7 +85,7 @@ def val_style(entry: Dict[str, Any], keys: str):
 
 
 def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[int], dev, temperature: float,
-             cfg_scale: float, max_sec: float, style_keys: str = "ln") -> Dict[str, float]:
+             cfg_scale: float, max_sec: float, style_keys: str = "ln", passes: int = 1) -> Dict[str, float]:
     reps = []
     for i in map_idx:
         e = index.maps[i]
@@ -97,13 +97,21 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         fa = fa[:F]
         ba = beat_features(tr.timing_points, 0, F, 10)
         st, sm = val_style(e, style_keys)
-        notes = generate_song(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), style=st, style_mask=sm,
-                              temperature=temperature, cfg_scale=cfg_scale, device=dev)
+        notes = generate_passes(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), passes=passes, style=st,
+                                style_mask=sm, temperature=temperature, cfg_scale=cfg_scale, device=dev)
         ref = [n for n in ref if n.start < F * 10]
         rep = per_ms_report(notes, ref, timing_points=tr.timing_points)
         rep["expressive"] = expressive_score(rep)
         reps.append(rep)
-    return summarize_reports(reps)
+    out = summarize_reports(reps)
+    # ratios (burst length, density) of single songs can be huge (a song with almost no human rice and one long
+    # stream of the network): the median over the songs is what is printed, not the mean
+    for k in ("burst_ms_ratio", "density_ratio"):
+        vals = np.array([r.get(k, np.nan) for r in reps], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            out[k] = float(np.median(vals))
+    return out
 
 
 def fit_climaxes(index: HybridIndex, train_idx: List[int], val_idx: List[int], slices, cache_path: Path) -> List[float]:
@@ -245,7 +253,8 @@ def main() -> None:
                     help="share of the draws given to maps by their loss (hard example mining, updated every epoch)")
     ap.add_argument("--val_fraction", type=float, default=0.1)
     ap.add_argument("--val_windows", type=int, default=4, help="fixed validation windows per validation map")
-    ap.add_argument("--val_maps", type=int, default=8, help="complete validation maps generated per epoch")
+    ap.add_argument("--val_maps", type=int, default=16,
+                    help="complete validation maps generated per epoch (more = steadier numbers, slower validation)")
     ap.add_argument("--val_max_sec", type=float, default=120.0, help="first N seconds of each validation map (0 = all)")
     ap.add_argument("--expressive_weight", type=float, default=0.3)
     ap.add_argument("--val_style", default="ln", choices=["ln", "all", "none"],
@@ -268,6 +277,14 @@ def main() -> None:
     ap.add_argument("--grow_every", type=int, default=3,
                     help="every N epochs the regime with the highest loss is split in two (its copy specialises): "
                          "'grow where it errs' as in MarI/O / NEAT; 0 = never")
+    ap.add_argument("--draft_prob", type=float, default=0.5,
+                    help="share of training windows where the encoder also sees a damaged draft of the map (bursts made "
+                         "1/2, notes moved / missing / extra, long notes broken, spans cut out) and maps it again: the "
+                         "re-mapping passes of generation (--passes); 0 = off. Added to an older checkpoint on --resume")
+    ap.add_argument("--passes", type=int, default=2,
+                    help="validation maps: 1 = one pass, 2+ = draft, then mapped again with the whole draft in view")
+    ap.add_argument("--regime_balance", type=float, default=0.01,
+                    help="load-balancing loss of the regimes (Switch Transformer): keeps one regime from taking every part")
     ap.add_argument("--no_ln_model", action="store_true",
                     help="do not fit the model of the LN share from the audio (osu_mapper/v5/lnstyle.py)")
     ap.add_argument("--no_sections", action="store_true",
@@ -326,9 +343,18 @@ def main() -> None:
             cfg.ln_model = fit_ln_share(index, train_idx, val_idx, slices, ln_cache)
     if group_columns(slices, sections="section" in cfg.groups) != cfg.groups:
         sys.exit("the dataset's features differ from the checkpoint's (e.g. other --external): use the same dataset")
+    new_parts = False
+    if args.draft_prob > 0 and not cfg.draft:
+        cfg.draft = True                     # re-mapping input added to a checkpoint made without it (starts at zero)
+        new_parts = resume is not None
     model = V5Net(cfg).to(dev)
     if resume:
-        model.load_state_dict(resume["model"])
+        missing, unexpected = model.load_state_dict(resume["model"], strict=False)
+        if unexpected or any(not k.startswith("draft_in.") for k in missing):
+            sys.exit(f"the checkpoint does not fit this network: missing {missing[:5]}, unexpected {unexpected[:5]}")
+        if missing:
+            print("[resume] added the draft input for the re-mapping passes (starts at zero: the network maps as before "
+                  "and learns to use the draft)")
     else:
         gaps = []
         for i in train_idx[:2000]:
@@ -337,12 +363,26 @@ def main() -> None:
         model.init_distance_prior(np.concatenate(gaps) if gaps else [10])
     ema = copy.deepcopy(model).eval() if args.ema > 0 else None
     if resume and ema is not None and resume.get("ema"):
-        ema.load_state_dict(resume["ema"])
+        ema.load_state_dict(resume["ema"], strict=False)
     print(f"[model] v5 {args.preset if not resume else 'from checkpoint'}: {count_parameters(model):,} parameters, "
           f"{len(cfg.groups) + 1} input groups, device {dev}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
-    if resume and resume.get("opt") and not args.finetune:
+    if resume and resume.get("opt") and not args.finetune and not new_parts:
         opt.load_state_dict(resume["opt"])
+    elif resume and resume.get("opt") and not args.finetune and new_parts:
+        # a part was added: the Adam statistics of every old weight are carried over by name (a fresh optimizer at the
+        # full learning rate would throw a trained network back), only the new part starts from zero
+        old_names = [n for n, _ in model.named_parameters() if not n.startswith("draft_in.")]
+        by_name = dict(model.named_parameters())
+        old_state = resume["opt"].get("state", {})
+        moved = 0
+        for i, n in enumerate(old_names):
+            st_ = old_state.get(i)
+            if st_ is not None and n in by_name:
+                p_ = by_name[n]
+                opt.state[p_] = {k: (v.to(p_.device) if torch.is_tensor(v) and v.dim() > 0 else v) for k, v in st_.items()}
+                moved += 1
+        print(f"[resume] optimizer state of {moved} weights carried over")
     use_amp = dev.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
@@ -353,7 +393,8 @@ def main() -> None:
     bs = 8 if auto else int(args.batch_size)
     train_ds = V5Dataset(index, train_idx, vocab, W, args.steps_per_epoch * 512, seed=args.seed + 1000 * rank,
                          sr_balance=args.sr_balance, hard_tilt=args.hard_tilt, hard_share=args.hard_share,
-                         max_tokens=cfg.max_tokens, sections="section" in cfg.groups, highlight=cfg.highlight)
+                         max_tokens=cfg.max_tokens, sections="section" in cfg.groups, highlight=cfg.highlight,
+                         draft_prob=args.draft_prob if cfg.draft else 0.0)
     if auto:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
         # the memory of a step grows with the token count: probe with the longest of 64 random windows
@@ -365,7 +406,7 @@ def main() -> None:
             model.train()
             with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(b)
-                loss, _ = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms)
+                loss, _ = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms, regime_balance=args.regime_balance)
             loss.backward()
             model.zero_grad(set_to_none=True)
         ema_bytes = sum(p.numel() * p.element_size() for p in ema.parameters()) if ema is not None else 0
@@ -445,7 +486,8 @@ def main() -> None:
                     g["lr"] = lr
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                     out = train_model(b)
-                    loss, logs = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms)
+                    loss, logs = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms,
+                                           regime_balance=args.regime_balance)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -509,7 +551,7 @@ def main() -> None:
                 if val_full:
                     t1 = time.time()
                     summary = val_maps(em, index, cache, val_full, dev, args.temperature, args.cfg_scale, args.val_max_sec,
-                                       args.val_style)
+                                       args.val_style, args.passes if cfg.draft else 1)
                     rec.update({f"map_{k}": v for k, v in summary.items()})
                     print(f"[epoch {epoch}] GENERATED MAPS vs human ({len(val_full)} songs, {time.time() - t1:.0f}s): event F1 "
                           f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | density "

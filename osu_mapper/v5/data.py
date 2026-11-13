@@ -101,6 +101,39 @@ class SongCache:
         return np.concatenate(parts, axis=1).astype(np.float32)
 
 
+def make_draft(notes, timing_points, rng: random.Random) -> list:
+    """A draft of the human map for training the re-mapping passes: one to three kinds of damage (the bursts collapsed
+    to 1/2, the critic's damage - lanes, timing, missing / extra notes, long notes made taps / taps made long notes /
+    lengths scrambled / releases moved - a span of 1-4 s cut out, every other event dropped); the network learns to
+    map the song again from it, keeping what is right and fixing the rest."""
+    from .critic import blandify, corrupt
+
+    d = list(notes)
+    for _ in range(rng.randint(1, 3)):
+        k = rng.random()
+        if k < 0.25:
+            d = blandify(d, timing_points)
+        elif k < 0.75:
+            d = corrupt(d, rng)
+        elif k < 0.9 and d:
+            a = rng.choice(d).start
+            L = rng.randint(1000, 4000)
+            d = [n for n in d if not (a <= n.start < a + L)]
+        else:
+            ts = sorted({n.start for n in d})
+            keep = set(ts[::2])
+            d = [n for n in d if n.start in keep]
+    return d
+
+
+def draft_frames(draft_notes, start_ms: int, W: int, frame_ms: int = 10) -> np.ndarray:
+    """[W, MAP_DIM + 1]: picture of the draft (critic.map_frames) + a column of ones ("a draft is given")."""
+    from .critic import map_frames
+
+    x = map_frames(draft_notes, start_ms, W, frame_ms)
+    return np.concatenate([x, np.ones((W, 1), np.float32)], axis=1)
+
+
 def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame: int, vocab: Vocab, W: int,
                 frame_ms: int = 10, style_known: bool = True) -> Dict[str, torch.Tensor]:
     start_ms = start_frame * frame_ms
@@ -148,8 +181,9 @@ class V5Dataset(Dataset):
     def __init__(self, index: HybridIndex, map_indices: Sequence[int], vocab: Vocab, window_frames: int,
                  samples: int, seed: int = 0, train: bool = True, sr_balance: float = 0.5, hard_tilt: float = 0.0,
                  hard_share: float = 0.0, style_known_prob: float = 0.5, fixed: Optional[List[Tuple[int, int]]] = None,
-                 max_tokens: int = 1536, sections: bool = True, highlight=None):
+                 max_tokens: int = 1536, sections: bool = True, highlight=None, draft_prob: float = 0.0):
         self.index = index
+        self.draft_prob = float(draft_prob)
         self.cache = SongCache(index, sections, highlight)
         self.map_indices = list(map_indices)
         self.vocab = vocab
@@ -214,6 +248,16 @@ class V5Dataset(Dataset):
         start = max(0, start)
         item = window_item(self.cache, self.entries[k], self.notes[k], self.tps[k], start, self.vocab, self.W,
                            style_known=self.train and rng.random() < self.style_known_prob)
+        if self.draft_prob > 0:
+            # re-mapping: in a share of the windows the encoder also sees a damaged draft of the map (the target is
+            # still the human map); in the others the draft input is empty (the first pass)
+            from .critic import MAP_DIM
+            if rng.random() < self.draft_prob:
+                s_ms, e_ms = start * 10, (start + self.W) * 10
+                win = [n for n in self.notes[k] if s_ms - 2000 <= n.start < e_ms]
+                item["draft"] = torch.from_numpy(draft_frames(make_draft(win, self.tps[k], rng), s_ms, self.W))
+            else:
+                item["draft"] = torch.zeros(self.W, MAP_DIM + 1)
         if item["tokens"].shape[0] > self.max_tokens:            # extremely dense window: keep the first part
             for key in ("tokens", "phase", "tok_frame", "is_time"):
                 item[key] = item[key][: self.max_tokens]

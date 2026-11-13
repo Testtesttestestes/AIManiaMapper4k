@@ -54,6 +54,7 @@ class V5Config:
     regime_rank: int = 32
     highlight: List[float] = field(default_factory=list)   # climax model of osu_mapper/v5/sections.py (from kiai)
     ln_model: List[float] = field(default_factory=list)    # LN share from the audio (osu_mapper/v5/lnstyle.py)
+    draft: bool = False                  # re-mapping: the encoder also sees a draft of the map (critic.map_frames)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -144,6 +145,16 @@ class RegimeModule(nn.Module):
             z = hard + soft - soft.detach()                                                    # [B, S, K]
         else:
             z = F.one_hot(logits.argmax(-1), self.slots).float()
+        # load balancing (Switch Transformer): K x sum_k (share of parts on k) x (mean probability of k); 1 = even.
+        # Without it one regime takes almost every part and the others never learn (82 % / 17 % / 0 % ...)
+        act = int(self.active)
+        prob = torch.softmax(logits, dim=-1)[..., :act].reshape(-1, act)
+        used = cnt.reshape(-1) > 0
+        if used.any():
+            share = F.one_hot(prob[used].argmax(-1), act).float().mean(0)
+            self.balance = act * (share * prob[used].mean(0)).sum()
+        else:
+            self.balance = logits.sum() * 0.0
         zf = torch.gather(z, 1, seg[..., None].expand(-1, -1, self.slots)).to(x.dtype)          # [B, T, K]
         # the embedding carries the (straight-through) gradient to the choice; the adapter is applied only for the
         # regime each frame chose (computing all slots for every frame cost [B, T, slots, d] of memory)
@@ -281,6 +292,13 @@ class V5Net(nn.Module):
         self.style_mlp = nn.Sequential(nn.Linear(2 * cfg.style_dim, d), nn.GELU(), nn.Linear(d, d))
         self.null_cond = nn.Parameter(torch.zeros(d))
         self.at_time = nn.Linear(d, d)
+        # draft of the map (re-mapping passes): added to the encoder input; zero at the start, so a checkpoint made
+        # without it behaves exactly as before and learns to use it
+        if cfg.draft:
+            from .critic import MAP_DIM
+            self.draft_in = nn.Linear(MAP_DIM + 1, d)
+            nn.init.zeros_(self.draft_in.weight)
+            nn.init.zeros_(self.draft_in.bias)
         self.dec = nn.ModuleList([DecLayer(d, cfg.n_heads, cfg.ff_mult, cfg.dropout) for _ in range(cfg.dec_layers)])
         self.dec_norm = nn.LayerNorm(d)
         # every token except the TIME tokens, plus one "an event starts" slot (index time0): the time itself is
@@ -320,9 +338,14 @@ class V5Net(nn.Module):
         parts.append(beat)
         return parts
 
-    def encode(self, feats: torch.Tensor, beat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """feats [B, T, sum(groups)] (the groups' columns in order, see data.group_columns), beat [B, T, beat_dim]."""
+    def encode(self, feats: torch.Tensor, beat: torch.Tensor, draft: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """feats [B, T, sum(groups)] (the groups' columns in order, see data.group_columns), beat [B, T, beat_dim],
+        draft [B, T, MAP_DIM + 1] (picture of a draft map + "a draft is given" flag) or None."""
         x, w = self.selector(self.split_groups(feats, beat))
+        if getattr(self, "draft_in", None) is not None:
+            if draft is None:
+                draft = torch.zeros(*x.shape[:2], self.draft_in.in_features, device=x.device, dtype=x.dtype)
+            x = x + self.draft_in(draft.to(x.dtype))
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
         x = x + sinusoid(x.shape[1], x.shape[2], x.device)[None]
         half = len(self.enc) // 2
@@ -336,7 +359,8 @@ class V5Net(nn.Module):
                 x, regime = self.regime(x, part_index(sec, x.shape[1], x.shape[0], x.device))
             x = layer(x)
         x = self.enc_norm(x)
-        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x), "regime": regime}
+        bal = self.regime.balance if (self.regime is not None and regime is not None and hasattr(self.regime, "balance")) else None
+        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x), "regime": regime, "regime_balance": bal}
 
     def condition(self, sr: torch.Tensor, style: torch.Tensor, style_mask: torch.Tensor,
                   drop: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -397,7 +421,7 @@ class V5Net(nn.Module):
         return self.full_logprobs(self.decode_parts(x, mem, caches, key_pad, tok_frame))
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        enc = self.encode(batch["feats"], batch["beat"])
+        enc = self.encode(batch["feats"], batch["beat"], batch.get("draft"))
         B = batch["tokens"].shape[0]
         drop = None
         if self.training:      # always a mask in training, so the null condition is part of the graph (DDP)
@@ -409,7 +433,8 @@ class V5Net(nn.Module):
 
 
 def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cause_weight: float = 0.2,
-              label_smoothing: float = 0.02, window_ms: int = 10240) -> Tuple[torch.Tensor, Dict[str, float]]:
+              label_smoothing: float = 0.02, window_ms: int = 10240,
+              regime_balance: float = 0.01) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Next-token cross-entropy (+ the cause head on event frames). Per-item weights (hard mining) via
     batch['item_weight']; returns (loss, logs) with the per-item token loss in logs['_per_item'] for hard mining."""
     from .tokens import N_SPECIAL
@@ -456,6 +481,9 @@ def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], caus
         is_t = batch["is_time"][:, 1:] > 0
         if is_t.any():
             logs["time_tokens"] = float((ce * is_t.float()).sum() / is_t.float().sum().clamp(min=1.0))
+    if out.get("regime_balance") is not None and regime_balance > 0:
+        total = total + regime_balance * out["regime_balance"].float()
+        logs["regime_balance"] = float(out["regime_balance"].detach())
     logs["total"] = float(total.detach())
     out["_per_item"] = per_item.detach()
     return total, logs

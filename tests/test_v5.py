@@ -364,3 +364,46 @@ class TestLnShare(unittest.TestCase):
         d = song_descriptor(feats, sl, [RawTimingPoint(0.0, 400.0, 4, 2, 1, 60, True, 0)], 4.5)
         self.assertEqual(d.size, 15)
         self.assertTrue(0.0 <= predict(w, d) <= 1.0)
+
+
+class TestDraftPasses(unittest.TestCase):
+    def test_draft_and_passes(self):
+        import random as _r
+        from osu_mapper.v5.data import draft_frames, make_draft
+        from osu_mapper.v5.generate import generate_passes, style_of_notes
+        from osu_mapper.v5.model import V5Config, V5Net
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        notes = [Note(250 * i, i % 4, 250 * i + (600 if i % 5 == 0 else 0), i % 5 == 0) for i in range(40)]
+        d = make_draft(notes, tps, _r.Random(1))
+        self.assertNotEqual(sorted(d), sorted(notes))
+        fr = draft_frames(d, 0, 200)
+        self.assertEqual(fr.shape[1], 10)
+        self.assertTrue((fr[:, -1] == 1).all())
+        st, sm = style_of_notes(notes, np.zeros(11, np.float32), np.zeros(11, np.float32), 10000)
+        from osu_mapper.hybrid.solver import STYLE_KEYS
+        self.assertAlmostEqual(float(st[STYLE_KEYS.index("ln_ratio")]), 8 / 40, places=5)
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+                       window_ms=1280, max_tokens=256, regimes=0, draft=True)
+        m = V5Net(cfg).eval()
+        out = generate_passes(m, np.random.randn(400, 6).astype(np.float32), np.zeros((400, 13), np.float32), tps, 4.0,
+                              passes=2)
+        for c in range(4):
+            lane = sorted((n for n in out if n.col == c), key=lambda n: n.start)
+            for a, b in zip(lane, lane[1:]):
+                self.assertGreaterEqual(b.start, (a.end if a.ln else a.start) + 30)
+
+    def test_resume_adds_draft_input(self):
+        from osu_mapper.v5.model import V5Config, V5Net
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+                       window_ms=1280, max_tokens=256, regimes=0)
+        old = V5Net(cfg).eval()
+        cfg2 = V5Config(**{**cfg.to_dict(), "draft": True})
+        new = V5Net(cfg2).eval()
+        missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
+        self.assertEqual(unexpected, [])
+        self.assertTrue(all(k.startswith("draft_in.") for k in missing))
+        f, b = torch.randn(1, 128, 6), torch.randn(1, 128, 13)
+        with torch.no_grad():
+            a = old.encode(f, b)["memory"]
+            c = new.encode(f, b, torch.randn(1, 128, 10))["memory"]
+        self.assertTrue(torch.allclose(a, c, atol=1e-5))        # the zero-initialized draft input changes nothing yet

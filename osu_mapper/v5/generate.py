@@ -34,11 +34,13 @@ def _top_p(logits: torch.Tensor, p: float) -> torch.Tensor:
 def sample_window(model: V5Net, feats: torch.Tensor, beat: torch.Tensor, sr: float, style: np.ndarray,
                   style_mask: np.ndarray, prefix: Sequence[int], min_time: int, start_ms: int, timing_points,
                   n: int = 1, temperature: float = 0.9, top_p: float = 0.95, cfg_scale: float = 1.0,
-                  max_new: int = 1400, generator: Optional[torch.Generator] = None) -> List[List[int]]:
-    """``n`` token sequences of one window (each starting with ``prefix``); feats [T, D], beat [T, 13] of the window."""
+                  max_new: int = 1400, generator: Optional[torch.Generator] = None,
+                  draft: Optional[torch.Tensor] = None) -> List[List[int]]:
+    """``n`` token sequences of one window (each starting with ``prefix``); feats [T, D], beat [T, 13] of the window,
+    draft [T, MAP_DIM + 1] (re-mapping passes) or None."""
     v: Vocab = model.cfg.vocab()
     dev = feats.device
-    enc = model.encode(feats[None], beat[None])
+    enc = model.encode(feats[None], beat[None], None if draft is None else draft[None])
     use_cfg = cfg_scale != 1.0
     rows = 2 * n if use_cfg else n
     memory = enc["memory"].expand(rows, -1, -1)
@@ -97,8 +99,12 @@ def sample_window(model: V5Net, feats: torch.Tensor, beat: torch.Tensor, sr: flo
         t_ = torch.where(at_time, torch.full_like(at_time, max(1e-4, temperature), dtype=lg.dtype),
                          torch.ones_like(at_time, dtype=lg.dtype))
         lg = (lg + mask) / t_[:, None]
-        if top_p < 1.0 and bool(at_time.any()):
-            lg = torch.where(at_time[:, None], _top_p(lg, top_p), lg)
+        # long-note lengths: no temperature, but the far tail (a 9 s hold the network gives 1 % to) is cut
+        at_len = torch.tensor([any(lo == v.len0 for lo, _ in g.ranges(seqs[r])) if not g.done else False
+                               for r, g in enumerate(states)], device=lg.device)
+        cut = at_time | at_len
+        if top_p < 1.0 and bool(cut.any()):
+            lg = torch.where(cut[:, None], _top_p(lg, top_p), lg)
         nxt = torch.multinomial(torch.softmax(lg, dim=-1), 1, generator=generator).view(-1).tolist()
         new_ph, new_fr = [], []
         for r, t in enumerate(nxt):
@@ -133,9 +139,10 @@ def generate_song(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, tim
                   score_fn: Optional[Callable[[List[Note], List[Note], int, int], float]] = None,
                   temperature: float = 0.9, top_p: float = 0.95, cfg_scale: float = 1.0, seed: int = 0,
                   device: Optional[torch.device] = None, progress: Optional[Callable[[int, int], None]] = None,
-                  log: Optional[Callable[[str], None]] = None) -> List[Note]:
+                  log: Optional[Callable[[str], None]] = None, draft_notes: Optional[List[Note]] = None) -> List[Note]:
     """Notes of the whole song. ``score_fn(new_notes, notes_so_far, start_ms, end_ms)`` ranks the ``candidates``
-    continuations of every phrase (higher = better); without it the first sample is kept."""
+    continuations of every phrase (higher = better); without it the first sample is kept. ``draft_notes``: the map
+    of the previous pass - every window then sees it (its future notes included) while it is mapped again."""
     model.eval()
     dev = device or next(model.parameters()).device
     # inputs are built as features + attacks + sections (data.song_inputs); a model without some of them reads the
@@ -166,8 +173,13 @@ def generate_song(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, tim
         prefix_notes = [n for n in notes if s_ms <= n.start < cursor]
         prefix, _, _ = encode(prefix_notes, s_ms, v, add_eos=False)
         k = max(1, int(candidates))
+        dr = None
+        if draft_notes is not None and getattr(model, "draft_in", None) is not None:
+            from .data import draft_frames
+            win = [n for n in draft_notes if s_ms - 2000 <= n.start < s_ms + W * H]
+            dr = torch.from_numpy(draft_frames(win, s_ms, W, H)).to(dev)
         seqs = _sample_cpu_gen(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, timing_points, k,
-                               temperature, top_p, cfg_scale, gen)
+                               temperature, top_p, cfg_scale, gen, dr)
         end_ms = s_ms + W * H
         cands = [[n for n in decode(q, s_ms, v) if cursor <= n.start < end_ms] for q in seqs]
         if k > 1 and score_fn is not None:
@@ -189,13 +201,69 @@ def generate_song(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, tim
     return _resolve_overlaps(sorted(notes))
 
 
-def _sample_cpu_gen(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, tps, k, temperature, top_p, cfg, gen):
+def _sample_cpu_gen(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, tps, k, temperature, top_p, cfg, gen,
+                    draft=None):
     # torch.multinomial with a CPU generator needs CPU probabilities: sample on CPU when the model is elsewhere
-    if f.device.type != "cpu":
-        return sample_window(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, tps, k, temperature, top_p,
-                             cfg, generator=None)
     return sample_window(model, f, b, sr, style, style_mask, prefix, min_time, s_ms, tps, k, temperature, top_p, cfg,
-                         generator=gen)
+                         generator=None if f.device.type != "cpu" else gen, draft=draft)
+
+
+def style_of_notes(notes: Sequence[Note], style: np.ndarray, style_mask: np.ndarray, song_ms: float):
+    """The style of a whole draft map (share of long notes, chord size, notes per second) for the next pass, so every
+    window keeps one style; keys the user gave stay as they are."""
+    from ..hybrid.solver import STYLE_KEYS
+
+    st, sm = np.array(style, dtype=np.float32), np.array(style_mask, dtype=np.float32)
+    if not notes:
+        return st, sm
+    starts = sorted({n.start for n in notes})
+    span_s = max(1.0, (starts[-1] - starts[0]) / 1000.0) if len(starts) > 1 else max(1.0, song_ms / 1000.0)
+    vals = {"ln_ratio": sum(n.ln for n in notes) / len(notes),
+            "chord_mean": (len(notes) / max(1, len(starts)) - 1.0) / 3.0,
+            "nps": float(np.log1p(len(notes) / span_s) / np.log1p(30.0))}
+    for k, val in vals.items():
+        if k in STYLE_KEYS and sm[STYLE_KEYS.index(k)] == 0:
+            st[STYLE_KEYS.index(k)] = val
+            sm[STYLE_KEYS.index(k)] = 1.0
+    return st, sm
+
+
+def generate_passes(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, timing_points, sr: float,
+                    passes: int = 2, style: Optional[np.ndarray] = None, style_mask: Optional[np.ndarray] = None,
+                    log: Optional[Callable[[str], None]] = None, keep_better: bool = True, lane_predictor=None,
+                    power: Optional[np.ndarray] = None, **kw) -> List[Note]:
+    """Draft, then map again with the whole draft in view: pass 1 is the plain map; every further pass maps each window
+    again seeing the previous pass's notes there (future ones included: where a long note ends, what comes next) and
+    the style of the whole draft. Like the v4 canvas, a change is kept only where it is better: with ``keep_better``
+    every bar is taken from the draft or the new pass, whichever the per-note reward (and the critic, in the search
+    of generate_v5.py) likes more (stitch.stitch_candidates: long notes are not cut at the seams).
+
+    Not the same as v4: v4 re-predicted only masked / suspicious frames of a whole window at once (non-autoregressive,
+    the true notes on both sides); here every window is mapped again note by note, the draft being a hint."""
+    sd = model.cfg.style_dim
+    style = np.zeros(sd, np.float32) if style is None else np.asarray(style, np.float32)
+    style_mask = np.zeros(sd, np.float32) if style_mask is None else np.asarray(style_mask, np.float32)
+    notes = generate_song(model, feats_all, beat_all, timing_points, sr, style=style, style_mask=style_mask, log=log, **kw)
+    if getattr(model, "draft_in", None) is None:
+        return notes
+    for p in range(2, max(1, int(passes)) + 1):
+        st, sm = style_of_notes(notes, style, style_mask, feats_all.shape[0] * model.cfg.frame_ms)
+        new = generate_song(model, feats_all, beat_all, timing_points, sr, style=st, style_mask=sm, log=log,
+                            draft_notes=notes, **kw)
+        if keep_better and notes and new:
+            from ..hybrid.stitch import stitch_candidates
+            # with two versions the median is their mean: a bar may be taken from the sparser one if it has at least
+            # 3/4 of the notes (an empty bar has nothing to penalize and must not win for that)
+            merged, info = stitch_candidates([notes, new], timing_points, sr, lane_predictor, power, switch_margin=0.5,
+                                             min_density=0.75)
+            if log is not None:
+                log(f"  pass {p}: {len(notes)} -> {len(new)} notes; kept the better of the two per bar: "
+                    f"{100 * info['from'][1]:.0f}% of the bars from the new pass")
+            new = merged
+        elif log is not None:
+            log(f"  pass {p}: {len(notes)} -> {len(new)} notes ({sum(n.ln for n in new)} LN)")
+        notes = new
+    return notes
 
 
 def _resolve_overlaps(notes: List[Note], gap_ms: int = 30) -> List[Note]:
