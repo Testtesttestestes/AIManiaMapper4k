@@ -53,6 +53,7 @@ class V5Config:
     regimes_active: int = 4              # slots in use; train_v5.py --grow_every splits the worst one (MarI/O-like)
     regime_rank: int = 32
     highlight: List[float] = field(default_factory=list)   # climax model of osu_mapper/v5/sections.py (from kiai)
+    ln_model: List[float] = field(default_factory=list)    # LN share from the audio (osu_mapper/v5/lnstyle.py)
 
     def to_dict(self) -> Dict:
         return asdict(self)

@@ -82,13 +82,23 @@ def sample_window(model: V5Net, feats: torch.Tensor, beat: torch.Tensor, sr: flo
             break
         lg = logits[:n] if not use_cfg else logits[n:] + cfg_scale * (logits[:n] - logits[n:])
         mask = torch.full_like(lg, float("-inf"))
+        at_time = torch.zeros(lg.shape[0], dtype=torch.bool, device=lg.device)
         for r, g in enumerate(states):
             if g.done:
                 mask[r, EOS] = 0.0
                 continue
-            for lo, hi in g.ranges(seqs[r]):
+            rng_ = g.ranges(seqs[r])
+            at_time[r] = any(lo <= v.time0 < hi or lo >= v.time0 and hi <= v.mask0 for lo, hi in rng_)
+            for lo, hi in rng_:
                 mask[r, lo:hi] = 0.0
-        lg = _top_p((lg + mask) / max(1e-4, temperature), top_p)
+        # temperature and top-p only shape WHERE the next note goes; the lanes, tap-or-long-note and lengths are drawn
+        # from the network's own distribution: a temperature below 1 there pushes every minority choice (long notes
+        # in a map that is 29 % LN) out, token after token
+        t_ = torch.where(at_time, torch.full_like(at_time, max(1e-4, temperature), dtype=lg.dtype),
+                         torch.ones_like(at_time, dtype=lg.dtype))
+        lg = (lg + mask) / t_[:, None]
+        if top_p < 1.0 and bool(at_time.any()):
+            lg = torch.where(at_time[:, None], _top_p(lg, top_p), lg)
         nxt = torch.multinomial(torch.softmax(lg, dim=-1), 1, generator=generator).view(-1).tolist()
         new_ph, new_fr = [], []
         for r, t in enumerate(nxt):

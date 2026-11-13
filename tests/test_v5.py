@@ -345,3 +345,22 @@ class TestAutocast(unittest.TestCase):
             loss, logs = v5_losses(out, b, window_ms=cfg.window_ms)
         loss.backward()
         self.assertTrue(np.isfinite(logs["total"]))
+
+
+class TestLnShare(unittest.TestCase):
+    def test_fit_predict(self):
+        from osu_mapper.v5.lnstyle import fit, predict, song_descriptor
+        rng = np.random.default_rng(0)
+        samples = []
+        for _ in range(60):
+            x = rng.normal(0, 1, 15)                 # 4 flux + 4 stem flux + 4 attack rates + bpm, stars, bias
+            x[-1] = 1.0
+            samples.append((x, float(np.clip(0.3 + 0.1 * x[0], 0, 1))))
+        w = fit(samples, l2=1e-3)
+        errs = [abs(predict(w, x) - y) for x, y in samples]
+        self.assertLess(float(np.mean(errs)), 0.02)
+        feats = rng.normal(0, 1, (3000, 166)).astype(np.float32)
+        sl = {"mel_mid": (0, 8), "pitch": (8, 20), "chroma": (20, 32), "hpss": (32, 38), "demucs_stems": (38, 166)}
+        d = song_descriptor(feats, sl, [RawTimingPoint(0.0, 400.0, 4, 2, 1, 60, True, 0)], 4.5)
+        self.assertEqual(d.size, 15)
+        self.assertTrue(0.0 <= predict(w, d) <= 1.0)
