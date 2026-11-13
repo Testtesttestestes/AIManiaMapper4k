@@ -160,7 +160,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--steps_per_epoch", type=int, default=1000)
     ap.add_argument("--batch_size", default="16", help="per GPU, or 'auto' (the largest that fits --mem_fraction)")
-    ap.add_argument("--mem_fraction", type=float, default=0.9)
+    ap.add_argument("--mem_fraction", type=float, default=0.85,
+                    help="share of the card the auto batch size aims at (windows differ in length: keep a margin)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--min_lr", type=float, default=1e-5)
     ap.add_argument("--warmup_steps", type=int, default=1000)
@@ -272,7 +273,7 @@ def main() -> None:
     if auto:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
         # the memory of a step grows with the token count: probe with the longest of 64 random windows
-        cand = [train_ds[i] for i in range(64)]
+        cand = [train_ds[i] for i in range(128)]
         probe = sorted(cand, key=lambda it: -int(it["tokens"].shape[0]))[:4]
 
         def probe_step(n: int) -> None:
@@ -283,7 +284,9 @@ def main() -> None:
                 loss, _ = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms)
             loss.backward()
             model.zero_grad(set_to_none=True)
-        found = find_batch_size(probe_step, model, dev, args.mem_fraction, distributed=distributed, log=print)
+        ema_bytes = sum(p.numel() * p.element_size() for p in ema.parameters()) if ema is not None else 0
+        found = find_batch_size(probe_step, model, dev, args.mem_fraction, distributed=distributed, log=print,
+                                extra_bytes=ema_bytes)
         bs = found or 8
     train_ds.samples = args.steps_per_epoch * bs
     loader = DataLoader(train_ds, batch_size=bs, shuffle=False, num_workers=args.workers, collate_fn=collate,

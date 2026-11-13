@@ -28,7 +28,7 @@ def _peak(step: Callable[[int], None], bs: int, dev: torch.device) -> Optional[i
 
 
 def find_batch_size(step: Callable[[int], None], model: torch.nn.Module, dev: torch.device, fraction: float = 0.9,
-                    max_bs: int = 512, distributed: bool = False, log=print) -> Optional[int]:
+                    max_bs: int = 512, distributed: bool = False, log=print, extra_bytes: int = 0) -> Optional[int]:
     """``step(bs)``: one full training step without the optimizer update. None when not on a CUDA device."""
     if dev.type != "cuda":
         return None
@@ -36,7 +36,7 @@ def find_batch_size(step: Callable[[int], None], model: torch.nn.Module, dev: to
     free, total = torch.cuda.mem_get_info(dev)
     other = max(0, total - free - torch.cuda.memory_reserved(dev))          # other programs on the card
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
-    extra = 2 * param_bytes + (param_bytes if distributed else 0)          # Adam moments (+ DDP buckets)
+    extra = 2 * param_bytes + (param_bytes if distributed else 0) + int(extra_bytes)   # Adam moments (+ DDP buckets, + EMA)
     budget = fraction * total - other - extra
     p1 = _peak(step, 2, dev)
     p2 = _peak(step, 6, dev) if p1 is not None else None
