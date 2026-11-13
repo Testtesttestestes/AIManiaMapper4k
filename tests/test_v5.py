@@ -407,3 +407,40 @@ class TestDraftPasses(unittest.TestCase):
             a = old.encode(f, b)["memory"]
             c = new.encode(f, b, torch.randn(1, 128, 10))["memory"]
         self.assertTrue(torch.allclose(a, c, atol=1e-5))        # the zero-initialized draft input changes nothing yet
+
+
+class TestSongCacheOnDisk(unittest.TestCase):
+    def test_same_values_shared_through_files(self):
+        import tempfile
+        from pathlib import Path
+        from osu_mapper.v5.data import SongCache
+
+        rng = np.random.default_rng(0)
+        feats = rng.random((3000, 160)).astype(np.float32)
+
+        class FakeIndex:
+            def __init__(self, root):
+                self.root = Path(root)
+                self.data = {"feature_slices": {"onset": (0, 32), "demucs_stems": (32, 160)}}
+                self.songs = {"s1": {"features": ["s1.npy"]}}
+
+            def features(self, song_id, variant=0):
+                return feats
+
+        tps = [RawTimingPoint(time=0.0, beat_len=500.0, meter=4, uninherited=True)]
+        with tempfile.TemporaryDirectory() as d:
+            mem = SongCache(FakeIndex(d), disk=False)
+            a = SongCache(FakeIndex(d))
+            w0 = mem.window("s1", 100, 400, tps)
+            w1 = a.window("s1", 100, 400, tps)
+            files = sorted(p.name for p in (Path(d) / "v5_song_cache").glob("*.npy"))
+            self.assertEqual(len(files), 2)                       # attacks + sections
+            self.assertFalse(any(".tmp" in f for f in files))
+            b = SongCache(FakeIndex(d))                           # another worker: reads the files
+            self.assertIsInstance(b.attacks("s1"), np.memmap)
+            w2 = b.window("s1", 100, 400, tps)
+            np.testing.assert_allclose(w0, w1)
+            np.testing.assert_allclose(w0, w2)
+            other = [RawTimingPoint(time=0.0, beat_len=400.0, meter=4, uninherited=True)]
+            b.window("s1", 0, 100, other)                          # other red lines -> their own sections file
+            self.assertEqual(len(list((Path(d) / "v5_song_cache").glob("sec_*.npy"))), 2)

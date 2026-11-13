@@ -12,7 +12,10 @@ often (``set_hard_weights``, updated by train_v5.py after every epoch).
 
 from __future__ import annotations
 
+import hashlib
+import os
 import random
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -62,13 +65,18 @@ def song_inputs(feats: np.ndarray, slices: Dict[str, Tuple[int, int]], timing_po
 
 
 class SongCache:
-    """Per-song inputs that need the whole song: stem attack curves (robust statistics) and its parts (sections)."""
+    """Per-song inputs that need the whole song: stem attack curves (robust statistics) and its parts (sections).
 
-    def __init__(self, index: HybridIndex, sections: bool = True, highlight=None):
+    They are computed once and kept as .npy files in ``<dataset>/v5_song_cache`` (memory-mapped): the DataLoader
+    workers of every GPU then share the same pages instead of each holding its own copy of every song it has drawn
+    (4 workers x 3 GPUs x ~1000 songs x ~2 MB ran the machine out of RAM). ``disk=False`` keeps them in memory only."""
+
+    def __init__(self, index: HybridIndex, sections: bool = True, highlight=None, disk: bool = True):
         self.index = index
         self.highlight = list(highlight or [])
         self.slices = {k: tuple(v) for k, v in (index.data.get("feature_slices") or index.feature_config.slices()).items()}
         self.use_sections = bool(sections)
+        self.disk = bool(disk)
         self._att: Dict[str, Optional[np.ndarray]] = {}
         self._sec: Dict[str, np.ndarray] = {}
 
@@ -78,17 +86,54 @@ class SongCache:
         d["_sec"] = {}
         return d
 
+    def _file(self, song_id: str, kind: str, extra: str = "") -> Optional[Path]:
+        if not self.disk:
+            return None
+        root = getattr(self.index, "root", None)
+        if root is None:
+            return None
+        files = self.index.songs.get(song_id, {}).get("features") or [""]
+        h = hashlib.sha1(f"{song_id}|{files[0]}|{kind}|{extra}".encode("utf-8")).hexdigest()[:20]
+        return Path(root) / "v5_song_cache" / f"{kind}_{h}.npy"
+
+    @staticmethod
+    def _load_or_make(path: Optional[Path], make):
+        if path is not None and path.exists():
+            try:
+                return np.load(path, mmap_mode="r")
+            except (OSError, ValueError):
+                pass                                    # half-written or damaged: computed again
+        arr = make()
+        if path is None or arr is None:
+            return arr
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npy")
+            np.save(tmp, np.ascontiguousarray(arr, dtype=np.float32))
+            os.replace(tmp, path)                       # atomic: other workers see the whole file or none
+            return np.load(path, mmap_mode="r")
+        except OSError:
+            return arr                                  # read-only dataset folder: kept in memory
+
     def sections(self, song_id: str, timing_points) -> np.ndarray:
-        """[F, SECTION_DIM] of the song (with the red lines of the first map that asks for it)."""
-        if song_id not in self._sec:
-            feats = np.asarray(self.index.features(song_id, 0))
-            secs = find_sections(feats, self.slices, timing_points, highlight=self.highlight)
-            self._sec[song_id] = section_features(secs, feats.shape[0])
-        return self._sec[song_id]
+        """[F, SECTION_DIM] of the song (with the red lines of the map that asks for it)."""
+        tps = [t.as_tuple() if hasattr(t, "as_tuple") else tuple(t) for t in (timing_points or [])]
+        key = song_id + "|" + hashlib.sha1(repr((tps, self.highlight)).encode("utf-8")).hexdigest()[:16]
+        if key not in self._sec:
+            def make():
+                feats = np.asarray(self.index.features(song_id, 0))
+                secs = find_sections(feats, self.slices, timing_points, highlight=self.highlight)
+                return section_features(secs, feats.shape[0])
+            self._sec[key] = self._load_or_make(self._file(song_id, "sec", key), make)
+        return self._sec[key]
 
     def attacks(self, song_id: str) -> Optional[np.ndarray]:
         if song_id not in self._att:
-            self._att[song_id] = stem_attacks(np.asarray(self.index.features(song_id, 0)), self.slices)
+            if "demucs_stems" not in self.slices:
+                self._att[song_id] = None
+            else:
+                self._att[song_id] = self._load_or_make(
+                    self._file(song_id, "att"), lambda: stem_attacks(np.asarray(self.index.features(song_id, 0)), self.slices))
         return self._att[song_id]
 
     def window(self, song_id: str, start: int, length: int, timing_points=None, sections: Optional[bool] = None) -> np.ndarray:
