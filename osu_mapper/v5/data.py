@@ -210,8 +210,118 @@ def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame
     }
 
 
+def augment_notes(notes, mirror: bool = False, rotate: int = 0) -> list:
+    """Lanes mirrored (1234 -> 4321) and / or rotated (rotate = 1: 1234 -> 4123). Star ratings stay the same (the
+    mania star rating treats the columns alike; checked in tests/test_v5.py)."""
+    from ..hybrid.beatmap import Note as _N
+
+    if not mirror and not rotate:
+        return list(notes)
+    out = []
+    for n in notes:
+        c = int(n.col)
+        if mirror:
+            c = 3 - c
+        c = (c + rotate) % 4
+        out.append(_N(n.start, c, n.end, n.ln))
+    return out
+
+
+def _shifted(timing_points, ms: int):
+    from ..hybrid.beatmap import RawTimingPoint as _R
+
+    return [_R(tp.time - ms, tp.beat_len, tp.meter, tp.sample_set, tp.sample_index, tp.volume, tp.uninherited, tp.effects)
+            for tp in timing_points]
+
+
+def hide_frames(W: int, ratio: float, rng: random.Random) -> np.ndarray:
+    """[W] bool: frames under the mask - at random or (half the time) as spans of 0.2 - 3 s (inpainting a phrase)."""
+    k = int(round(min(1.0, max(0.0, ratio)) * W))
+    hidden = np.zeros(W, dtype=bool)
+    if k <= 0:
+        return hidden
+    if rng.random() < 0.5:
+        hidden[np.array(rng.sample(range(W), k))] = True
+        return hidden
+    while hidden.sum() < k:
+        L = rng.randint(20, 300)
+        a = rng.randint(0, max(0, W - 1))
+        hidden[a:a + L] = True
+    return hidden
+
+
+def canvas_item(cache: "SongCache", entry: Dict, notes, timing_points, start_frame: int, W: int, rng: random.Random,
+                style_known: bool, frame_ms: int = 10, mirror: bool = False, rotate: int = 0, shift_ms: int = 0,
+                p_empty: float = 0.1, p_fix: float = 0.25) -> Dict[str, torch.Tensor]:
+    """One training window of the canvas (as the v4 canvas): the human map as frames x lanes, part of it hidden (random
+    frames or whole phrases, any share from 5 to 100 %, "restore what is missing"), or - ``p_fix`` - a damaged copy of
+    it visible ("find and fix": the loss counts every frame, the error head learns which visible frames are wrong), or
+    - ``p_empty`` - nothing visible (a map from scratch). Augmentations: mirrored lanes, rotated lanes (tagged: the
+    condition knows; generation never rotates), a shift of 0-9 ms inside the frame (features interpolated between
+    frames, notes moved by the same milliseconds: every millisecond of a song can start a window)."""
+    from . import frames as fr
+
+    start_ms = start_frame * frame_ms + shift_ms
+    end_ms = start_ms + W * frame_ms
+    win = [n for n in notes if (n.end if n.ln else n.start) >= start_ms - frame_ms and n.start < end_ms]
+    win = augment_notes(win, mirror, rotate)
+    st, so, eo, _ = fr.encode(win, start_ms, W, frame_ms)
+    tps = _shifted(timing_points, shift_ms) if shift_ms else timing_points
+    if shift_ms:
+        rows = cache.window(entry["song_id"], start_frame, W + 1, timing_points)
+        a = shift_ms / float(frame_ms)
+        feats = (rows[:-1] * (1.0 - a) + rows[1:] * a).astype(np.float32)
+    else:
+        feats = cache.window(entry["song_id"], start_frame, W, timing_points)
+    beat = beat_features(tps, start_frame, W, frame_ms) if tps else np.zeros((W, BEAT_DIM), np.float32)
+    # what is visible: masked frames / a damaged copy / nothing
+    u = rng.random()
+    err = np.zeros(W, dtype=np.float32)
+    err_mask = np.zeros(W, dtype=np.float32)
+    if u < p_empty:
+        hidden = np.ones(W, dtype=bool)
+        vis = (st, so, eo)
+        loss = np.ones(W, dtype=np.float32)
+    elif u < p_empty + p_fix:
+        dmg = make_draft(win, timing_points, rng)
+        dst, dso, deo, _ = fr.encode(dmg, start_ms, W, frame_ms)
+        vis = (dst, dso, deo)
+        hidden = hide_frames(W, rng.uniform(0.0, 0.3), rng)
+        loss = np.ones(W, dtype=np.float32)
+        err = fr.frame_differs(vis, (st, so, eo)).astype(np.float32)
+        err_mask = (~hidden).astype(np.float32)
+    else:
+        r = max(0.05, float(np.cos(np.pi / 2 * rng.random())))
+        hidden = hide_frames(W, r, rng)
+        vis = (st, so, eo)
+        loss = hidden.astype(np.float32)
+        err_mask = (~hidden).astype(np.float32)                 # visible frames are the truth here: "no error"
+    s_in, a_in, e_in = fr.inputs(*vis, hidden)
+    cause = np.full(W, -1, dtype=np.int64)
+    ev = np.flatnonzero(((st == fr.TAP) | (st == fr.HEAD)).any(axis=1))
+    if ev.size:
+        t_ev = start_ms + ev * frame_ms + np.where(so[ev] >= 0, so[ev], 99).min(axis=1)
+        cause[ev] = note_causes(t_ev, cache.attacks(entry["song_id"]), frame_ms)
+    style = np.asarray(entry["style"], dtype=np.float32)
+    smask = np.asarray(entry["style_mask"], dtype=np.float32) if style_known else np.zeros_like(style)
+    return {
+        "feats": torch.from_numpy(np.ascontiguousarray(feats)), "beat": torch.from_numpy(beat.astype(np.float32)),
+        "cv_state": torch.from_numpy(s_in), "cv_start": torch.from_numpy(a_in), "cv_end": torch.from_numpy(e_in),
+        "cv_hidden": torch.from_numpy(hidden.astype(np.int64)),
+        "cv_tgt_state": torch.from_numpy(st.astype(np.int64)), "cv_tgt_start": torch.from_numpy(so.astype(np.int64)),
+        "cv_tgt_end": torch.from_numpy(eo.astype(np.int64)),
+        "cv_loss": torch.from_numpy(loss), "cv_err": torch.from_numpy(err), "cv_err_mask": torch.from_numpy(err_mask),
+        "cause": torch.from_numpy(cause),
+        "sr": torch.tensor([float(entry.get("sr", 0.0))], dtype=torch.float32),
+        "style": torch.from_numpy(style), "style_mask": torch.from_numpy(smask),
+        "aug": torch.tensor([1 if rotate else 0], dtype=torch.int64),
+    }
+
+
 def collate(items: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
+    if "tokens" not in items[0]:                       # canvas windows: every tensor has the same shape
+        return {k: torch.stack([it[k] for it in items]) for k in items[0]}
     L = max(int(it["tokens"].shape[0]) for it in items)
     for k in items[0]:
         if k in ("tokens", "phase", "tok_frame", "is_time"):
@@ -226,9 +336,12 @@ class V5Dataset(Dataset):
     def __init__(self, index: HybridIndex, map_indices: Sequence[int], vocab: Vocab, window_frames: int,
                  samples: int, seed: int = 0, train: bool = True, sr_balance: float = 0.5, hard_tilt: float = 0.0,
                  hard_share: float = 0.0, style_known_prob: float = 0.5, fixed: Optional[List[Tuple[int, int]]] = None,
-                 max_tokens: int = 1536, sections: bool = True, highlight=None, draft_prob: float = 0.0):
+                 max_tokens: int = 1536, sections: bool = True, highlight=None, draft_prob: float = 0.0,
+                 decoder: str = "ar", mirror: float = 0.5, rotate: float = 0.25, shift: float = 0.5):
         self.index = index
         self.draft_prob = float(draft_prob)
+        self.decoder = decoder
+        self.p_mirror, self.p_rotate, self.p_shift = float(mirror), float(rotate), float(shift)
         self.cache = SongCache(index, sections, highlight)
         self.map_indices = list(map_indices)
         self.vocab = vocab
@@ -291,6 +404,16 @@ class V5Dataset(Dataset):
             a, b = self.spans[k]
             start = rng.randint(a - self.W // 4, max(a - self.W // 4 + 1, b - self.W // 2))
         start = max(0, start)
+        if self.decoder == "canvas":
+            aug = self.train and self.fixed is None
+            item = canvas_item(self.cache, self.entries[k], self.notes[k], self.tps[k], start, self.W, rng,
+                               style_known=self.train and rng.random() < self.style_known_prob,
+                               mirror=aug and rng.random() < self.p_mirror,
+                               rotate=rng.randint(1, 3) if aug and rng.random() < self.p_rotate else 0,
+                               shift_ms=rng.randint(1, 9) if aug and rng.random() < self.p_shift else 0)
+            item["map_k"] = torch.tensor([k], dtype=torch.int64)
+            item["item_weight"] = torch.tensor([1.0], dtype=torch.float32)
+            return item
         item = window_item(self.cache, self.entries[k], self.notes[k], self.tps[k], start, self.vocab, self.W,
                            style_known=self.train and rng.random() < self.style_known_prob)
         if self.draft_prob > 0:

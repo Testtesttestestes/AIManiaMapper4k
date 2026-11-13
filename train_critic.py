@@ -5,10 +5,13 @@ Trains the critic of the v5 network (osu_mapper/v5/critic.py): audio + notes of 
     python train_critic.py --data dataset_hybrid
     python train_critic.py --data dataset_hybrid --v5 checkpoints/v5/v5_best.pt --network_windows 400   # + the network's own maps
 
-Positives: windows of human maps. Negatives: the same windows made bland (everything on 1/2, bursts collapsed), broken
-(lanes shuffled, timing jittered, notes removed or added), self-generated maps of the dataset (make_self_maps.py), and
-- with --v5 - windows the v5 network generates on training songs (re-run after each v5 training round, as the
-discriminator of GAIL keeps up with the generator). Validation: accuracy on held-out songs per kind of negative.
+Targets: 1 for windows of human maps; for every other window its REAL quality against the human map of the same
+place (0.6 x note F1 + 0.4 x expressiveness: bursts, rhythm, density per bar, long notes) - for the same windows made
+bland (everything on 1/2, bursts collapsed), broken (lanes, timing, missing / extra notes, long notes), self-generated
+maps of the dataset (make_self_maps.py), and - with --v5 - windows the v5 network generates on training songs. So
+the critic learns how bad the network's own maps are and where, from their actual errors (re-run after each v5
+training round, as the discriminator of GAIL keeps up with the generator). Validation: error of the predicted
+quality per kind of window, and its correlation with the real quality of the network's windows.
 The critic is saved as <checkpoint_dir>/critic.pt and used by generate_v5.py --search.
 """
 
@@ -68,9 +71,23 @@ class CriticData(Dataset):
             win = given
         feats = self.cache.window(e["song_id"], start, self.W, tps, sections=False)   # sound + stem attacks
         beat = beat_features(tps, start, self.W, 10)
+        q = 1.0 if kind == "human" else window_quality(win, [n for n in notes if s_ms <= n.start < e_ms], s_ms, e_ms, tps)
         return (torch.from_numpy(feats), torch.from_numpy(beat.astype(np.float32)),
-                torch.from_numpy(map_frames(win, s_ms, self.W)), torch.tensor(1.0 if kind == "human" else 0.0),
+                torch.from_numpy(map_frames(win, s_ms, self.W)), torch.tensor(q, dtype=torch.float32),
                 torch.tensor(KINDS.index(kind)))
+
+
+def window_quality(pred, ref, s_ms: int, e_ms: int, timing_points) -> float:
+    """How good a window is against the human map of the same place: 0.6 x note F1 (32 ms) + 0.4 x expressiveness
+    (bursts, rhythm, density per bar, long notes). The critic learns this number - not only "human or not" - so it
+    knows roughly how bad a map of the network is, from the real errors of the network's own maps."""
+    from osu_mapper.hybrid.metrics import expressive_score, per_ms_report
+
+    pred = [n for n in pred if s_ms <= n.start < e_ms]
+    if not ref:
+        return 1.0 if not pred else 0.3
+    rep = per_ms_report(pred, ref, tolerances=(32,), timing_points=timing_points)
+    return float(np.clip(0.6 * rep.get("event_f1@32", 0.0) + 0.4 * expressive_score(rep), 0.0, 1.0))
 
 
 def make_items(index: HybridIndex, maps: List[int], W: int, per_map: int, rng: random.Random, network: Dict[int, list]):
@@ -101,7 +118,7 @@ def make_items(index: HybridIndex, maps: List[int], W: int, per_map: int, rng: r
 
 
 def network_maps(index: HybridIndex, cache: SongCache, maps: List[int], ckpt: str, n_maps: int, dev, max_sec: float):
-    from osu_mapper.v5.generate import generate_song
+    from osu_mapper.v5.infer import generate_map
     from osu_mapper.v5.model import V5Config, V5Net
 
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
@@ -115,8 +132,8 @@ def network_maps(index: HybridIndex, cache: SongCache, maps: List[int], ckpt: st
         fa = song_inputs(np.asarray(index.features(e["song_id"], 0)), cache.slices, tr.timing_points,
                          highlight=net.cfg.highlight)
         Fr = min(fa.shape[0], int(max_sec * 100))
-        out[mi] = generate_song(net, fa[:Fr], beat_features(tr.timing_points, 0, Fr, 10), tr.timing_points,
-                                float(e.get("sr", 0.0)), device=dev)
+        out[mi] = generate_map(net, fa[:Fr], beat_features(tr.timing_points, 0, Fr, 10), tr.timing_points,
+                               float(e.get("sr", 0.0)), device=dev)
     return out
 
 
@@ -175,19 +192,23 @@ def main() -> None:
             opt.step()
             tot, n = tot + loss.item(), n + 1
         net.eval()
-        right = {k: [0, 0] for k in KINDS}
+        preds: Dict[str, list] = {k: [] for k in KINDS}
         with torch.no_grad():
             for f, b, m, y, k in va:
-                p = net(f.to(dev), b.to(dev), m.to(dev)).cpu() > 0
+                p = torch.sigmoid(net(f.to(dev), b.to(dev), m.to(dev))).cpu()
                 for pi, yi, ki in zip(p.tolist(), y.tolist(), k.tolist()):
-                    right[KINDS[ki]][0] += int(pi == (yi > 0.5))
-                    right[KINDS[ki]][1] += 1
-        acc = {k: c / t for k, (c, t) in right.items() if t}
-        neg = [v for k, v in acc.items() if k != "human"]
-        # half human, half the negatives: "everything is fake" scores 0.5, not 2/3
-        bal = 0.5 * acc.get("human", 0.0) + 0.5 * (float(np.mean(neg)) if neg else 0.0)
-        print(f"[critic {ep}] train loss {tot / max(1, n):.4f} ({time.time() - t0:.0f}s) | held-out accuracy "
-              + " ".join(f"{k} {v:.2f}" for k, v in acc.items()) + f" | balanced {bal:.3f}", flush=True)
+                    preds[KINDS[ki]].append((pi, yi))
+        err = {k: float(np.mean([abs(a - b) for a, b in v])) for k, v in preds.items() if v}
+        net_pairs = preds.get("network", []) + preds.get("self", [])
+        corr = float(np.corrcoef(*zip(*net_pairs))[0, 1]) if len(net_pairs) > 3 else float("nan")
+        neg = [v for k, v in err.items() if k != "human"]
+        # half human, half the others: predicting one constant cannot score well
+        bal = 1.0 - (0.5 * err.get("human", 1.0) + 0.5 * (float(np.mean(neg)) if neg else 1.0))
+        print(f"[critic {ep}] train loss {tot / max(1, n):.4f} ({time.time() - t0:.0f}s) | held-out error of the predicted "
+              f"quality: " + " ".join(f"{k} {v:.3f}" for k, v in err.items())
+              + (f" | network maps: correlation with their real quality {corr:.2f}" if np.isfinite(corr) else "")
+              + f" | score {bal:.3f}", flush=True)
+        acc = err
         if bal > best:
             best = bal
             torch.save({"config": cfg.to_dict(), "model": net.state_dict(), "accuracy": acc}, out / "critic.pt")

@@ -2,6 +2,7 @@
 
 import random
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -60,7 +61,7 @@ class TestTokens(unittest.TestCase):
 class TestModel(unittest.TestCase):
     def _cfg(self):
         from osu_mapper.v5.model import V5Config
-        return V5Config(groups={"a": 6, "b": 4}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=128,
+        return V5Config(decoder="ar", groups={"a": 6, "b": 4}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=128,
                         window_ms=1280, max_tokens=512)
 
     def _batch(self, cfg, notes):
@@ -160,7 +161,7 @@ if __name__ == "__main__":
 class TestDistancePrior(unittest.TestCase):
     def test_prior_prefers_usual_gaps(self):
         from osu_mapper.v5.model import V5Config, V5Net
-        m = V5Net(V5Config(groups={"a": 4}, d_model=16, enc_layers=1, dec_layers=1, n_heads=2, window_frames=64,
+        m = V5Net(V5Config(decoder="ar", groups={"a": 4}, d_model=16, enc_layers=1, dec_layers=1, n_heads=2, window_frames=64,
                            window_ms=640, max_tokens=64))
         m.init_distance_prior([12] * 50 + [25] * 20 + [3] * 2)
         w = m.dist_bias.weight[:, 0]
@@ -228,7 +229,7 @@ class TestSectionsRegimesExplainMeta(unittest.TestCase):
         from osu_mapper.v5.meta import BurstMeta, MetaConfig, burst_inputs, span_has_burst
         from osu_mapper.v5.model import V5Config, V5Net
         from osu_mapper.v5.tokens import encode
-        cfg = V5Config(groups={"a": 6, "stem_vocals": 4, "attacks": 4}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4,
+        cfg = V5Config(decoder="ar", groups={"a": 6, "stem_vocals": 4, "attacks": 4}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4,
                        window_frames=128, window_ms=1280, max_tokens=256, regimes=0)
         m = V5Net(cfg)
         notes = [Note(100 + 125 * i, i % 4, 100 + 125 * i, False) for i in range(8)]
@@ -293,7 +294,7 @@ class TestFactorizedTime(unittest.TestCase):
         from osu_mapper.v5.model import V5Config, V5Net, v5_losses
         from osu_mapper.v5.tokens import encode
         from osu_mapper.v5.data import collate, PHASE_NONE
-        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+        cfg = V5Config(decoder="ar", groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
                        window_ms=1280, max_tokens=256, regimes=0)
         m = V5Net(cfg).eval()
         v = cfg.vocab()
@@ -324,7 +325,7 @@ class TestAutocast(unittest.TestCase):
         from osu_mapper.v5.data import collate, PHASE_NONE
         from osu_mapper.v5.sections import SECTION_DIM
         from osu_mapper.v5.tokens import encode
-        cfg = V5Config(groups={"a": 6, "section": SECTION_DIM}, d_model=32, enc_layers=2, dec_layers=1, n_heads=4,
+        cfg = V5Config(decoder="ar", groups={"a": 6, "section": SECTION_DIM}, d_model=32, enc_layers=2, dec_layers=1, n_heads=4,
                        window_frames=128, window_ms=1280, max_tokens=256, regimes=6, regimes_active=3)
         m = V5Net(cfg).train()
         v = cfg.vocab()
@@ -382,7 +383,7 @@ class TestDraftPasses(unittest.TestCase):
         st, sm = style_of_notes(notes, np.zeros(11, np.float32), np.zeros(11, np.float32), 10000)
         from osu_mapper.hybrid.solver import STYLE_KEYS
         self.assertAlmostEqual(float(st[STYLE_KEYS.index("ln_ratio")]), 8 / 40, places=5)
-        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+        cfg = V5Config(decoder="ar", groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
                        window_ms=1280, max_tokens=256, regimes=0, draft=True)
         m = V5Net(cfg).eval()
         out = generate_passes(m, np.random.randn(400, 6).astype(np.float32), np.zeros((400, 13), np.float32), tps, 4.0,
@@ -394,7 +395,7 @@ class TestDraftPasses(unittest.TestCase):
 
     def test_resume_adds_draft_input(self):
         from osu_mapper.v5.model import V5Config, V5Net
-        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
+        cfg = V5Config(decoder="ar", groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=1, n_heads=4, window_frames=128,
                        window_ms=1280, max_tokens=256, regimes=0)
         old = V5Net(cfg).eval()
         cfg2 = V5Config(**{**cfg.to_dict(), "draft": True})
@@ -444,3 +445,128 @@ class TestSongCacheOnDisk(unittest.TestCase):
             other = [RawTimingPoint(time=0.0, beat_len=400.0, meter=4, uninherited=True)]
             b.window("s1", 0, 100, other)                          # other red lines -> their own sections file
             self.assertEqual(len(list((Path(d) / "v5_song_cache").glob("sec_*.npy"))), 2)
+
+
+class TestCanvas(unittest.TestCase):
+    def _notes(self):
+        out = []
+        for i in range(60):
+            t = 200 + 125 * i + (i % 3)
+            if i % 7 == 0:
+                out.append(Note(t, i % 4, t + 430 + i, True))
+            else:
+                out.append(Note(t, (i * 3) % 4, t, False))
+        out += [Note(5000, 0, 5000, False), Note(5003, 1, 5003, False)]          # staggered chord
+        # drop overlaps on a lane (a real map has none)
+        held, keep = {c: -10 ** 9 for c in range(4)}, []
+        for n in sorted(out):
+            if n.start < held[n.col] + 30:
+                continue
+            keep.append(n)
+            held[n.col] = n.end if n.ln else n.start
+        return keep
+
+    def test_roundtrip_and_windows(self):
+        from osu_mapper.v5 import frames as fr
+        notes = self._notes()
+        F = max((n.end if n.ln else n.start) for n in notes) // 10 + 3
+        st, so, eo, lossy = fr.encode(notes, 0, F)
+        self.assertEqual(lossy, 0)
+        self.assertEqual(fr.decode(st, so, eo, 0), sorted(notes))
+        # a window starting inside a long note sees HOLD from its first frame
+        ln = next(n for n in notes if n.ln)
+        s0 = ln.start + 100
+        st2, _, _, _ = fr.encode(notes, s0, 50)
+        self.assertEqual(int(st2[0, ln.col]), fr.HOLD)
+        s_in, a_in, e_in = fr.inputs(st, so, eo, np.arange(F) % 2 == 0)
+        self.assertTrue((s_in[::2] == fr.MASK_STATE).all() and (a_in[::2] == fr.MASK_OFF).all())
+
+    def test_allowed_states(self):
+        from osu_mapper.v5 import frames as fr
+        from osu_mapper.v5.canvas_gen import allowed_states
+        st = np.zeros((1, 6, 4), np.int8)
+        st[0, 0, 0] = fr.HEAD
+        hidden = np.ones((1, 6), bool)
+        hidden[0, 0] = False
+        ok = allowed_states(st, hidden)
+        self.assertTrue(ok[0, 1, 0, fr.HOLD] and ok[0, 1, 0, fr.TAIL])          # after a head: hold or tail
+        self.assertFalse(ok[0, 1, 0, fr.TAP] or ok[0, 1, 0, fr.EMPTY])
+        self.assertFalse(ok[0, 1, 1, fr.HOLD])                                   # known empty frame before: no hold
+        st[0, 0, 1] = fr.TAP
+        ok = allowed_states(st, hidden)
+        self.assertFalse(ok[0, 1, 1, fr.TAP] or ok[0, 2, 1, fr.TAP])             # 30 ms after a tap on the lane
+
+    def test_item_model_loss_own_errors(self):
+        import random as _r
+        from osu_mapper.v5 import frames as fr
+        from osu_mapper.v5.data import canvas_item, collate
+        from osu_mapper.v5.model import V5Config, V5Net, canvas_losses
+
+        class Cache:
+            def window(self, song_id, start, length, tps=None, sections=None):
+                return np.random.default_rng(start).normal(0, 1, (length, 6)).astype(np.float32)
+
+            def attacks(self, song_id):
+                return None
+        notes = self._notes()
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        entry = {"song_id": "s", "sr": 4.0, "style": [0.0] * 11, "style_mask": [0.0] * 11}
+        items = [canvas_item(Cache(), entry, notes, tps, 10, 128, _r.Random(k), True, mirror=k % 2 == 0,
+                             rotate=k % 4, shift_ms=k % 10) for k in range(6)]
+        b = collate(items)
+        self.assertEqual(tuple(b["cv_state"].shape), (6, 128, 4))
+        # the loss counts hidden frames (or every frame of a damaged canvas)
+        self.assertTrue(((b["cv_loss"] > 0) | (b["cv_hidden"] == 0)).all())
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=128,
+                       window_ms=1280, regimes=0, decoder="canvas")
+        m = V5Net(cfg).train()
+        out = m(b)
+        loss, logs = canvas_losses(out, b)
+        loss.backward()
+        self.assertTrue(np.isfinite(logs["total"]))
+        import importlib.util, sys
+        spec = importlib.util.spec_from_file_location("train_v5_mod", str(Path(__file__).resolve().parents[1] / "train_v5.py"))
+        tv5 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tv5)
+        nb = tv5.own_error_batch(m, b)
+        self.assertTrue((nb["cv_hidden"] == 0).all())
+        self.assertTrue((nb["cv_state"] != fr.MASK_STATE).all())               # its own version is fully visible
+        self.assertTrue(((nb["cv_err"] == 0) | (nb["cv_err"] == 1)).all())
+        loss2, _ = canvas_losses(m(nb), nb)
+        self.assertTrue(torch.isfinite(loss2))
+
+    def test_generate_control_and_explain(self):
+        from osu_mapper.v5.canvas_gen import generate_canvas
+        from osu_mapper.v5.explain import explain_events_canvas
+        from osu_mapper.v5.model import V5Config, V5Net
+        torch.manual_seed(0)
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=128,
+                       window_ms=1280, regimes=0, decoder="canvas")
+        m = V5Net(cfg).eval()
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        F = 600
+        fa = np.random.default_rng(1).normal(0, 1, (F, 6)).astype(np.float32)
+        ba = np.zeros((F, 13), np.float32)
+        out = generate_canvas(m, fa, ba, tps, 4.0, steps=3, candidates=2, score_fn=lambda c, a, s, e: -len(c))
+        for c in range(4):
+            lane = sorted(n for n in out if n.col == c)
+            for a, b_ in zip(lane, lane[1:]):
+                self.assertGreaterEqual(b_.start, (a.end if a.ln else a.start))
+        fixed = self._notes()
+        out2 = generate_canvas(m, fa, ba, tps, 4.0, steps=3, fixed=fixed, regen=[(2.0, 3.0)])
+        kept = [n for n in fixed if not (2000 <= n.start <= 3010) and (n.end if n.ln else n.start) < 2000]
+        for n in kept:
+            self.assertIn(n, out2)
+        rows = explain_events_canvas(m, fa[:128], ba[:128], fixed, 4.0, 0, [fixed[1].start], steps=2)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(sum(rows[0][k] for k in ("vocals", "drums", "bass", "other", "mix", "section", "beat")), 1.0,
+                               places=5)
+
+    def test_star_rating_ignores_lane_order(self):
+        from osu_mapper.hybrid.inference import star_rating_of
+        from osu_mapper.v5.data import augment_notes
+        notes = self._notes()
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        base = star_rating_of(notes, tps)
+        for mirror, rot in ((True, 0), (False, 1), (False, 2), (True, 3)):
+            self.assertAlmostEqual(star_rating_of(augment_notes(notes, mirror, rot), tps), base, places=6)

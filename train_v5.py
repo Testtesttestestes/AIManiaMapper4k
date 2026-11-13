@@ -39,8 +39,8 @@ from osu_mapper.hybrid.dataset import HybridIndex
 from osu_mapper.hybrid.metrics import expressive_score, per_ms_report, summarize_reports
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.v5.data import SongCache, V5Dataset, collate, group_columns, song_inputs
-from osu_mapper.v5.generate import generate_passes, generate_song
-from osu_mapper.v5.model import PRESETS, V5Config, V5Net, count_parameters, v5_losses
+from osu_mapper.v5.infer import generate_map
+from osu_mapper.v5.model import PRESETS, V5Config, V5Net, canvas_losses, count_parameters, v5_losses
 from train_hybrid import init_distributed, lr_at
 
 
@@ -54,15 +54,51 @@ def to_dev(b: Dict[str, torch.Tensor], dev) -> Dict[str, torch.Tensor]:
     return {k: v.to(dev, non_blocking=True) for k, v in b.items()}
 
 
+def losses_of(model_cfg, out, b, args):
+    if model_cfg.decoder == "canvas":
+        return canvas_losses(out, b, args.cause_weight, event_weight=args.event_weight, error_weight=args.error_weight,
+                             regime_balance=args.regime_balance)
+    return v5_losses(out, b, args.cause_weight, window_ms=model_cfg.window_ms, regime_balance=args.regime_balance)
+
+
 @torch.no_grad()
-def val_tokens(model: V5Net, loader, dev) -> Dict[str, float]:
+def own_error_batch(train_model, b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Learn from the network's own errors (step-unrolled denoising, SUNDAE - Savinov et al. 2021): the network first
+    restores the hidden frames of the batch itself; its own version becomes the visible canvas, the target stays the
+    human map, every frame counts, and the error head is told exactly which frames the network got wrong - the real
+    errors of inference, not only the synthetic damage."""
+    from osu_mapper.v5 import frames as fr
+
+    out = train_model(b)["canvas"]
+    hid = b["cv_hidden"].bool()                                                  # [B, T]
+    st = torch.distributions.Categorical(logits=out["state"].float()).sample()   # [B, T, 4]
+    a = out["start"].float().argmax(-1)
+    e = out["end"].float().argmax(-1)
+    no = torch.full_like(st, fr.NO_OFF)
+    st_new = torch.where(hid[..., None], st, b["cv_state"])
+    a_new = torch.where(hid[..., None], torch.where((st == fr.TAP) | (st == fr.HEAD), a, no), b["cv_start"])
+    e_new = torch.where(hid[..., None], torch.where(st == fr.TAIL, e, no), b["cv_end"])
+    tgt_a = torch.where(b["cv_tgt_start"] >= 0, b["cv_tgt_start"], torch.full_like(b["cv_tgt_start"], fr.NO_OFF))
+    tgt_e = torch.where(b["cv_tgt_end"] >= 0, b["cv_tgt_end"], torch.full_like(b["cv_tgt_end"], fr.NO_OFF))
+    wrong = ((st_new != b["cv_tgt_state"]) | (a_new != tgt_a) | (e_new != tgt_e)).any(-1)
+    nb = dict(b)
+    nb.update(cv_state=st_new, cv_start=a_new, cv_end=e_new, cv_hidden=torch.zeros_like(b["cv_hidden"]),
+              cv_loss=torch.ones_like(b["cv_loss"]), cv_err=wrong.float(), cv_err_mask=torch.ones_like(b["cv_err_mask"]))
+    return nb
+
+
+@torch.no_grad()
+def val_tokens(model: V5Net, loader, dev, args=None) -> Dict[str, float]:
     model.eval()
     sums: Dict[str, float] = {}
     n = 0
     for b in loader:
         b = to_dev(b, dev)
         out = model(b)
-        _, logs = v5_losses(out, b, window_ms=model.cfg.window_ms)
+        if model.cfg.decoder == "canvas":
+            _, logs = canvas_losses(out, b)
+        else:
+            _, logs = v5_losses(out, b, window_ms=model.cfg.window_ms)
         for k, v in logs.items():
             sums[k] = sums.get(k, 0.0) + v
         n += 1
@@ -85,7 +121,8 @@ def val_style(entry: Dict[str, Any], keys: str):
 
 
 def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[int], dev, temperature: float,
-             cfg_scale: float, max_sec: float, style_keys: str = "ln", passes: int = 1) -> Dict[str, float]:
+             cfg_scale: float, max_sec: float, style_keys: str = "ln", passes: int = 1, canvas_steps: int = 8,
+             refine: int = 1) -> Dict[str, float]:
     reps = []
     for i in map_idx:
         e = index.maps[i]
@@ -97,8 +134,9 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         fa = fa[:F]
         ba = beat_features(tr.timing_points, 0, F, 10)
         st, sm = val_style(e, style_keys)
-        notes = generate_passes(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), passes=passes, style=st,
-                                style_mask=sm, temperature=temperature, cfg_scale=cfg_scale, device=dev)
+        notes = generate_map(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), passes=passes, style=st,
+                             style_mask=sm, temperature=temperature, cfg_scale=cfg_scale, device=dev,
+                             steps=canvas_steps, refine_passes=refine)
         ref = [n for n in ref if n.start < F * 10]
         rep = per_ms_report(notes, ref, timing_points=tr.timing_points)
         rep["expressive"] = expressive_score(rep)
@@ -277,6 +315,22 @@ def main() -> None:
     ap.add_argument("--grow_every", type=int, default=3,
                     help="every N epochs the regime with the highest loss is split in two (its copy specialises): "
                          "'grow where it errs' as in MarI/O / NEAT; 0 = never")
+    ap.add_argument("--decoder", default="canvas", choices=["canvas", "ar"],
+                    help="canvas (default): the map as frames x lanes, hidden parts restored with everything else in view "
+                         "(as the v4 canvas); ar: the older autoregressive event decoder")
+    ap.add_argument("--mirror", type=float, default=0.5, help="canvas: share of windows with mirrored lanes (1234 -> 4321)")
+    ap.add_argument("--rotate", type=float, default=0.25,
+                    help="canvas: share of windows with rotated lanes (1234 -> 4123 / 3412 / 2341), tagged in the condition "
+                         "(generation never rotates); star ratings are the same")
+    ap.add_argument("--shift", type=float, default=0.5,
+                    help="canvas: share of windows moved by 1-9 ms inside the frame (features interpolated, notes moved)")
+    ap.add_argument("--self_correct", type=float, default=0.25,
+                    help="canvas: share of steps that learn from the network's own errors: it restores the hidden frames "
+                         "itself first, then fixes its own version (the error head gets the real errors)")
+    ap.add_argument("--event_weight", type=float, default=4.0, help="canvas: weight of frames with a note in the loss")
+    ap.add_argument("--error_weight", type=float, default=0.3, help="canvas: loss of the error head")
+    ap.add_argument("--canvas_steps", type=int, default=8, help="canvas: rounds of revealing a window (validation maps)")
+    ap.add_argument("--refine", type=int, default=1, help="canvas: self-correction passes of the validation maps")
     ap.add_argument("--draft_prob", type=float, default=0.5,
                     help="share of training windows where the encoder also sees a damaged draft of the map (bursts made "
                          "1/2, notes moved / missing / extra, long notes broken, spans cut out) and maps it again: the "
@@ -322,7 +376,7 @@ def main() -> None:
     else:
         cfg = V5Config(groups=group_columns(slices, sections=not args.no_sections), dropout=args.dropout,
                        regimes=args.regimes_max if args.regimes > 0 else 0, regimes_active=max(1, args.regimes),
-                       **PRESETS[args.preset])
+                       decoder=args.decoder, **PRESETS[args.preset])
         if not args.no_sections:
             # one process fits the climax model (minutes of CPU work), the others wait and read its cached result
             cache_file = Path(args.data) / "v5_climaxes.json"
@@ -344,7 +398,7 @@ def main() -> None:
     if group_columns(slices, sections="section" in cfg.groups) != cfg.groups:
         sys.exit("the dataset's features differ from the checkpoint's (e.g. other --external): use the same dataset")
     new_parts = False
-    if args.draft_prob > 0 and not cfg.draft:
+    if args.draft_prob > 0 and not cfg.draft and cfg.decoder == "ar":
         cfg.draft = True                     # re-mapping input added to a checkpoint made without it (starts at zero)
         new_parts = resume is not None
     model = V5Net(cfg).to(dev)
@@ -355,7 +409,7 @@ def main() -> None:
         if missing:
             print("[resume] added the draft input for the re-mapping passes (starts at zero: the network maps as before "
                   "and learns to use the draft)")
-    else:
+    elif cfg.decoder == "ar":
         gaps = []
         for i in train_idx[:2000]:
             t = np.unique([n.start // cfg.frame_ms for n in render_track(index.track(i))])
@@ -394,19 +448,20 @@ def main() -> None:
     train_ds = V5Dataset(index, train_idx, vocab, W, args.steps_per_epoch * 512, seed=args.seed + 1000 * rank,
                          sr_balance=args.sr_balance, hard_tilt=args.hard_tilt, hard_share=args.hard_share,
                          max_tokens=cfg.max_tokens, sections="section" in cfg.groups, highlight=cfg.highlight,
-                         draft_prob=args.draft_prob if cfg.draft else 0.0)
+                         draft_prob=args.draft_prob if cfg.draft else 0.0, decoder=cfg.decoder,
+                         mirror=args.mirror, rotate=args.rotate, shift=args.shift)
     if auto:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
         # the memory of a step grows with the token count: probe with the longest of 64 random windows
-        cand = [train_ds[i] for i in range(128)]
-        probe = sorted(cand, key=lambda it: -int(it["tokens"].shape[0]))[:4]
+        cand = [train_ds[i] for i in range(128 if cfg.decoder == "ar" else 8)]
+        probe = sorted(cand, key=lambda it: -int(it["tokens"].shape[0]))[:4] if cfg.decoder == "ar" else cand[:4]
 
         def probe_step(n: int) -> None:
             b = to_dev(repeat_batch(probe, n, collate), dev)
             model.train()
             with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(b)
-                loss, _ = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms, regime_balance=args.regime_balance)
+                loss, _ = losses_of(cfg, out, b, args)
             loss.backward()
             model.zero_grad(set_to_none=True)
         ema_bytes = sum(p.numel() * p.element_size() for p in ema.parameters()) if ema is not None else 0
@@ -420,7 +475,7 @@ def main() -> None:
     if val_idx and is_main:
         fixed = V5Dataset.fixed_windows(index, val_idx, W, args.val_windows, seed=args.seed)
         val_ds = V5Dataset(index, val_idx, vocab, W, 0, train=False, fixed=fixed, sr_balance=0, max_tokens=cfg.max_tokens,
-                           sections="section" in cfg.groups, highlight=cfg.highlight)
+                           sections="section" in cfg.groups, highlight=cfg.highlight, decoder=cfg.decoder)
         val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=0, collate_fn=collate)
     val_full = sorted(val_idx, key=lambda i: float(index.maps[i].get("sr", 0.0)))
     if val_full and args.val_maps > 0:
@@ -484,10 +539,14 @@ def main() -> None:
                 lr = lr_at(step - sched0, total, warm, lr_base, args.min_lr if not args.finetune else lr_base / 10)
                 for g in opt.param_groups:
                     g["lr"] = lr
+                own = cfg.decoder == "canvas" and args.self_correct > 0 and np.random.random() < args.self_correct
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
+                    if own:
+                        b = own_error_batch(train_model, b)
                     out = train_model(b)
-                    loss, logs = v5_losses(out, b, args.cause_weight, window_ms=cfg.window_ms,
-                                           regime_balance=args.regime_balance)
+                    loss, logs = losses_of(cfg, out, b, args)
+                if own:
+                    logs = {("own_" + k if k in ("state", "error", "note_f1") else k): v for k, v in logs.items()}
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -515,8 +574,15 @@ def main() -> None:
                 nrun += 1
                 if step % args.log_every == 0:
                     a = {k: v / nrun for k, v in run.items()}
-                    print(f"  step {step:>7} | lr {lr:.2e} | tokens {a['tokens']:.4f} (time {a.get('time_tokens', float('nan')):.3f}) "
-                          f"| cause {a.get('cause', float('nan')):.3f} acc {a.get('cause_acc', float('nan')):.2f}", flush=True)
+                    if cfg.decoder == "canvas":
+                        print(f"  step {step:>7} | lr {lr:.2e} | hidden frames: state {a.get('state', float('nan')):.4f} "
+                              f"notes F1 {a.get('note_f1', float('nan')):.3f} | offsets {a.get('start', float('nan')):.3f}/"
+                              f"{a.get('end', float('nan')):.3f} | error head {a.get('error', float('nan')):.3f} | own errors: "
+                              f"state {a.get('own_state', float('nan')):.4f} error head {a.get('own_error', float('nan')):.3f}",
+                              flush=True)
+                    else:
+                        print(f"  step {step:>7} | lr {lr:.2e} | tokens {a['tokens']:.4f} (time {a.get('time_tokens', float('nan')):.3f}) "
+                              f"| cause {a.get('cause', float('nan')):.3f} acc {a.get('cause_acc', float('nan')):.2f}", flush=True)
                     run, nrun = {}, 0
             train_ds.set_hard_weights(per_map_loss)
             # grow where it errs: the active regime with the highest mean loss (and real use) is split in two
@@ -546,12 +612,16 @@ def main() -> None:
                 if val_loader is not None:
                     vt = val_tokens(em, val_loader, dev)
                     rec.update({f"val_{k}": v for k, v in vt.items()})
-                    print(f"[epoch {epoch}] val windows: tokens {vt.get('tokens', float('nan')):.4f} (time {vt.get('time_tokens', float('nan')):.3f}) "
-                          f"| cause acc {vt.get('cause_acc', float('nan')):.3f}")
+                    if cfg.decoder == "canvas":
+                        print(f"[epoch {epoch}] val windows: hidden frames state {vt.get('state', float('nan')):.4f}, notes F1 "
+                              f"{vt.get('note_f1', float('nan')):.3f} | error head {vt.get('error', float('nan')):.3f}")
+                    else:
+                        print(f"[epoch {epoch}] val windows: tokens {vt.get('tokens', float('nan')):.4f} (time {vt.get('time_tokens', float('nan')):.3f}) "
+                              f"| cause acc {vt.get('cause_acc', float('nan')):.3f}")
                 if val_full:
                     t1 = time.time()
                     summary = val_maps(em, index, cache, val_full, dev, args.temperature, args.cfg_scale, args.val_max_sec,
-                                       args.val_style, args.passes if cfg.draft else 1)
+                                       args.val_style, args.passes if cfg.draft else 1, args.canvas_steps, args.refine)
                     rec.update({f"map_{k}": v for k, v in summary.items()})
                     print(f"[epoch {epoch}] GENERATED MAPS vs human ({len(val_full)} songs, {time.time() - t1:.0f}s): event F1 "
                           f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | density "
