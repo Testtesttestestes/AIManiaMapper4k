@@ -70,10 +70,22 @@ def own_error_batch(model, b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     errors of inference, not only the synthetic damage. ``model``: the network itself, not the DDP wrapper (a pass of
     the wrapper syncs buffers between the GPUs, and only some steps make this extra pass)."""
     from osu_mapper.v5 import frames as fr
+    from osu_mapper.v5.canvas_gen import _commit_in_order, allowed_states
 
     out = model(b)["canvas"]
     hid = b["cv_hidden"].bool()                                                  # [B, T]
-    st = torch.distributions.Categorical(logits=out["state"].float()).sample()   # [B, T, 4]
+    # one round of revealing with the rules of generation (long notes whole, 30 ms gaps): its own version as it
+    # really comes out, not single scattered holds generation never makes
+    vis = torch.where(hid[..., None], torch.zeros_like(b["cv_state"]), b["cv_state"]).cpu().numpy().astype(np.int8)
+    hidden = hid.cpu().numpy().copy()
+    lp = torch.log_softmax(out["state"].float(), dim=-1).cpu().numpy()
+    lp = np.where(allowed_states(vis, hidden), lp, -1e9)
+    lp = lp - np.logaddexp.reduce(lp, axis=-1, keepdims=True)
+    rng = np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
+    u = rng.random(lp.shape[:-1])[..., None]
+    samp = (np.exp(lp).cumsum(-1) < u).sum(-1).clip(0, fr.N_STATES - 1)
+    _commit_in_order(vis, hidden, lp, samp, hid.cpu().numpy(), np.zeros((vis.shape[0], fr.NUM_LANES), bool), rng, True)
+    st = torch.from_numpy(vis.astype(np.int64)).to(b["cv_state"].device)
     a = out["start"].float().argmax(-1)
     e = out["end"].float().argmax(-1)
     no = torch.full_like(st, fr.NO_OFF)
