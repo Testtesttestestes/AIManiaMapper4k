@@ -152,7 +152,8 @@ class RegimeModule(nn.Module):
         for k in torch.unique(pick).tolist():
             sel = pick == k
             xs = x[sel]
-            add[sel] = F.gelu(xs @ self.down[k].to(x.dtype)) @ self.up[k].to(x.dtype)
+            # under autocast the matmuls come out in bf16/fp16 while x (and add) may be float32
+            add[sel] = (F.gelu(xs @ self.down[k].to(x.dtype)) @ self.up[k].to(x.dtype)).to(add.dtype)
         return out + add, pick
 
     @torch.no_grad()
