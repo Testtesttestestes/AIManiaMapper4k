@@ -14,7 +14,7 @@ import numpy as np
 from ..hybrid.beatmap import Note
 
 CANVAS_KEYS = ("style", "style_mask", "steps", "temperature", "cfg_scale", "candidates", "score_fn", "refine_passes",
-               "refine_frac", "fixed", "regen", "seed", "device", "log")
+               "refine_frac", "fixed", "regen", "seed", "device", "log", "overlap")
 AR_KEYS = ("style", "style_mask", "passes", "candidates", "score_fn", "temperature", "top_p", "cfg_scale", "seed",
            "device", "log", "keep_better", "lane_predictor", "power")
 

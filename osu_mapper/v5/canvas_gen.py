@@ -16,6 +16,10 @@ The whole song is one canvas (frames x lanes, osu_mapper/v5/frames.py); every fr
    reward) keeps the best.
 4. Control: ``fixed`` notes (e.g. the user's own map) stay exactly as they are; ``regen`` time ranges are hidden and
    restored around them - edit any part of a map with the rest in view.
+5. Overlaps (``overlap``): windows overlap by half (as in Mapperatorinator); the later half of the overlap was placed
+   by the previous window without seeing what follows, so the next window proposes its own version there. Where the
+   two versions are the same nothing happens; where they differ, every differing stretch is decided with both sides
+   in view by the error head (which learned from the network's own real errors): the version with fewer errors stays.
 """
 
 from __future__ import annotations
@@ -171,7 +175,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
                     temperature: float = 1.0, cfg_scale: float = 1.0, candidates: int = 1,
                     score_fn: Optional[Callable[[List[Note], List[Note], int, int], float]] = None,
                     refine_passes: int = 1, refine_frac: float = 0.1, fixed: Optional[Sequence[Note]] = None,
-                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0,
+                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = True,
                     device: Optional[torch.device] = None, log: Optional[Callable[[str], None]] = None) -> List[Note]:
     """Notes of the whole song (see the module docstring). ``fixed``: notes kept as they are (with ``regen``: the notes
     outside the regen ranges are kept, the ranges (seconds) are restored)."""
@@ -208,12 +212,22 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
         return mem, cond, cond_null
 
     starts = list(range(0, max(1, F_), hop))
+    generated = np.zeros(F_, dtype=bool)          # frames this run produced (not given by the user)
+    seams = {"windows": 0, "differed": 0, "kept_earlier": 0, "took_later": 0}
     # 1. reveal the song window by window
     for s in starts:
         st, so, eo, known = canvas.window(s, W)
-        hidden = ~known
+        e = min(F_, s + W)
+        # overlap: the later half of what the previous window placed was decided without seeing what comes after it;
+        # this window proposes its own version there (with the continuation in view)
+        zone = np.zeros(W, dtype=bool)
+        if overlap and s > 0:
+            a_, b_ = hop // 2, min(hop, e - s)
+            zone[a_:b_] = generated[s + a_:s + b_] & ~canvas.locked[s + a_:s + b_]
+        hidden = ~known | zone
         if not hidden.any():
             continue
+        prev = (st.copy(), so.copy(), eo.copy())
         mem, cond, cnull = encode_window(s, K)
         rs, ro, re_ = restore_window(model, mem, cond, cnull, np.repeat(st[None], K, 0), np.repeat(so[None], K, 0),
                                      np.repeat(eo[None], K, 0), np.repeat(hidden[None], K, 0), steps, temperature,
@@ -228,10 +242,41 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
                 new = [n for n in cand if hidden[(n.start - s * H) // H]] if cand else []
                 scores.append(score_fn(new, [n for n in so_far if n.start >= ctx * H], s * H, (s + W) * H))
             best = int(np.argmax(scores))
-        e = min(F_, s + W)
+        new = (rs[best].copy(), ro[best].copy(), re_[best].copy())
+        if zone.any():
+            seams["windows"] += 1
+            diff = fr.frame_differs(prev, new) & zone
+            if diff.any():
+                seams["differed"] += 1
+                # decide every differing stretch (+-2 frames) with both sides in view: the version the error head
+                # finds fewer errors in stays (the error head learned from the network's own real errors)
+                mark = np.zeros(W, dtype=bool)
+                for f in np.flatnonzero(diff):
+                    mark[max(0, f - 2):f + 3] = True
+                mark &= zone
+                labels = np.cumsum(np.r_[mark[0], mark[1:] & ~mark[:-1]]) * mark
+                mem1, cond1, cnull1 = (mem[:1], cond[:1], cnull[:1])
+                none = np.zeros((1, W), dtype=bool)
+                for seg in range(1, int(labels.max()) + 1):
+                    sl = labels == seg
+                    errs = []
+                    for ver in (prev, new):
+                        st_t, so_t, eo_t = new[0].copy(), new[1].copy(), new[2].copy()
+                        st_t[sl], so_t[sl], eo_t[sl] = ver[0][sl], ver[1][sl], ver[2][sl]
+                        out = _decode_logits(model, mem1, cond1, cnull1, st_t[None], so_t[None], eo_t[None], none, cfg_scale)
+                        errs.append(float(torch.sigmoid(out["error"].float())[0].cpu().numpy()[sl].sum()))
+                    if errs[0] <= errs[1]:
+                        new[0][sl], new[1][sl], new[2][sl] = prev[0][sl], prev[1][sl], prev[2][sl]
+                        seams["kept_earlier"] += 1
+                    else:
+                        seams["took_later"] += 1
         sel = hidden[: e - s]
-        canvas.state[s:e][sel], canvas.start[s:e][sel], canvas.end[s:e][sel] = rs[best, :e - s][sel], ro[best, :e - s][sel], re_[best, :e - s][sel]
+        canvas.state[s:e][sel], canvas.start[s:e][sel], canvas.end[s:e][sel] = new[0][: e - s][sel], new[1][: e - s][sel], new[2][: e - s][sel]
         canvas.known[s:e] = True
+        generated[s:e] |= sel
+    if log is not None and seams["windows"]:
+        log(f"  overlaps: {seams['differed']} of {seams['windows']} differed between the two windows; differing stretches "
+            f"decided by the error head: kept the earlier {seams['kept_earlier']}, took the later {seams['took_later']}")
     # 2. self-correction
     for p in range(max(0, int(refine_passes))):
         changed = 0

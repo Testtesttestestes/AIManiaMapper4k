@@ -117,6 +117,9 @@ def main(argv=None) -> None:
     ap.add_argument("--refine", type=int, default=1,
                     help="canvas networks: self-correction passes (the error head marks frames, they are restored again; "
                          "a change is kept only if the error head then finds fewer errors)")
+    ap.add_argument("--no_overlap", action="store_true",
+                    help="canvas networks: do not let the next window propose its own version of the end of the previous "
+                         "one (by default differing stretches of the overlaps are decided by the error head)")
     ap.add_argument("--edit", default=None,
                     help="canvas networks: an existing map (.osz/.osu) whose notes are kept; with --regen only those "
                          "seconds are mapped again, with the rest of the map in view")
@@ -270,7 +273,8 @@ def main(argv=None) -> None:
                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev,
                                  log=print if (args.passes > 1 or is_canvas) else None,
                                  keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
-                                 steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen)
+                                 steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen,
+                                 overlap=not args.no_overlap)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)
