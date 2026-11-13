@@ -23,6 +23,7 @@ import copy
 import json
 import math
 import os
+import random
 import signal
 import sys
 import time
@@ -57,19 +58,20 @@ def to_dev(b: Dict[str, torch.Tensor], dev) -> Dict[str, torch.Tensor]:
 def losses_of(model_cfg, out, b, args):
     if model_cfg.decoder == "canvas":
         return canvas_losses(out, b, args.cause_weight, event_weight=args.event_weight, error_weight=args.error_weight,
-                             regime_balance=args.regime_balance)
+                             regime_balance=args.regime_balance, seam_weight=args.seam_weight)
     return v5_losses(out, b, args.cause_weight, window_ms=model_cfg.window_ms, regime_balance=args.regime_balance)
 
 
 @torch.no_grad()
-def own_error_batch(train_model, b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def own_error_batch(model, b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Learn from the network's own errors (step-unrolled denoising, SUNDAE - Savinov et al. 2021): the network first
     restores the hidden frames of the batch itself; its own version becomes the visible canvas, the target stays the
     human map, every frame counts, and the error head is told exactly which frames the network got wrong - the real
-    errors of inference, not only the synthetic damage."""
+    errors of inference, not only the synthetic damage. ``model``: the network itself, not the DDP wrapper (a pass of
+    the wrapper syncs buffers between the GPUs, and only some steps make this extra pass)."""
     from osu_mapper.v5 import frames as fr
 
-    out = train_model(b)["canvas"]
+    out = model(b)["canvas"]
     hid = b["cv_hidden"].bool()                                                  # [B, T]
     st = torch.distributions.Categorical(logits=out["state"].float()).sample()   # [B, T, 4]
     a = out["start"].float().argmax(-1)
@@ -85,6 +87,75 @@ def own_error_batch(train_model, b: Dict[str, torch.Tensor]) -> Dict[str, torch.
     nb.update(cv_state=st_new, cv_start=a_new, cv_end=e_new, cv_hidden=torch.zeros_like(b["cv_hidden"]),
               cv_loss=torch.ones_like(b["cv_loss"]), cv_err=wrong.float(), cv_err_mask=torch.ones_like(b["cv_err_mask"]))
     return nb
+
+
+@torch.no_grad()
+def seam_batch(model, b: Dict[str, torch.Tensor], steps: int = 4, seed: int = 0):
+    """Learn the overlap zones of generation (the seam head). Generation windows overlap by half: the earlier window
+    places the end of its new half without seeing what follows; the later one proposes its own version of that zone
+    with the continuation in view, and where they differ the seam head decides. Here both happen on a human map, as in
+    generation (eval mode, the zone revealed in ``steps`` rounds): the earlier window [-W/2, W/2) (first half the human
+    map, second half revealed) gives version A of [0, W/2); the later window [0, W) (its first quarter = A, as locked
+    in generation, the rest revealed) gives version B of [W/4, W). The example: A on [0, W/4), the zone [W/4, W/2) = A
+    or B (half the items each), B after it; the target is the human map, the error labels are the real errors, and
+    the seam head learns them on the zone. ``model``: the network itself (no DDP pass). Returns (batch, stats)."""
+    from osu_mapper.v5 import frames as fr
+    from osu_mapper.v5.canvas_gen import restore_window
+
+    was = model.training
+    model.eval()
+    try:
+        B, W = b["cv_hidden"].shape
+        Z, H2 = W // 4, W // 2
+        dev = b["feats"].device
+        rng = np.random.default_rng(seed)
+        cond = model.condition(b["sr"], b["style"], b["style_mask"], None, b.get("aug"))
+        npi = lambda t: t.cpu().numpy().astype(np.int8)
+
+        def restore(feats, beat, st, so, eo, hidden):
+            mem = model.encode(feats, beat)["memory"]
+            return restore_window(model, mem, cond, cond, st, so, eo, hidden, steps=steps, temperature=1.0, cfg_scale=1.0,
+                                  rng=rng)
+
+        # 1. the earlier window: its second half revealed without anything after it
+        hid = np.zeros((B, W), dtype=bool)
+        hid[:, H2:] = True
+        sa, oa, ea = restore(torch.cat([b["seam_feats"], b["feats"][:, :H2]], 1),
+                             torch.cat([b["seam_beat"], b["beat"][:, :H2]], 1),
+                             npi(b["seam_state"]), npi(b["seam_start"]), npi(b["seam_end"]), hid)
+        A = (sa[:, H2:], oa[:, H2:], ea[:, H2:])                                  # frames [0, W/2) of this window
+        # 2. the later window (this one): its first quarter is A, the zone and the rest revealed with all in view
+        gt = (npi(b["cv_tgt_state"]), npi(b["cv_tgt_start"]), npi(b["cv_tgt_end"]))
+        later = [g.copy() for g in gt]
+        for x, a in zip(later, A):
+            x[:, :Z] = a[:, :Z]
+        hid = np.zeros((B, W), dtype=bool)
+        hid[:, Z:] = True
+        sb, ob, eb = restore(b["feats"], b["beat"], *later, hid)
+        # 3. the example: A before the zone, A or B on the zone, B after it
+        x = [sb.copy(), ob.copy(), eb.copy()]
+        use_a = rng.random(B) < 0.5
+        for xi, a in zip(x, A):
+            xi[use_a, Z:H2] = a[use_a, Z:H2]
+        differs = lambda p, q, sl: ((p[0][:, sl] != q[0][:, sl]) | (p[1][:, sl] != q[1][:, sl])
+                                    | (p[2][:, sl] != q[2][:, sl])).any(-1)
+        zone_sl = slice(Z, H2)
+        wrong = differs(x, gt, slice(None))
+        stats = {"seam_differ": float(differs(A, (sb, ob, eb), zone_sl).mean()),
+                 "seam_wrong_a": float(differs(A, gt, zone_sl).mean()),
+                 "seam_wrong_b": float(differs((sb, ob, eb), gt, zone_sl).mean())}
+        none = np.zeros(W, dtype=bool)
+        s_in, a_in, e_in = (np.stack(v) for v in zip(*[fr.inputs(x[0][r], x[1][r], x[2][r], none) for r in range(B)]))
+        zone = np.zeros((B, W), dtype=np.float32)
+        zone[:, Z:H2] = 1.0
+        T = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+        nb = {k: v for k, v in b.items() if not k.startswith("seam_")}
+        nb.update(cv_state=T(s_in), cv_start=T(a_in), cv_end=T(e_in), cv_hidden=torch.zeros_like(b["cv_hidden"]),
+                  cv_loss=torch.ones_like(b["cv_loss"]), cv_err=T(wrong.astype(np.float32)),
+                  cv_err_mask=torch.ones_like(b["cv_err_mask"]), cv_seam_mask=T(zone))
+        return nb, stats
+    finally:
+        model.train(was)
 
 
 @torch.no_grad()
@@ -124,6 +195,7 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
              cfg_scale: float, max_sec: float, style_keys: str = "ln", passes: int = 1, canvas_steps: int = 8,
              refine: int = 1) -> Dict[str, float]:
     reps = []
+    seams: Dict[str, int] = {}
     for i in map_idx:
         e = index.maps[i]
         tr = index.track(i)
@@ -136,7 +208,7 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         st, sm = val_style(e, style_keys)
         notes = generate_map(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), passes=passes, style=st,
                              style_mask=sm, temperature=temperature, cfg_scale=cfg_scale, device=dev,
-                             steps=canvas_steps, refine_passes=refine)
+                             steps=canvas_steps, refine_passes=refine, stats=seams)
         ref = [n for n in ref if n.start < F * 10]
         rep = per_ms_report(notes, ref, timing_points=tr.timing_points)
         rep["expressive"] = expressive_score(rep)
@@ -149,6 +221,7 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         vals = vals[np.isfinite(vals)]
         if vals.size:
             out[k] = float(np.median(vals))
+    out.update({"overlap_" + k: float(v) for k, v in seams.items()})
     return out
 
 
@@ -327,6 +400,12 @@ def main() -> None:
     ap.add_argument("--self_correct", type=float, default=0.25,
                     help="canvas: share of steps that learn from the network's own errors: it restores the hidden frames "
                          "itself first, then fixes its own version (the error head gets the real errors)")
+    ap.add_argument("--seam", type=float, default=0.1,
+                    help="canvas: share of steps that learn the overlap zones of generation windows: the network maps a "
+                         "window's end without seeing what follows and again with it in view; the seam head learns which "
+                         "version is wrong where (generation: it decides differing overlaps). Slower steps; 0 = off")
+    ap.add_argument("--seam_steps", type=int, default=4, help="canvas: rounds of revealing in the seam steps")
+    ap.add_argument("--seam_weight", type=float, default=0.3, help="canvas: loss of the seam head")
     ap.add_argument("--event_weight", type=float, default=4.0, help="canvas: weight of frames with a note in the loss")
     ap.add_argument("--error_weight", type=float, default=0.3, help="canvas: loss of the error head")
     ap.add_argument("--canvas_steps", type=int, default=8, help="canvas: rounds of revealing a window (validation maps)")
@@ -449,7 +528,9 @@ def main() -> None:
                          sr_balance=args.sr_balance, hard_tilt=args.hard_tilt, hard_share=args.hard_share,
                          max_tokens=cfg.max_tokens, sections="section" in cfg.groups, highlight=cfg.highlight,
                          draft_prob=args.draft_prob if cfg.draft else 0.0, decoder=cfg.decoder,
-                         mirror=args.mirror, rotate=args.rotate, shift=args.shift)
+                         mirror=args.mirror, rotate=args.rotate, shift=args.shift,
+                         seam=args.seam if cfg.decoder == "canvas" and getattr(cfg, "seam_head", False) else 0.0,
+                         sync_seed=args.seed)
     if auto:
         from osu_mapper.hybrid.autobatch import find_batch_size, repeat_batch
         # the memory of a step grows with the token count: probe with the longest of 64 random windows
@@ -469,6 +550,7 @@ def main() -> None:
                                 extra_bytes=ema_bytes)
         bs = found or 8
     train_ds.samples = args.steps_per_epoch * bs
+    train_ds.batch_size = bs                       # seam batches are decided per batch (the same on every GPU)
     loader = DataLoader(train_ds, batch_size=bs, shuffle=False, num_workers=args.workers, collate_fn=collate,
                         drop_last=True, persistent_workers=False)
     val_loader = None
@@ -483,6 +565,7 @@ def main() -> None:
         val_full = [val_full[p] for p in pick]
     cache = SongCache(index, sections="section" in cfg.groups, highlight=cfg.highlight)
 
+    sync_rng = random.Random(args.seed * 7 + 3)          # the same on every GPU
     train_model = model
     if distributed:
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index] if dev.type == "cuda" else None)
@@ -533,20 +616,29 @@ def main() -> None:
             model.train()
             t0 = time.time()
             run: Dict[str, float] = {}
+            cnt: Dict[str, int] = {}
             nrun = 0
             for b in loader:
                 b = to_dev(b, dev)
                 lr = lr_at(step - sched0, total, warm, lr_base, args.min_lr if not args.finetune else lr_base / 10)
                 for g in opt.param_groups:
                     g["lr"] = lr
-                own = cfg.decoder == "canvas" and args.self_correct > 0 and np.random.random() < args.self_correct
+                # the same decision on every GPU (a seed they share): the slower steps happen together
+                seam = "seam_feats" in b
+                own = cfg.decoder == "canvas" and sync_rng.random() < args.self_correct and not seam
+                sstats = None
                 with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=use_amp):
-                    if own:
-                        b = own_error_batch(train_model, b)
+                    if seam:
+                        b, sstats = seam_batch(model, b, steps=args.seam_steps, seed=args.seed * 7919 + step)
+                    elif own:
+                        b = own_error_batch(model, b)
                     out = train_model(b)
                     loss, logs = losses_of(cfg, out, b, args)
-                if own:
-                    logs = {("own_" + k if k in ("state", "error", "note_f1") else k): v for k, v in logs.items()}
+                if own or seam:
+                    pre = "own_" if own else "seamstep_"
+                    logs = {(pre + k if k in ("state", "error", "note_f1") else k): v for k, v in logs.items()}
+                if sstats:
+                    logs.update(sstats)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -571,19 +663,23 @@ def main() -> None:
                 step += 1
                 for k, v in logs.items():
                     run[k] = run.get(k, 0.0) + v
+                    cnt[k] = cnt.get(k, 0) + 1                  # own / seam numbers come only from their own steps
                 nrun += 1
                 if step % args.log_every == 0:
-                    a = {k: v / nrun for k, v in run.items()}
+                    a = {k: v / max(1, cnt.get(k, 0)) for k, v in run.items()}
                     if cfg.decoder == "canvas":
                         print(f"  step {step:>7} | lr {lr:.2e} | hidden frames: state {a.get('state', float('nan')):.4f} "
                               f"notes F1 {a.get('note_f1', float('nan')):.3f} | offsets {a.get('start', float('nan')):.3f}/"
                               f"{a.get('end', float('nan')):.3f} | error head {a.get('error', float('nan')):.3f} | own errors: "
-                              f"state {a.get('own_state', float('nan')):.4f} error head {a.get('own_error', float('nan')):.3f}",
-                              flush=True)
+                              f"state {a.get('own_state', float('nan')):.4f} error head {a.get('own_error', float('nan')):.3f}"
+                              + (f" | seams: versions differ on {100 * a['seam_differ']:.0f}% of the zone, wrong: earlier "
+                                 f"{100 * a['seam_wrong_a']:.0f}% later {100 * a['seam_wrong_b']:.0f}%, seam head "
+                                 f"{a.get('seam', float('nan')):.3f} (constant guess {a.get('seam_base', float('nan')):.3f})"
+                                 if "seam_differ" in a else ""), flush=True)
                     else:
                         print(f"  step {step:>7} | lr {lr:.2e} | tokens {a['tokens']:.4f} (time {a.get('time_tokens', float('nan')):.3f}) "
                               f"| cause {a.get('cause', float('nan')):.3f} acc {a.get('cause_acc', float('nan')):.2f}", flush=True)
-                    run, nrun = {}, 0
+                    run, cnt, nrun = {}, {}, 0
             train_ds.set_hard_weights(per_map_loss)
             # grow where it errs: the active regime with the highest mean loss (and real use) is split in two
             if model.regime is not None and args.grow_every > 0 and epoch % args.grow_every == 0:
@@ -633,6 +729,11 @@ def main() -> None:
                     print(f"[epoch {epoch}] long notes: {100 * summary.get('ln_share_pred', 0):.0f}% of notes vs "
                           f"{100 * summary.get('ln_share_ref', 0):.0f}% | LN starts F1 {summary.get('ln_start_f1', 0):.3f} "
                           f"| LN lengths distance {summary.get('ln_len_tv', float('nan')):.3f} | LN F1 {summary.get('ln_f1', 0):.3f}")
+                    if summary.get("overlap_windows", 0) > 0:
+                        judge = "seam head" if getattr(em, "seam_head", None) is not None else "error head"
+                        print(f"[epoch {epoch}] overlaps of windows: {summary['overlap_differed']:.0f} of "
+                              f"{summary['overlap_windows']:.0f} differed; differing stretches decided by the {judge}: kept "
+                              f"the earlier {summary['overlap_kept_earlier']:.0f}, took the later {summary['overlap_took_later']:.0f}")
                     score = summary.get("event_f1@16", 0.0) + args.expressive_weight * summary.get("expressive", 0.0)
                 else:
                     score = -rec.get("val_tokens", float(step))

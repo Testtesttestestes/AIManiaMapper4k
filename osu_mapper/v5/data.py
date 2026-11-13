@@ -252,13 +252,16 @@ def hide_frames(W: int, ratio: float, rng: random.Random) -> np.ndarray:
 
 def canvas_item(cache: "SongCache", entry: Dict, notes, timing_points, start_frame: int, W: int, rng: random.Random,
                 style_known: bool, frame_ms: int = 10, mirror: bool = False, rotate: int = 0, shift_ms: int = 0,
-                p_empty: float = 0.1, p_fix: float = 0.25) -> Dict[str, torch.Tensor]:
+                p_empty: float = 0.1, p_fix: float = 0.25, seam: bool = False) -> Dict[str, torch.Tensor]:
     """One training window of the canvas (as the v4 canvas): the human map as frames x lanes, part of it hidden (random
     frames or whole phrases, any share from 5 to 100 %, "restore what is missing"), or - ``p_fix`` - a damaged copy of
     it visible ("find and fix": the loss counts every frame, the error head learns which visible frames are wrong), or
     - ``p_empty`` - nothing visible (a map from scratch). Augmentations: mirrored lanes, rotated lanes (tagged: the
     condition knows; generation never rotates), a shift of 0-9 ms inside the frame (features interpolated between
-    frames, notes moved by the same milliseconds: every millisecond of a song can start a window)."""
+    frames, notes moved by the same milliseconds: every millisecond of a song can start a window).
+    ``seam``: also the earlier of two windows that overlap by half, as in generation (``seam_feats`` / ``seam_beat``:
+    the half window before this one; ``seam_state`` / ``seam_start`` / ``seam_end``: the human map of the earlier
+    window), for learning the overlap zones (train_v5.seam_batch)."""
     from . import frames as fr
 
     start_ms = start_frame * frame_ms + shift_ms
@@ -304,7 +307,7 @@ def canvas_item(cache: "SongCache", entry: Dict, notes, timing_points, start_fra
         cause[ev] = note_causes(t_ev, cache.attacks(entry["song_id"]), frame_ms)
     style = np.asarray(entry["style"], dtype=np.float32)
     smask = np.asarray(entry["style_mask"], dtype=np.float32) if style_known else np.zeros_like(style)
-    return {
+    item = {
         "feats": torch.from_numpy(np.ascontiguousarray(feats)), "beat": torch.from_numpy(beat.astype(np.float32)),
         "cv_state": torch.from_numpy(s_in), "cv_start": torch.from_numpy(a_in), "cv_end": torch.from_numpy(e_in),
         "cv_hidden": torch.from_numpy(hidden.astype(np.int64)),
@@ -316,6 +319,24 @@ def canvas_item(cache: "SongCache", entry: Dict, notes, timing_points, start_fra
         "style": torch.from_numpy(style), "style_mask": torch.from_numpy(smask),
         "aug": torch.tensor([1 if rotate else 0], dtype=torch.int64),
     }
+    if seam:
+        # the earlier window [start - W/2, start + W/2): same augmentation, its own human map
+        H2 = W // 2
+        s0 = start_ms - H2 * frame_ms
+        win_e = [n for n in notes if (n.end if n.ln else n.start) >= s0 - frame_ms and n.start < s0 + W * frame_ms]
+        ste, soe, eoe, _ = fr.encode(augment_notes(win_e, mirror, rotate), s0, W, frame_ms)
+        if shift_ms:
+            rows = cache.window(entry["song_id"], start_frame - H2, H2 + 1, timing_points)
+            a = shift_ms / float(frame_ms)
+            pre = (rows[:-1] * (1.0 - a) + rows[1:] * a).astype(np.float32)
+        else:
+            pre = cache.window(entry["song_id"], start_frame - H2, H2, timing_points)
+        pre_beat = beat_features(tps, start_frame - H2, H2, frame_ms) if tps else np.zeros((H2, BEAT_DIM), np.float32)
+        item.update(seam_feats=torch.from_numpy(np.ascontiguousarray(pre)),
+                    seam_beat=torch.from_numpy(pre_beat.astype(np.float32)),
+                    seam_state=torch.from_numpy(ste.astype(np.int64)), seam_start=torch.from_numpy(soe.astype(np.int64)),
+                    seam_end=torch.from_numpy(eoe.astype(np.int64)))
+    return item
 
 
 def collate(items: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -337,8 +358,12 @@ class V5Dataset(Dataset):
                  samples: int, seed: int = 0, train: bool = True, sr_balance: float = 0.5, hard_tilt: float = 0.0,
                  hard_share: float = 0.0, style_known_prob: float = 0.5, fixed: Optional[List[Tuple[int, int]]] = None,
                  max_tokens: int = 1536, sections: bool = True, highlight=None, draft_prob: float = 0.0,
-                 decoder: str = "ar", mirror: float = 0.5, rotate: float = 0.25, shift: float = 0.5):
+                 decoder: str = "ar", mirror: float = 0.5, rotate: float = 0.25, shift: float = 0.5,
+                 seam: float = 0.0, sync_seed: int = 0):
         self.index = index
+        # seam batches (canvas): a share of the batches also carries the earlier of two overlapping windows; decided
+        # per batch from a seed every GPU shares, so all of them take the slower step together
+        self.p_seam, self.sync_seed, self.batch_size = float(seam), int(sync_seed), 1
         self.draft_prob = float(draft_prob)
         self.decoder = decoder
         self.p_mirror, self.p_rotate, self.p_shift = float(mirror), float(rotate), float(shift)
@@ -394,6 +419,12 @@ class V5Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.fixed) if self.fixed is not None else self.samples
 
+    def is_seam_batch(self, i: int) -> bool:
+        if not (self.train and self.fixed is None and self.decoder == "canvas" and self.p_seam > 0):
+            return False
+        b = i // max(1, self.batch_size)
+        return random.Random(self.sync_seed * 1_000_003 + self.epoch * 7919 + b * 31 + 17).random() < self.p_seam
+
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         rng = random.Random(self.seed * 1_000_003 + self.epoch * 7919 + i)
         if self.fixed is not None:
@@ -410,7 +441,8 @@ class V5Dataset(Dataset):
                                style_known=self.train and rng.random() < self.style_known_prob,
                                mirror=aug and rng.random() < self.p_mirror,
                                rotate=rng.randint(1, 3) if aug and rng.random() < self.p_rotate else 0,
-                               shift_ms=rng.randint(1, 9) if aug and rng.random() < self.p_shift else 0)
+                               shift_ms=rng.randint(1, 9) if aug and rng.random() < self.p_shift else 0,
+                               seam=self.is_seam_batch(i))
             item["map_k"] = torch.tensor([k], dtype=torch.int64)
             item["item_weight"] = torch.tensor([1.0], dtype=torch.float32)
             return item

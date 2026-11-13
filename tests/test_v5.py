@@ -496,6 +496,148 @@ class TestCanvas(unittest.TestCase):
         ok = allowed_states(st, hidden)
         self.assertFalse(ok[0, 1, 1, fr.TAP] or ok[0, 2, 1, fr.TAP])             # 30 ms after a tap on the lane
 
+    def test_restore_keeps_long_note_grammar(self):
+        """Revealing in rounds never leaves a hold without its head, nor two notes of a lane closer than 30 ms - even
+        from random logits - and a confident long note comes out whole."""
+        from types import SimpleNamespace
+        from osu_mapper.v5 import frames as fr
+        from osu_mapper.v5.canvas_gen import restore_window
+
+        W = 96
+
+        class Stub:
+            def __init__(self, logits):
+                self.logits = logits
+
+            def canvas_decode(self, memory, cond, s_in, a_in, e_in, h):
+                B = s_in.shape[0]
+                return {"state": self.logits[None].expand(B, -1, -1, -1), "start": torch.zeros(B, W, 4, 10),
+                        "end": torch.zeros(B, W, 4, 10), "error": torch.zeros(B, W)}
+
+        def check(st, prev_open):
+            for r in range(st.shape[0]):
+                for c in range(4):
+                    last_note = -10
+                    for f in range(W):
+                        s_ = int(st[r, f, c])
+                        is_open = bool(prev_open[r, c]) if f == 0 else int(st[r, f - 1, c]) in (fr.HEAD, fr.HOLD)
+                        if is_open:
+                            self.assertIn(s_, (fr.HOLD, fr.TAIL), (r, f, c))
+                        else:
+                            self.assertNotIn(s_, (fr.HOLD, fr.TAIL), (r, f, c))
+                        if s_ in (fr.TAP, fr.HEAD):
+                            self.assertGreaterEqual(f - last_note, 3, (r, f, c))
+                        if s_ in (fr.TAP, fr.HEAD, fr.TAIL):
+                            last_note = f
+
+        g = torch.Generator().manual_seed(0)
+        for steps in (1, 3, 8):
+            stub = Stub(torch.randn(W, 4, 5, generator=g) * 2)
+            K = 3
+            st = np.zeros((K, W, 4), np.int8)
+            so = np.full((K, W, 4), -1, np.int8)
+            prev_open = np.zeros((K, 4), bool)
+            prev_open[1, 2] = True                               # a long note held from the window before
+            hidden = np.ones((K, W), bool)
+            rs, _, _ = restore_window(stub, torch.zeros(K, W, 1), None, None, st, so, so.copy(), hidden, steps=steps,
+                                      rng=np.random.default_rng(steps), prev_open=prev_open)
+            check(rs, prev_open)
+        # a confident long note (head at 10, tail at 30 on lane 1) comes out whole
+        tgt = np.zeros((W, 4), np.int64)
+        tgt[10, 1], tgt[11:30, 1], tgt[30, 1] = fr.HEAD, fr.HOLD, fr.TAIL
+        tgt[50, 3] = fr.TAP
+        logits = torch.full((W, 4, 5), -8.0)
+        logits.scatter_(-1, torch.from_numpy(tgt)[..., None], 8.0)
+        st = np.zeros((1, W, 4), np.int8)
+        so = np.full((1, W, 4), -1, np.int8)
+        rs, _, _ = restore_window(Stub(logits), torch.zeros(1, W, 1), None, None, st, so, so.copy(), np.ones((1, W), bool),
+                                  steps=8, rng=np.random.default_rng(0))
+        self.assertTrue((rs[0] == tgt).all())
+
+    def test_overlap_keeps_long_notes_whole(self):
+        """A long note held across the edge of an overlap zone is never cut: the earlier version of a stretch is taken
+        only if it glues with the later version around it, even when the judge prefers it."""
+        from osu_mapper.v5 import frames as fr
+        from osu_mapper.v5.canvas_gen import arbitrate_overlap, glues
+
+        W = 80
+        zone = np.zeros(W, bool)
+        zone[20:40] = True
+
+        def canvas(events):
+            st = np.zeros((W, 4), np.int8)
+            for (c, a, b) in events:                     # long note on lane c from frame a to b (b = tail)
+                st[a, c] = fr.HEAD
+                st[a + 1:b, c] = fr.HOLD
+                st[b, c] = fr.TAIL
+            off = np.where(np.isin(st, (fr.TAP, fr.HEAD)), 0, -1).astype(np.int8)
+            end = np.where(st == fr.TAIL, 0, -1).astype(np.int8)
+            return st, off, end
+
+        def valid(st):
+            return all(glues(st, R) for R in range(1, W))
+
+        # earlier window: the long note on lane 1 runs on past the zone (it did not see what follows);
+        # later window: it ends at 34, and nothing is held at frame 40
+        prev = canvas([(1, 30, 60)])
+        new = canvas([(1, 30, 34)])
+        prefer_prev = lambda ver: np.where(ver[0][:, 1] == fr.HOLD, 0.0, 1.0)   # a judge that likes the earlier one
+        merged, cnt = arbitrate_overlap(prev, new, zone, prefer_prev)
+        self.assertTrue(valid(merged[0]))
+        self.assertEqual(cnt["kept_earlier"], 0)
+        self.assertEqual(fr.decode(*merged), fr.decode(*new))
+        # both versions hold the long note across the edge (the later one goes on to 60 as well): the earlier one
+        # glues and is taken when the judge prefers it - one long note, not two pieces
+        prev2 = canvas([(1, 30, 60), (3, 24, 27)])
+        new2 = canvas([(1, 30, 60)])
+        merged2, cnt2 = arbitrate_overlap(prev2, new2, zone, lambda ver: np.where(ver[0][:, 3] != fr.EMPTY, 0.0, 1.0))
+        self.assertTrue(valid(merged2[0]))
+        self.assertEqual(cnt2["kept_earlier"], 1)
+        notes = fr.decode(*merged2)
+        self.assertEqual(sorted((n.col, n.start, n.end) for n in notes if n.ln), [(1, 300, 600), (3, 240, 270)])
+
+    def test_generation_glues_long_notes(self):
+        """Long notes held across window edges, overlap zones, self-correction patches and --regen edges are never
+        cut, and no two notes of a lane come closer than 30 ms - on a whole generated song."""
+        from osu_mapper.v5 import frames as fr
+        import osu_mapper.v5.canvas_gen as cg
+        from osu_mapper.v5.model import V5Config, V5Net
+
+        torch.manual_seed(0)
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=128,
+                       window_ms=1280, regimes=0, decoder="canvas")
+        m = V5Net(cfg).eval()
+        with torch.no_grad():
+            m.state_head.bias.view(4, 5)[:] = torch.tensor([1.5, -2.5, -0.5, 1.8, -1.2])     # long notes everywhere
+        F = 700
+        fa = np.random.default_rng(1).normal(0, 1, (F, 6)).astype(np.float32)
+        ba = np.zeros((F, 13), np.float32)
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        user = [Note(150 + 600 * k + 40 * c, c, 150 + 600 * k + 40 * c + 450, True) for k in range(10) for c in range(4)]
+        captured = {}
+        orig = cg.SongCanvas.notes
+
+        def notes(self):
+            captured["st"] = self.state.copy()
+            return orig(self)
+        try:
+            cg.SongCanvas.notes = notes
+            for kw in ({"refine_passes": 1}, {"refine_passes": 1, "overlap": False},
+                       {"fixed": user, "regen": [(1.03, 2.57), (4.11, 5.0)]}):
+                out = cg.generate_canvas(m, fa, ba, tps, 4.0, steps=6, seed=1, **kw)
+                st = captured["st"]
+                self.assertGreater(sum(n.ln for n in out), 10)
+                for c in range(4):
+                    last = -10
+                    for f in range(1, F):
+                        self.assertEqual(st[f - 1, c] in (fr.HEAD, fr.HOLD), st[f, c] in (fr.HOLD, fr.TAIL), (kw.keys(), f, c))
+                        if st[f, c] in (fr.TAP, fr.HEAD):
+                            self.assertGreaterEqual(f - last, 3, (kw.keys(), f, c))
+                        if st[f, c] in (fr.TAP, fr.HEAD, fr.TAIL):
+                            last = f
+        finally:
+            cg.SongCanvas.notes = orig
+
     def test_item_model_loss_own_errors(self):
         import random as _r
         from osu_mapper.v5 import frames as fr
@@ -535,6 +677,66 @@ class TestCanvas(unittest.TestCase):
         loss2, _ = canvas_losses(m(nb), nb)
         self.assertTrue(torch.isfinite(loss2))
 
+    def test_seam_batch(self):
+        """Overlap zones: the earlier window maps its end without what follows, the later one with it in view; the
+        example shows A before the zone, A or B on it, B after; the seam head learns the real errors on the zone."""
+        import random as _r
+        from types import SimpleNamespace
+        from osu_mapper.v5 import frames as fr
+        from osu_mapper.v5.data import V5Dataset, canvas_item, collate
+        from osu_mapper.v5.model import V5Config, V5Net, canvas_losses
+
+        class Cache:
+            def window(self, song_id, start, length, tps=None, sections=None):
+                return np.random.default_rng(start + 1000).normal(0, 1, (length, 6)).astype(np.float32)
+
+            def attacks(self, song_id):
+                return None
+        notes = self._notes()
+        tps = [RawTimingPoint(0.0, 500.0, 4, 2, 1, 60, True, 0)]
+        entry = {"song_id": "s", "sr": 4.0, "style": [0.0] * 11, "style_mask": [0.0] * 11}
+        W = 128
+        items = [canvas_item(Cache(), entry, notes, tps, 300 + 7 * k, W, _r.Random(k), True, mirror=k % 2 == 0,
+                             rotate=k % 4, shift_ms=k % 10, seam=True) for k in range(4)]
+        b = collate(items)
+        self.assertEqual(tuple(b["seam_feats"].shape), (4, W // 2, 6))
+        self.assertEqual(tuple(b["seam_state"].shape), (4, W, 4))
+        # the earlier window's human map continues into this window's one
+        self.assertTrue((b["seam_state"][:, W // 2 + 2:] == b["cv_tgt_state"][:, 2:W // 2]).float().mean() > 0.99)
+        cfg = V5Config(groups={"a": 6}, d_model=32, enc_layers=1, dec_layers=2, n_heads=4, window_frames=W,
+                       window_ms=W * 10, regimes=0, decoder="canvas")
+        m = V5Net(cfg).train()
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("train_v5_mod", str(Path(__file__).resolve().parents[1] / "train_v5.py"))
+        tv5 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tv5)
+        nb, stats = tv5.seam_batch(m, b, steps=2, seed=0)
+        self.assertTrue(m.training)                                            # back in training mode
+        self.assertFalse(any(k.startswith("seam_") for k in nb))
+        self.assertTrue((nb["cv_hidden"] == 0).all() and (nb["cv_state"] != fr.MASK_STATE).all())
+        self.assertTrue((nb["cv_seam_mask"][:, W // 4:W // 2] == 1).all() and nb["cv_seam_mask"].sum() == 4 * W // 4)
+        self.assertTrue(((nb["cv_err"] == 0) | (nb["cv_err"] == 1)).all())
+        for v in stats.values():
+            self.assertTrue(0.0 <= v <= 1.0)
+        out = m(nb)
+        self.assertIn("seam", out["canvas"])
+        loss, logs = canvas_losses(out, nb)
+        loss.backward()
+        self.assertIn("seam", logs)
+        self.assertIsNotNone(m.seam_head.weight.grad)
+        # without a seam the seam head is still in the graph (DDP) with a zero gradient
+        m.zero_grad()
+        nb2 = {k: v for k, v in nb.items() if k != "cv_seam_mask"}
+        loss2, logs2 = canvas_losses(m(nb2), nb2)
+        loss2.backward()
+        self.assertNotIn("seam", logs2)
+        self.assertEqual(float(m.seam_head.weight.grad.abs().sum()), 0.0)
+        # seam batches: decided per batch, the same on every GPU (shared seed), ~ the asked share
+        ds = SimpleNamespace(train=True, fixed=None, decoder="canvas", p_seam=0.3, batch_size=4, sync_seed=5, epoch=2)
+        flags = [V5Dataset.is_seam_batch(ds, i) for i in range(4000)]
+        self.assertTrue(all(len(set(flags[j:j + 4])) == 1 for j in range(0, 4000, 4)))
+        self.assertAlmostEqual(np.mean(flags), 0.3, delta=0.06)
+
     def test_generate_control_and_explain(self):
         from osu_mapper.v5.canvas_gen import generate_canvas
         from osu_mapper.v5.explain import explain_events_canvas
@@ -547,7 +749,13 @@ class TestCanvas(unittest.TestCase):
         F = 600
         fa = np.random.default_rng(1).normal(0, 1, (F, 6)).astype(np.float32)
         ba = np.zeros((F, 13), np.float32)
-        out = generate_canvas(m, fa, ba, tps, 4.0, steps=3, candidates=2, score_fn=lambda c, a, s, e: -len(c))
+        logs, stats = [], {}
+        out = generate_canvas(m, fa, ba, tps, 4.0, steps=3, candidates=2, score_fn=lambda c, a, s, e: -len(c),
+                              log=logs.append, stats=stats)
+        self.assertGreater(stats["windows"], 0)
+        self.assertEqual(stats["kept_earlier"] + stats["took_later"] >= stats["differed"], True)
+        if stats["differed"]:
+            self.assertTrue(any("seam head" in line for line in logs))
         for c in range(4):
             lane = sorted(n for n in out if n.col == c)
             for a, b_ in zip(lane, lane[1:]):

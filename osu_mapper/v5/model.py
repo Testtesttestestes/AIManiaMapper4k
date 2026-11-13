@@ -57,6 +57,7 @@ class V5Config:
     draft: bool = False                  # re-mapping: the encoder also sees a draft of the map (critic.map_frames)
     decoder: str = "canvas"              # "canvas" (masked frames restored, as the v4 canvas) or "ar" (event tokens)
     aug_tag: bool = True                 # an embedding of "this example is lane-rotated" in the condition (tagged aug)
+    seam_head: bool = True               # canvas: a head for the overlap zones of generation windows (learned on seams)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -67,6 +68,7 @@ class V5Config:
         d.setdefault("regimes", 0)          # checkpoints made before the regimes existed
         d.setdefault("decoder", "ar")       # checkpoints made before the canvas existed
         d.setdefault("aug_tag", False)
+        d.setdefault("seam_head", False)    # canvas checkpoints made before the seam head (the error head decides)
         return V5Config(**d)
 
     def vocab(self) -> Vocab:
@@ -343,6 +345,10 @@ class V5Net(nn.Module):
         self.start_head = nn.Linear(d, NUM_LANES * cfg.frame_ms)
         self.end_head = nn.Linear(d, NUM_LANES * cfg.frame_ms)
         self.error_head = nn.Linear(d, 1)
+        # overlap zones of generation: "this visible frame - placed by the earlier window without seeing what follows,
+        # or by the later one - is wrong", learned on exactly that situation (train_v5.seam_batch); decides which
+        # version of a differing stretch stays
+        self.seam_head = nn.Linear(d, 1) if cfg.seam_head else None
 
     def canvas_embed(self, state_in: torch.Tensor, start_in: torch.Tensor, end_in: torch.Tensor,
                      hidden: torch.Tensor) -> torch.Tensor:
@@ -356,7 +362,8 @@ class V5Net(nn.Module):
         return x + self.cv_hidden(hidden.long())
 
     def canvas_decode(self, memory: torch.Tensor, cond: torch.Tensor, state_in, start_in, end_in, hidden) -> Dict[str, torch.Tensor]:
-        """Logits of every frame and lane: state [B, T, 4, 5], start [B, T, 4, 10], end [B, T, 4, 10], error [B, T]."""
+        """Logits of every frame and lane: state [B, T, 4, 5], start [B, T, 4, 10], end [B, T, 4, 10], error [B, T]
+        (+ seam [B, T] with the seam head)."""
         from .frames import N_STATES, NUM_LANES
 
         x = memory + self.canvas_embed(state_in, start_in, end_in, hidden) + cond[:, None]
@@ -364,10 +371,13 @@ class V5Net(nn.Module):
             x = layer(x)
         h = self.cv_norm(x)
         B, T, _ = h.shape
-        return {"state": self.state_head(h).view(B, T, NUM_LANES, N_STATES),
-                "start": self.start_head(h).view(B, T, NUM_LANES, -1),
-                "end": self.end_head(h).view(B, T, NUM_LANES, -1),
-                "error": self.error_head(h).squeeze(-1)}
+        out = {"state": self.state_head(h).view(B, T, NUM_LANES, N_STATES),
+               "start": self.start_head(h).view(B, T, NUM_LANES, -1),
+               "end": self.end_head(h).view(B, T, NUM_LANES, -1),
+               "error": self.error_head(h).squeeze(-1)}
+        if getattr(self, "seam_head", None) is not None:
+            out["seam"] = self.seam_head(h).squeeze(-1)
+        return out
 
     @torch.no_grad()
     def init_distance_prior(self, gaps_frames) -> None:
@@ -553,11 +563,11 @@ def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], caus
 
 def canvas_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cause_weight: float = 0.2,
                   event_weight: float = 4.0, error_weight: float = 0.3, regime_balance: float = 0.01,
-                  label_smoothing: float = 0.02) -> Tuple[torch.Tensor, Dict[str, float]]:
+                  label_smoothing: float = 0.02, seam_weight: float = 0.3) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Losses of the canvas: per lane state (frames with a note weigh ``event_weight`` x), start / end offsets where
     the target has them, on the frames that count (``cv_loss`` [B, T]: the hidden ones, or every frame of a damaged
-    canvas), + "this visible frame is wrong" (``cv_err`` / ``cv_err_mask``) + the cause head + regime balance.
-    Per-item loss in out['_per_item'] (hard mining)."""
+    canvas), + "this visible frame is wrong" (``cv_err`` / ``cv_err_mask``; the seam head on the overlap zone of seam
+    batches, ``cv_seam_mask``) + the cause head + regime balance. Per-item loss in out['_per_item'] (hard mining)."""
     from .frames import EMPTY, HEAD, TAIL, TAP
 
     cv = out["canvas"]
@@ -590,6 +600,19 @@ def canvas_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], 
             / em.sum().clamp(min=1.0)
         total = total + error_weight * le
         logs["error"] = float(le.detach())
+    if cv.get("seam") is not None:
+        sm = batch.get("cv_seam_mask")
+        sm = torch.zeros_like(em) if sm is None else sm.float()
+        ls = (F.binary_cross_entropy_with_logits(cv["seam"].float(), batch["cv_err"].float(), reduction="none") * sm).sum() \
+            / sm.sum().clamp(min=1.0)
+        total = total + seam_weight * ls                    # in the graph on every step (DDP): zero without a seam
+        if float(sm.sum()) > 0:
+            with torch.no_grad():
+                p = (batch["cv_err"].float() * sm).sum() / sm.sum()
+                p = p.clamp(1e-4, 1 - 1e-4)
+            logs["seam"] = float(ls.detach())
+            logs["seam_base"] = float(-(p * p.log() + (1 - p) * (1 - p).log()))    # loss of a constant guess
+            logs["seam_wrong"] = float(p)
     cl = batch["cause"]
     m = cl >= 0
     if m.any() and cause_weight > 0:
