@@ -315,3 +315,33 @@ class TestFactorizedTime(unittest.TestCase):
             ref = -full.gather(-1, toks[1:].unsqueeze(-1)).squeeze(-1).mean()
             _, logs = v5_losses(out, b, label_smoothing=0.0, window_ms=cfg.window_ms)
         self.assertAlmostEqual(logs["tokens"], float(ref), places=4)
+
+
+class TestAutocast(unittest.TestCase):
+    def test_training_step_under_bf16_autocast(self):
+        """The GPU trains with bf16 autocast: every module (regimes included) must accept mixed dtypes."""
+        from osu_mapper.v5.model import V5Config, V5Net, v5_losses
+        from osu_mapper.v5.data import collate, PHASE_NONE
+        from osu_mapper.v5.sections import SECTION_DIM
+        from osu_mapper.v5.tokens import encode
+        cfg = V5Config(groups={"a": 6, "section": SECTION_DIM}, d_model=32, enc_layers=2, dec_layers=1, n_heads=4,
+                       window_frames=128, window_ms=1280, max_tokens=256, regimes=6, regimes_active=3)
+        m = V5Net(cfg).train()
+        v = cfg.vocab()
+        notes = [Note(100 + 97 * i, i % 4, 100 + 97 * i, False) for i in range(10)]
+        toks = torch.tensor(encode(notes, 0, v)[0])
+        is_t = torch.from_numpy(v.is_time(toks.numpy()).astype(np.int64))
+        fr, cur = [], -1
+        for t in toks.tolist():
+            cur = t - v.time0 if v.time0 <= t < v.mask0 else cur
+            fr.append(cur // 10 if cur >= 0 else -1)
+        feats = torch.randn(128, 6 + SECTION_DIM)
+        item = {"feats": feats, "beat": torch.randn(128, 13), "tokens": toks, "phase": torch.full_like(toks, PHASE_NONE),
+                "tok_frame": torch.tensor(fr), "is_time": is_t, "cause": torch.full((128,), -1), "sr": torch.tensor([4.0]),
+                "style": torch.zeros(11), "style_mask": torch.zeros(11)}
+        b = collate([item, item])
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            out = m(b)
+            loss, logs = v5_losses(out, b, window_ms=cfg.window_ms)
+        loss.backward()
+        self.assertTrue(np.isfinite(logs["total"]))
