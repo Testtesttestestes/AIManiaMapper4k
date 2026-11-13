@@ -234,6 +234,7 @@ def expressive_report(pred_notes: Sequence[Note], ref_notes: Sequence[Note], tim
     rep["burst_precision"], rep["burst_recall"] = float(prec), float(rec)
     rep["burst_f1"] = float(2 * prec * rec / (prec + rec)) if prec + rec > 0 else 0.0
     rep["burst_ms_ratio"] = float(dur_p / dur_r) if dur_r > 0 else float("nan")
+    rep["burst_ms_pred"], rep["burst_ms_ref"] = float(dur_p), float(dur_r)
     bars_r = bar_index(rt, timing_points)
     lo, hi = int(bars_r.min()), int(bars_r.max())
     cr = np.bincount(bars_r - lo, minlength=hi - lo + 1).astype(np.float64)
@@ -303,6 +304,12 @@ def summarize_reports(reports: Sequence[Dict[str, float]]) -> Dict[str, float]:
         vals = np.array([r.get(k, np.nan) for r in reports], dtype=np.float64)
         vals = vals[np.isfinite(vals)]
         out[k] = float(vals.mean()) if vals.size else float("nan")
+    # a mean of per-map ratios is ruled by the maps whose reference has almost no bursts (0.5 s of bursts against 5 s
+    # generated is x10 alone): the burst length over all the maps is the total generated over the total of the humans
+    tot_p = sum(float(r.get("burst_ms_pred", 0.0)) for r in reports)
+    tot_r = sum(float(r.get("burst_ms_ref", 0.0)) for r in reports)
+    if "burst_ms_pred" in keys:
+        out["burst_ms_ratio"] = tot_p / tot_r if tot_r > 0 else float("nan")
     return out
 
 

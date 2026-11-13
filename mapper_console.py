@@ -5,7 +5,7 @@
     python mapper_console.py            (на Windows: двойной клик по composer.bat — имя файла осталось старым)
 
 Программа спрашивает песню, сложности, лонгноты и т.д. простыми вопросами, показывает итог, запускает генерацию
-(generate_hybrid.py) и запоминает выбор до следующего раза. В конце печатает ту же генерацию одной командой - её
+(generate_v5.py, если есть checkpoints/v5/v5_best.pt, иначе generate_hybrid.py) и запоминает выбор до следующего раза. В конце печатает ту же генерацию одной командой - её
 можно сохранить или запустить без вопросов.
 
 Композитор (generate_composer.py) устарел (deprecated) и из консоли убран: он ставил много лишних нот, но не
@@ -178,6 +178,18 @@ def find_model(name: str) -> Optional[Path]:
     return None
 
 
+V5_PATHS = (REPO / "checkpoints" / "v5" / "v5_best.pt", REPO / "checkpoints" / "hybrid" / "v5_best.pt",
+            REPO / "test_NN" / "v5_best.pt")
+
+
+def find_v5() -> Optional[Path]:
+    """Сеть v5 (train_v5.py): checkpoints/v5/v5_best.pt, иначе checkpoints/hybrid/ или test_NN/."""
+    for p in V5_PATHS:
+        if p.is_file() and p.stat().st_size > 1024:
+            return p
+    return None
+
+
 def model_argv() -> List[str]:
     out: List[str] = []
     ck, pt = find_model("hybrid_best.pt"), find_model("patterns.npz")
@@ -192,6 +204,9 @@ def status_line() -> Tuple[bool, bool]:
     patterns = find_model("patterns.npz") is not None
     net = find_model("hybrid_best.pt") is not None
     ok, no = color("есть", "32"), color("нет", "33")
+    v5 = find_v5()
+    if v5 is not None:
+        print(f"Нейросеть v5:     {ok}" + color(f"  ({v5.relative_to(REPO) if v5.is_relative_to(REPO) else v5})", "2"))
     print(f"Модель паттернов: {ok if patterns else no}" + ("" if patterns else color("  (python learn_patterns.py --data dataset_hybrid)", "2")))
     print(f"Нейросеть:        {ok if net else no}" + ("" if net else color("  (нужна: обучите её, python train_console.py)", "2")))
     return patterns, net
@@ -282,9 +297,69 @@ def network_dialog(last, use_last, argv, info, template, stars, song_argv):
     return ("network", argv)
 
 
+def v5_dialog(last, argv, info, stars, song_argv):
+    """Questions for the v5 network (generate_v5.py)."""
+    title("4. Лонгноты")
+    opts = [("Как решит сеть", "доля LN оценивается по музыке"), ("Только тапы", "без лонгнотов"),
+            ("Задать долю LN", "например 0.3 = 30 % нот")]
+    r = ask_choice("Лонгноты:", opts, int(last.get("v5_ln_choice", 1)))
+    ln_text = "как решит сеть"
+    if r == 2:
+        argv += ["--style", "ln_ratio=0"]
+        ln_text = "нет"
+    elif r == 3:
+        while True:
+            v = ask("Доля LN (0-1)", str(last.get("v5_ln_ratio", "0.3"))).replace(",", ".")
+            try:
+                if 0 <= float(v) <= 1:
+                    break
+            except ValueError:
+                pass
+            print("  Число от 0 до 1, например 0.3.")
+        argv += ["--style", f"ln_ratio={float(v):g}"]
+        ln_text = f"{100 * float(v):.0f} % нот"
+        last["v5_ln_ratio"] = v
+    title("5. Дополнительно")
+    creator = ask("Автор (Creator)", str(last.get("creator", "AIManiaMapper")))
+    argv += ["--creator", creator]
+    safe = "".join(c for c in str(info.get("title") or "map") if c.isalnum() or c in " -_()").strip() or "map"
+    out = clean_path(ask("Куда сохранить", str(REPO / "output_beatmaps" / f"{safe} (v5).osz")))
+    argv += ["--output", out]
+    title("Итог")
+    print(f"  Песня:      {info.get('title') or song_argv[-1]}")
+    print(f"  Сложности:  {', '.join(f'{s:g}*' for s in stars)}")
+    print(f"  Строит:     нейросеть v5")
+    print(f"  Лонгноты:   {ln_text}")
+    print(f"  Файл:       {out}")
+    if not ask_yes("Начать генерацию?", True):
+        return None
+    last.update({"song": song_argv[1] if song_argv[0] == "--template" else song_argv[0], "engine": "v5",
+                 "stars": " ".join(f"{s:g}" for s in stars), "v5_ln_choice": r, "creator": creator})
+    save_settings(last)
+    return ("v5", argv)
+
+
+def choose_engine(last, v5: Optional[Path], net: bool) -> str:
+    if v5 is None:
+        return "network"
+    if not net:
+        return "v5"
+    title("0. Нейросеть")
+    opts = [("v5", f"{v5.name} — новая (train_v5.py)"), ("hybrid", "hybrid_best.pt — прежняя (train_hybrid.py)")]
+    r = ask_choice("Какой сетью строить?", opts, 2 if last.get("engine") == "network" else 1)
+    return "v5" if r == 1 else "network"
+
+
 def run_dialog() -> Optional[List[str]]:
     last = load_settings()
     patterns, net = status_line()
+    v5 = find_v5()
+    engine = choose_engine(last, v5, net)
+    if engine == "v5":
+        song_argv, info, template = choose_song(last)
+        stars = choose_stars(last, info)
+        argv = song_argv + ["--sr", ",".join(f"{s:g}" for s in stars), "--checkpoint", str(v5)]
+        return v5_dialog(last, argv, info, stars, song_argv)
     if not net:
         print(color("Нет обученной нейросети (hybrid_best.pt): карты строит только она. Обучите её: python train_console.py", "31"))
         print(color("(Композитор устарел и из консоли убран: python generate_composer.py, если он всё же нужен.)", "2"))
@@ -309,8 +384,12 @@ def main() -> None:
             if res:
                 engine, argv = res
                 title("Генерация")
-                import generate_hybrid as gen
-                script = "generate_hybrid.py"
+                if engine == "v5":
+                    import generate_v5 as gen
+                    script = "generate_v5.py"
+                else:
+                    import generate_hybrid as gen
+                    script = "generate_hybrid.py"
                 gen.main(argv)
                 print()
                 print(color("Готово!", "1;32") + " Та же генерация одной командой:")
