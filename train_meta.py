@@ -56,9 +56,9 @@ def proposals(index: HybridIndex, maps: List[int], cache: SongCache, highlight, 
                 if j != i:
                     props += [(sp, [n for n in notes[j] if sp[0] <= n.start <= sp[1]], "sibling") for sp in bursts_of[j]]
             if v5 is not None:
-                from osu_mapper.v5.generate import generate_song
+                from osu_mapper.v5.infer import generate_map
                 F_ = min(feats_all.shape[0], int(max_sec * 100))
-                gen = generate_song(v5, feats_all[:F_], beat_all[:F_], tps0, sr, device=dev)
+                gen = generate_map(v5, feats_all[:F_], beat_all[:F_], tps0, sr, device=dev)
                 t = np.array(sorted({n.start for n in gen}), dtype=np.float64)
                 props += [(sp, [n for n in gen if sp[0] <= n.start <= sp[1]], "network") for sp in bursts(t, tps0)]
             song_props.extend((i, sp, members, src, sr) for sp, members, src in props)

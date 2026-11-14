@@ -54,6 +54,10 @@ class V5Config:
     regime_rank: int = 32
     highlight: List[float] = field(default_factory=list)   # climax model of osu_mapper/v5/sections.py (from kiai)
     ln_model: List[float] = field(default_factory=list)    # LN share from the audio (osu_mapper/v5/lnstyle.py)
+    draft: bool = False                  # re-mapping: the encoder also sees a draft of the map (critic.map_frames)
+    decoder: str = "canvas"              # "canvas" (masked frames restored, as the v4 canvas) or "ar" (event tokens)
+    aug_tag: bool = True                 # an embedding of "this example is lane-rotated" in the condition (tagged aug)
+    seam_head: bool = True               # canvas: a head for the overlap zones of generation windows (learned on seams)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -62,6 +66,9 @@ class V5Config:
     def from_dict(d: Dict) -> "V5Config":
         d = dict(d)
         d.setdefault("regimes", 0)          # checkpoints made before the regimes existed
+        d.setdefault("decoder", "ar")       # checkpoints made before the canvas existed
+        d.setdefault("aug_tag", False)
+        d.setdefault("seam_head", False)    # canvas checkpoints made before the seam head (the error head decides)
         return V5Config(**d)
 
     def vocab(self) -> Vocab:
@@ -144,6 +151,16 @@ class RegimeModule(nn.Module):
             z = hard + soft - soft.detach()                                                    # [B, S, K]
         else:
             z = F.one_hot(logits.argmax(-1), self.slots).float()
+        # load balancing (Switch Transformer): K x sum_k (share of parts on k) x (mean probability of k); 1 = even.
+        # Without it one regime takes almost every part and the others never learn (82 % / 17 % / 0 % ...)
+        act = int(self.active)
+        prob = torch.softmax(logits, dim=-1)[..., :act].reshape(-1, act)
+        used = cnt.reshape(-1) > 0
+        if used.any():
+            share = F.one_hot(prob[used].argmax(-1), act).float().mean(0)
+            self.balance = act * (share * prob[used].mean(0)).sum()
+        else:
+            self.balance = logits.sum() * 0.0
         zf = torch.gather(z, 1, seg[..., None].expand(-1, -1, self.slots)).to(x.dtype)          # [B, T, K]
         # the embedding carries the (straight-through) gradient to the choice; the adapter is applied only for the
         # regime each frame chose (computing all slots for every frame cost [B, T, slots, d] of memory)
@@ -273,14 +290,27 @@ class V5Net(nn.Module):
         self.enc_norm = nn.LayerNorm(d)
         self.regime = RegimeModule(d, cfg.regimes, cfg.regimes_active, cfg.regime_rank) if cfg.regimes > 0 else None
         self.cause_head = nn.Linear(d, len(CAUSES))
+        self.sr_mlp = nn.Sequential(nn.Linear(1, d), nn.GELU(), nn.Linear(d, d))
+        self.style_mlp = nn.Sequential(nn.Linear(2 * cfg.style_dim, d), nn.GELU(), nn.Linear(d, d))
+        self.null_cond = nn.Parameter(torch.zeros(d))
+        if cfg.aug_tag:
+            self.aug_emb = nn.Embedding(2, d)
+            nn.init.zeros_(self.aug_emb.weight)
+        if cfg.decoder == "canvas":
+            self._build_canvas(cfg)
+            return
         V = cfg.vocab().size
         self.tok = nn.Embedding(V, d)
         self.pos = nn.Embedding(cfg.max_tokens, d)
         self.phase = nn.Embedding(N_PHASE, d)
-        self.sr_mlp = nn.Sequential(nn.Linear(1, d), nn.GELU(), nn.Linear(d, d))
-        self.style_mlp = nn.Sequential(nn.Linear(2 * cfg.style_dim, d), nn.GELU(), nn.Linear(d, d))
-        self.null_cond = nn.Parameter(torch.zeros(d))
         self.at_time = nn.Linear(d, d)
+        # draft of the map (re-mapping passes): added to the encoder input; zero at the start, so a checkpoint made
+        # without it behaves exactly as before and learns to use it
+        if cfg.draft:
+            from .critic import MAP_DIM
+            self.draft_in = nn.Linear(MAP_DIM + 1, d)
+            nn.init.zeros_(self.draft_in.weight)
+            nn.init.zeros_(self.draft_in.bias)
         self.dec = nn.ModuleList([DecLayer(d, cfg.n_heads, cfg.ff_mult, cfg.dropout) for _ in range(cfg.dec_layers)])
         self.dec_norm = nn.LayerNorm(d)
         # every token except the TIME tokens, plus one "an event starts" slot (index time0): the time itself is
@@ -296,6 +326,58 @@ class V5Net(nn.Module):
         # that jumps far ahead skips notes it can never go back to
         self.dist_bias = nn.Embedding(MAX_DIST + 2, 1)
         nn.init.zeros_(self.dist_bias.weight)
+
+    # --- canvas decoder ----------------------------------------------------------------------------------------------
+    def _build_canvas(self, cfg: V5Config) -> None:
+        """Bidirectional layers over the frames of the window: input = the encoder state of every frame + the canvas
+        (per lane: state, start offset, end offset - or the mask) + the condition; output per lane: state, start
+        offset, end offset, and per frame: "this visible frame is wrong" (the critic of the self-correction)."""
+        from .frames import MASK_OFF, N_STATES, NUM_LANES
+
+        d = cfg.d_model
+        self.cv_state = nn.Embedding(NUM_LANES * (N_STATES + 1), d)
+        self.cv_start = nn.Embedding(NUM_LANES * (MASK_OFF + 1), d)
+        self.cv_end = nn.Embedding(NUM_LANES * (MASK_OFF + 1), d)
+        self.cv_hidden = nn.Embedding(2, d)
+        self.cv_layers = nn.ModuleList([EncLayer(d, cfg.n_heads, cfg.ff_mult, cfg.dropout) for _ in range(cfg.dec_layers)])
+        self.cv_norm = nn.LayerNorm(d)
+        self.state_head = nn.Linear(d, NUM_LANES * N_STATES)
+        self.start_head = nn.Linear(d, NUM_LANES * cfg.frame_ms)
+        self.end_head = nn.Linear(d, NUM_LANES * cfg.frame_ms)
+        self.error_head = nn.Linear(d, 1)
+        # overlap zones of generation: "this visible frame - placed by the earlier window without seeing what follows,
+        # or by the later one - is wrong", learned on exactly that situation (train_v5.seam_batch); decides which
+        # version of a differing stretch stays
+        self.seam_head = nn.Linear(d, 1) if cfg.seam_head else None
+
+    def canvas_embed(self, state_in: torch.Tensor, start_in: torch.Tensor, end_in: torch.Tensor,
+                     hidden: torch.Tensor) -> torch.Tensor:
+        """[B, T, d] of a canvas (inputs of frames.inputs)."""
+        from .frames import MASK_OFF, N_STATES, NUM_LANES
+
+        lanes = torch.arange(NUM_LANES, device=state_in.device)
+        x = self.cv_state(lanes * (N_STATES + 1) + state_in).sum(2)
+        x = x + self.cv_start(lanes * (MASK_OFF + 1) + start_in).sum(2)
+        x = x + self.cv_end(lanes * (MASK_OFF + 1) + end_in).sum(2)
+        return x + self.cv_hidden(hidden.long())
+
+    def canvas_decode(self, memory: torch.Tensor, cond: torch.Tensor, state_in, start_in, end_in, hidden) -> Dict[str, torch.Tensor]:
+        """Logits of every frame and lane: state [B, T, 4, 5], start [B, T, 4, 10], end [B, T, 4, 10], error [B, T]
+        (+ seam [B, T] with the seam head)."""
+        from .frames import N_STATES, NUM_LANES
+
+        x = memory + self.canvas_embed(state_in, start_in, end_in, hidden) + cond[:, None]
+        for layer in self.cv_layers:
+            x = layer(x)
+        h = self.cv_norm(x)
+        B, T, _ = h.shape
+        out = {"state": self.state_head(h).view(B, T, NUM_LANES, N_STATES),
+               "start": self.start_head(h).view(B, T, NUM_LANES, -1),
+               "end": self.end_head(h).view(B, T, NUM_LANES, -1),
+               "error": self.error_head(h).squeeze(-1)}
+        if getattr(self, "seam_head", None) is not None:
+            out["seam"] = self.seam_head(h).squeeze(-1)
+        return out
 
     @torch.no_grad()
     def init_distance_prior(self, gaps_frames) -> None:
@@ -320,9 +402,14 @@ class V5Net(nn.Module):
         parts.append(beat)
         return parts
 
-    def encode(self, feats: torch.Tensor, beat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """feats [B, T, sum(groups)] (the groups' columns in order, see data.group_columns), beat [B, T, beat_dim]."""
+    def encode(self, feats: torch.Tensor, beat: torch.Tensor, draft: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """feats [B, T, sum(groups)] (the groups' columns in order, see data.group_columns), beat [B, T, beat_dim],
+        draft [B, T, MAP_DIM + 1] (picture of a draft map + "a draft is given" flag) or None."""
         x, w = self.selector(self.split_groups(feats, beat))
+        if getattr(self, "draft_in", None) is not None:
+            if draft is None:
+                draft = torch.zeros(*x.shape[:2], self.draft_in.in_features, device=x.device, dtype=x.dtype)
+            x = x + self.draft_in(draft.to(x.dtype))
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
         x = x + sinusoid(x.shape[1], x.shape[2], x.device)[None]
         half = len(self.enc) // 2
@@ -336,14 +423,19 @@ class V5Net(nn.Module):
                 x, regime = self.regime(x, part_index(sec, x.shape[1], x.shape[0], x.device))
             x = layer(x)
         x = self.enc_norm(x)
-        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x), "regime": regime}
+        bal = self.regime.balance if (self.regime is not None and regime is not None and hasattr(self.regime, "balance")) else None
+        return {"memory": x, "source_weights": w, "cause_logits": self.cause_head(x), "regime": regime, "regime_balance": bal}
 
     def condition(self, sr: torch.Tensor, style: torch.Tensor, style_mask: torch.Tensor,
-                  drop: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """[B, d]; ``drop`` [B] bool = unconditional (null) rows."""
+                  drop: Optional[torch.Tensor] = None, aug: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """[B, d]; ``drop`` [B] bool = unconditional (null) rows; ``aug`` [B] 1 = a lane-rotated training example
+        (tagged augmentation: generation always uses 0)."""
         c = self.sr_mlp(sr.view(-1, 1) / 10.0) + self.style_mlp(torch.cat([style * style_mask, style_mask], dim=-1))
         if drop is not None:
             c = torch.where(drop[:, None], self.null_cond[None].expand_as(c), c)
+        if getattr(self, "aug_emb", None) is not None:
+            a = torch.zeros(c.shape[0], dtype=torch.long, device=c.device) if aug is None else aug.view(-1).long()
+            c = c + self.aug_emb(a)
         return c
 
     def embed_tokens(self, tokens, phase, tok_frame, memory, cond, pos0: int = 0):
@@ -397,19 +489,24 @@ class V5Net(nn.Module):
         return self.full_logprobs(self.decode_parts(x, mem, caches, key_pad, tok_frame))
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        enc = self.encode(batch["feats"], batch["beat"])
-        B = batch["tokens"].shape[0]
+        enc = self.encode(batch["feats"], batch["beat"], batch.get("draft"))
+        B = batch["feats"].shape[0]
         drop = None
         if self.training:      # always a mask in training, so the null condition is part of the graph (DDP)
-            drop = torch.rand(B, device=batch["tokens"].device) < self.cfg.cond_dropout
-        cond = self.condition(batch["sr"], batch["style"], batch["style_mask"], drop)
+            drop = torch.rand(B, device=batch["feats"].device) < self.cfg.cond_dropout
+        cond = self.condition(batch["sr"], batch["style"], batch["style_mask"], drop, batch.get("aug"))
+        if self.cfg.decoder == "canvas":
+            out = self.canvas_decode(enc["memory"], cond, batch["cv_state"], batch["cv_start"], batch["cv_end"],
+                                     batch["cv_hidden"])
+            return {"canvas": out, **enc}
         x = self.embed_tokens(batch["tokens"], batch["phase"], batch["tok_frame"], enc["memory"], cond)
         parts = self.decode_parts(x, self.memory_kv(enc["memory"]), key_pad=batch["tokens"] == 0, tok_frame=batch["tok_frame"])
         return {"parts": parts, **enc}
 
 
 def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cause_weight: float = 0.2,
-              label_smoothing: float = 0.02, window_ms: int = 10240) -> Tuple[torch.Tensor, Dict[str, float]]:
+              label_smoothing: float = 0.02, window_ms: int = 10240,
+              regime_balance: float = 0.01) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Next-token cross-entropy (+ the cause head on event frames). Per-item weights (hard mining) via
     batch['item_weight']; returns (loss, logs) with the per-item token loss in logs['_per_item'] for hard mining."""
     from .tokens import N_SPECIAL
@@ -456,6 +553,85 @@ def v5_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], caus
         is_t = batch["is_time"][:, 1:] > 0
         if is_t.any():
             logs["time_tokens"] = float((ce * is_t.float()).sum() / is_t.float().sum().clamp(min=1.0))
+    if out.get("regime_balance") is not None and regime_balance > 0:
+        total = total + regime_balance * out["regime_balance"].float()
+        logs["regime_balance"] = float(out["regime_balance"].detach())
+    logs["total"] = float(total.detach())
+    out["_per_item"] = per_item.detach()
+    return total, logs
+
+
+def canvas_losses(out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cause_weight: float = 0.2,
+                  event_weight: float = 4.0, error_weight: float = 0.3, regime_balance: float = 0.01,
+                  label_smoothing: float = 0.02, seam_weight: float = 0.3) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Losses of the canvas: per lane state (frames with a note weigh ``event_weight`` x), start / end offsets where
+    the target has them, on the frames that count (``cv_loss`` [B, T]: the hidden ones, or every frame of a damaged
+    canvas), + "this visible frame is wrong" (``cv_err`` / ``cv_err_mask``; the seam head on the overlap zone of seam
+    batches, ``cv_seam_mask``) + the cause head + regime balance. Per-item loss in out['_per_item'] (hard mining)."""
+    from .frames import EMPTY, HEAD, TAIL, TAP
+
+    cv = out["canvas"]
+    tgt = batch["cv_tgt_state"]                                              # [B, T, 4]
+    lw = batch["cv_loss"].float()                                            # [B, T]
+    B, T, L = tgt.shape
+    st_logits = cv["state"].float()
+    ce_s = F.cross_entropy(st_logits.reshape(-1, st_logits.shape[-1]), tgt.reshape(-1).long(), reduction="none",
+                           label_smoothing=label_smoothing).view(B, T, L)
+    w_s = lw[..., None] * (1.0 + (event_weight - 1.0) * (tgt != EMPTY).float())
+    per_item = (ce_s * w_s).sum((1, 2)) / w_s.sum((1, 2)).clamp(min=1.0)
+    loss_state = (ce_s * w_s).sum() / w_s.sum().clamp(min=1.0)
+    st_on = ((tgt == TAP) | (tgt == HEAD)).float() * lw[..., None]
+    en_on = (tgt == TAIL).float() * lw[..., None]
+    ce_a = F.cross_entropy(cv["start"].float().reshape(-1, cv["start"].shape[-1]),
+                           batch["cv_tgt_start"].clamp(min=0).reshape(-1).long(), reduction="none").view(B, T, L)
+    ce_e = F.cross_entropy(cv["end"].float().reshape(-1, cv["end"].shape[-1]),
+                           batch["cv_tgt_end"].clamp(min=0).reshape(-1).long(), reduction="none").view(B, T, L)
+    loss_start = (ce_a * st_on).sum() / st_on.sum().clamp(min=1.0)
+    loss_end = (ce_e * en_on).sum() / en_on.sum().clamp(min=1.0)
+    w = batch.get("item_weight")
+    iw = torch.ones(B, device=tgt.device) if w is None else w.float().view(-1)
+    iw = iw / iw.mean().clamp(min=1e-8)
+    total = (per_item * iw).mean() + 0.5 * (loss_start + loss_end)
+    logs: Dict[str, float] = {"state": float(loss_state.detach()), "start": float(loss_start.detach()),
+                              "end": float(loss_end.detach())}
+    em = batch["cv_err_mask"].float()
+    if error_weight > 0:
+        le = (F.binary_cross_entropy_with_logits(cv["error"].float(), batch["cv_err"].float(), reduction="none") * em).sum() \
+            / em.sum().clamp(min=1.0)
+        total = total + error_weight * le
+        logs["error"] = float(le.detach())
+    if cv.get("seam") is not None:
+        sm = batch.get("cv_seam_mask")
+        sm = torch.zeros_like(em) if sm is None else sm.float()
+        ls = (F.binary_cross_entropy_with_logits(cv["seam"].float(), batch["cv_err"].float(), reduction="none") * sm).sum() \
+            / sm.sum().clamp(min=1.0)
+        total = total + seam_weight * ls                    # in the graph on every step (DDP): zero without a seam
+        if float(sm.sum()) > 0:
+            with torch.no_grad():
+                p = (batch["cv_err"].float() * sm).sum() / sm.sum()
+                p = p.clamp(1e-4, 1 - 1e-4)
+            logs["seam"] = float(ls.detach())
+            logs["seam_base"] = float(-(p * p.log() + (1 - p) * (1 - p).log()))    # loss of a constant guess
+            logs["seam_wrong"] = float(p)
+    cl = batch["cause"]
+    m = cl >= 0
+    if m.any() and cause_weight > 0:
+        lc = F.cross_entropy(out["cause_logits"][m].float(), cl[m])
+        total = total + cause_weight * lc
+        logs["cause"] = float(lc.detach())
+    else:
+        total = total + out["cause_logits"].sum() * 0.0
+    if out.get("regime_balance") is not None and regime_balance > 0:
+        total = total + regime_balance * out["regime_balance"].float()
+        logs["regime_balance"] = float(out["regime_balance"].detach())
+    with torch.no_grad():                                                    # notes found on the hidden frames
+        pred_note = st_logits.argmax(-1) != EMPTY
+        true_note = tgt != EMPTY
+        on = lw[..., None] > 0
+        tp = (pred_note & true_note & on).sum().float()
+        prec = tp / (pred_note & on).sum().clamp(min=1).float()
+        rec = tp / (true_note & on).sum().clamp(min=1).float()
+        logs["note_f1"] = float(2 * prec * rec / (prec + rec).clamp(min=1e-8))
     logs["total"] = float(total.detach())
     out["_per_item"] = per_item.detach()
     return total, logs

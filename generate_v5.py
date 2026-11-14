@@ -31,7 +31,7 @@ from osu_mapper.hybrid.audio_features import beat_features, load_audio
 from osu_mapper.hybrid.beatmap import ManiaMap, RawTimingPoint, map_to_osu_text
 from osu_mapper.hybrid.causes import CAUSES, stem_attacks
 from osu_mapper.hybrid.inference import estimated_timing_points, prepare_song_inputs, resolve_device, star_rating_of
-from osu_mapper.v5.generate import generate_song
+from osu_mapper.v5.infer import generate_map
 from osu_mapper.v5.data import song_inputs
 from osu_mapper.v5.model import V5Config, V5Net
 from osu_mapper.v5.sections import describe, find_sections, kiai_timing_points
@@ -112,6 +112,24 @@ def main(argv=None) -> None:
     ap.add_argument("--sr", nargs="*", default=["4"])
     ap.add_argument("--checkpoint", "-c", default="checkpoints/v5/v5_best.pt")
     ap.add_argument("--critic", default=None, help="critic.pt (default: next to the checkpoint, if it exists)")
+    ap.add_argument("--steps", type=int, default=8,
+                    help="canvas networks: rounds in which the hidden frames of a window are revealed (more = surer)")
+    ap.add_argument("--refine", type=int, default=1,
+                    help="canvas networks: self-correction passes (the error head marks frames, they are restored again; "
+                         "a change is kept only if the error head then finds fewer errors)")
+    ap.add_argument("--no_overlap", action="store_true",
+                    help="canvas networks: do not let the next window propose its own version of the end of the previous "
+                         "one (by default differing stretches of the overlaps are decided by the error head)")
+    ap.add_argument("--edit", default=None,
+                    help="canvas networks: an existing map (.osz/.osu) whose notes are kept; with --regen only those "
+                         "seconds are mapped again, with the rest of the map in view")
+    ap.add_argument("--edit_diff", default="", help="difficulty name (substring) inside --edit")
+    ap.add_argument("--regen", default="", help="time ranges in seconds to map again, e.g. 30-45,61.5-70 (with --edit)")
+    ap.add_argument("--passes", type=int, default=2,
+                    help="1 = one pass; 2+ = draft, then every window mapped again with the whole draft in view "
+                         "(networks trained with --draft_prob; others make one pass)")
+    ap.add_argument("--no_keep_better", action="store_true",
+                    help="take every later pass as it is (default: per bar the better of draft and new pass)")
     ap.add_argument("--search", type=int, default=1, help="continuations sampled per phrase; the best is kept")
     ap.add_argument("--critic_weight", type=float, default=1.0)
     ap.add_argument("--reward_weight", type=float, default=0.5)
@@ -208,6 +226,18 @@ def main(argv=None) -> None:
         artist = args.artist or meta.get("Artist") or "Unknown Artist"
         items = []
         targets = [float(x) for s in args.sr for x in str(s).split(",") if x.strip()]
+        fixed_notes, regen = None, None
+        if args.edit:
+            from generate_hybrid import load_reference
+            if getattr(cfg, "decoder", "ar") != "canvas":
+                sys.exit("--edit needs a canvas network (train_v5.py --decoder canvas)")
+            fixed_notes = sorted(load_reference(args.edit, args.edit_diff).notes)
+            regen = []
+            for part in [p for p in args.regen.replace(" ", "").split(",") if p]:
+                a, b = part.split("-")
+                regen.append((float(a), float(b)))
+            print(f"[edit] {len(fixed_notes)} notes kept" + (", mapped again: " + ", ".join(f"{a:g}-{b:g}s" for a, b in regen)
+                                                            if regen else " (no --regen: the map is only self-corrected, --refine passes)"))
         # style: what the audio does not decide - an LN map or a rice map of the same song is the mapper's choice
         from osu_mapper.hybrid.inference import style_from_dict
         style, smask = style_from_dict(parse_style(args.style))
@@ -235,9 +265,16 @@ def main(argv=None) -> None:
                 sm_t[j_ln] = 1.0
                 print(f"[style] LN share from the music at {target:.2f}*: {st_t[j_ln]:.2f} "
                       "(--style ln_ratio=... sets it, --no_ln_guess leaves it to the network)")
-            notes = generate_song(model, feats_all, beat_all, timing, target, style=st_t, style_mask=sm_t,
-                                  candidates=args.search, score_fn=score_fn, temperature=args.temperature,
-                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev)
+            lp_pass = LanePredictor.cached(lib, target) if lib is not None else None
+            is_canvas = getattr(cfg, "decoder", "ar") == "canvas"
+            notes = generate_map(model, feats_all, beat_all, timing, target, passes=args.passes, style=st_t,
+                                 style_mask=sm_t, candidates=args.search, score_fn=score_fn,
+                                 temperature=args.temperature if not is_canvas or args.temperature != 0.9 else 1.0,
+                                 top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev,
+                                 log=print if (args.passes > 1 or is_canvas) else None,
+                                 keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
+                                 steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen,
+                                 overlap=not args.no_overlap)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

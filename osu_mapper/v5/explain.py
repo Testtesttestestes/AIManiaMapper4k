@@ -90,30 +90,83 @@ def explain_events(model: V5Net, feats: np.ndarray, beat: np.ndarray, tokens: Se
             logits = model.decode(x, model.memory_kv(enc["memory"]), tok_frame=fr_t[:, :p])
             lp = torch.log_softmax(logits[:, -1].float(), dim=-1)[:, toks[p]]
             gf, gb = torch.autograd.grad(lp.sum(), [fx, bx])
-        attr_f = (f0 * gf.mean(0)).abs()                                       # [T, width]
-        attr_b = (b0 * gb.mean(0)).abs()
         t_ms = toks[p] - v.time0
-        c = t_ms // model.cfg.frame_ms
-        w = max(1, local_ms // model.cfg.frame_ms)
-        lo, hi = max(0, c - w), min(f0.shape[0], c + w + 1)
-        share = {s: 0.0 for s in SOURCES}
-        groups: Dict[str, float] = {}
-        for n, (ga, gb_) in zip(names, bounds):
-            val = float(attr_f[lo:hi, ga:gb_].sum())
-            groups[n] = val
-            if n == "attacks":
-                per = attr_f[lo:hi, ga:gb_].sum(0).tolist()
-                for k, s in enumerate(_STEM_OF_ATTACK):
-                    share[s] += float(per[k]) if k < len(per) else 0.0
-            else:
-                share[_source_of_group(n)] += val
-        share["beat"] += float(attr_b[lo:hi].sum())
-        groups["beat"] = float(attr_b[lo:hi].sum())
-        tot = sum(share.values()) or 1.0
-        row = {"time_ms": float(start_ms + t_ms), "logp": float(lp.detach().mean())}
-        row.update({s: share[s] / tot for s in SOURCES})
-        row.update({"g_" + n: v_ / tot for n, v_ in groups.items()})
-        rows.append(row)
+        rows.append(_row(model, f0, b0, gf, gb, t_ms // model.cfg.frame_ms, local_ms, names, bounds,
+                         start_ms + t_ms, float(lp.detach().mean())))
+    return rows
+
+
+def _row(model: V5Net, f0, b0, gf, gb, c: int, local_ms: int, names, bounds, time_ms: float, logp: float) -> Dict[str, float]:
+    """Attribution (input x mean gradient) near frame ``c``, per source and per input group, as shares."""
+    attr_f = (f0 * gf.mean(0)).abs()                                       # [T, width]
+    attr_b = (b0 * gb.mean(0)).abs()
+    w = max(1, local_ms // model.cfg.frame_ms)
+    lo, hi = max(0, c - w), min(f0.shape[0], c + w + 1)
+    share = {s: 0.0 for s in SOURCES}
+    groups: Dict[str, float] = {}
+    for n, (ga, gb_) in zip(names, bounds):
+        val = float(attr_f[lo:hi, ga:gb_].sum())
+        groups[n] = val
+        if n == "attacks":
+            per = attr_f[lo:hi, ga:gb_].sum(0).tolist()
+            for k, s in enumerate(_STEM_OF_ATTACK):
+                share[s] += float(per[k]) if k < len(per) else 0.0
+        else:
+            share[_source_of_group(n)] += val
+    share["beat"] += float(attr_b[lo:hi].sum())
+    groups["beat"] = float(attr_b[lo:hi].sum())
+    tot = sum(share.values()) or 1.0
+    row = {"time_ms": float(time_ms), "logp": float(logp)}
+    row.update({s: share[s] / tot for s in SOURCES})
+    row.update({"g_" + n: v_ / tot for n, v_ in groups.items()})
+    return row
+
+
+def explain_events_canvas(model: V5Net, feats: np.ndarray, beat: np.ndarray, notes, sr: float, start_ms: int,
+                          times: Sequence[int], steps: int = 8, local_ms: int = 200,
+                          device: Optional[torch.device] = None) -> List[Dict[str, float]]:
+    """The canvas network's version: the decision about a note is the log-probability of its true state (TAP / HEAD on
+    every lane of the chord) when its frame (and two frames on each side) is hidden and the rest of the map is visible;
+    attributed to the audio inputs by integrated gradients, as for the autoregressive network."""
+    from . import frames as fr
+
+    dev = device or next(model.parameters()).device
+    model.eval()
+    W, H = model.cfg.window_frames, model.cfg.frame_ms
+    width = sum(model.cfg.groups.values())
+    f0 = torch.from_numpy(np.asarray(feats[:, :width], dtype=np.float32)).to(dev)
+    b0 = torch.from_numpy(np.asarray(beat, dtype=np.float32)).to(dev)
+    st, so, eo, _ = fr.encode(notes, start_ms, W, H)
+    alphas = (torch.arange(steps, device=dev, dtype=torch.float32) + 0.5) / steps
+    names = list(model.cfg.groups)
+    bounds, a = [], 0
+    for n in names:
+        bounds.append((a, a + model.cfg.groups[n]))
+        a += model.cfg.groups[n]
+    zero_style = torch.zeros(steps, model.cfg.style_dim, device=dev)
+    rows: List[Dict[str, float]] = []
+    for t in times:
+        f = (int(t) - start_ms) // H
+        if not 0 <= f < W:
+            continue
+        lanes = [c for c in range(fr.NUM_LANES) if st[f, c] in (fr.TAP, fr.HEAD)]
+        if not lanes:
+            continue
+        hidden = np.zeros(W, dtype=bool)
+        hidden[max(0, f - 2):f + 3] = True
+        s_in, a_in, e_in = fr.inputs(st, so, eo, hidden)
+        T = lambda x: torch.from_numpy(np.asarray(x)).to(dev)[None].expand(steps, *x.shape)
+        fx = (alphas[:, None, None] * f0[None]).requires_grad_(True)
+        bx = (alphas[:, None, None] * b0[None]).requires_grad_(True)
+        with torch.enable_grad():
+            enc = model.encode(fx, bx)
+            cond = model.condition(torch.full((steps, 1), float(sr), device=dev), zero_style, zero_style)
+            out = model.canvas_decode(enc["memory"], cond, T(s_in), T(a_in), T(e_in), T(hidden.astype(np.int64)))
+            lp = torch.log_softmax(out["state"].float(), dim=-1)[:, f]               # [steps, 4, 5]
+            tgt = torch.tensor([int(st[f, c]) for c in lanes], device=dev)
+            val = lp[:, lanes].gather(-1, tgt[None, :, None].expand(steps, -1, 1)).sum((1, 2))
+            gf, gb = torch.autograd.grad(val.sum(), [fx, bx])
+        rows.append(_row(model, f0, b0, gf, gb, f, local_ms, names, bounds, float(t), float(val.detach().mean())))
     return rows
 
 
@@ -136,7 +189,7 @@ def explain_notes(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, not
     ``max_events`` spread over the map). Every event is explained in a window that has the 5 s before it as context."""
     from .tokens import encode
 
-    v = model.cfg.vocab()
+    v = model.cfg.vocab() if getattr(model.cfg, "decoder", "ar") == "ar" else None
     W, H = model.cfg.window_frames, model.cfg.frame_ms
     ev_times = sorted({int(n.start) for n in notes}) if times is None else sorted({int(t) for t in times})
     if len(ev_times) > max_events:
@@ -149,6 +202,10 @@ def explain_notes(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, not
     from ..hybrid.dataset import _crop_rows
     for s, ts in sorted(by_win.items()):
         s_ms = s * H
+        if getattr(model.cfg, "decoder", "ar") == "canvas":
+            rows += explain_events_canvas(model, _crop_rows(feats_all, s, W), _crop_rows(beat_all, s, W), notes, sr,
+                                          s_ms, ts, steps=steps, device=device)
+            continue
         toks, ev_pos, _ = encode(notes, s_ms, v)
         ev_ms = [toks[p] - v.time0 + s_ms for p in ev_pos]
         idx = [ev_ms.index(t) for t in ts if t in ev_ms]

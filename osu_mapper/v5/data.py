@@ -146,6 +146,39 @@ class SongCache:
         return np.concatenate(parts, axis=1).astype(np.float32)
 
 
+def make_draft(notes, timing_points, rng: random.Random) -> list:
+    """A draft of the human map for training the re-mapping passes: one to three kinds of damage (the bursts collapsed
+    to 1/2, the critic's damage - lanes, timing, missing / extra notes, long notes made taps / taps made long notes /
+    lengths scrambled / releases moved - a span of 1-4 s cut out, every other event dropped); the network learns to
+    map the song again from it, keeping what is right and fixing the rest."""
+    from .critic import blandify, corrupt
+
+    d = list(notes)
+    for _ in range(rng.randint(1, 3)):
+        k = rng.random()
+        if k < 0.25:
+            d = blandify(d, timing_points)
+        elif k < 0.75:
+            d = corrupt(d, rng)
+        elif k < 0.9 and d:
+            a = rng.choice(d).start
+            L = rng.randint(1000, 4000)
+            d = [n for n in d if not (a <= n.start < a + L)]
+        else:
+            ts = sorted({n.start for n in d})
+            keep = set(ts[::2])
+            d = [n for n in d if n.start in keep]
+    return d
+
+
+def draft_frames(draft_notes, start_ms: int, W: int, frame_ms: int = 10) -> np.ndarray:
+    """[W, MAP_DIM + 1]: picture of the draft (critic.map_frames) + a column of ones ("a draft is given")."""
+    from .critic import map_frames
+
+    x = map_frames(draft_notes, start_ms, W, frame_ms)
+    return np.concatenate([x, np.ones((W, 1), np.float32)], axis=1)
+
+
 def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame: int, vocab: Vocab, W: int,
                 frame_ms: int = 10, style_known: bool = True) -> Dict[str, torch.Tensor]:
     start_ms = start_frame * frame_ms
@@ -177,8 +210,139 @@ def window_item(cache: SongCache, entry: Dict, notes, timing_points, start_frame
     }
 
 
+def augment_notes(notes, mirror: bool = False, rotate: int = 0) -> list:
+    """Lanes mirrored (1234 -> 4321) and / or rotated (rotate = 1: 1234 -> 4123). Star ratings stay the same (the
+    mania star rating treats the columns alike; checked in tests/test_v5.py)."""
+    from ..hybrid.beatmap import Note as _N
+
+    if not mirror and not rotate:
+        return list(notes)
+    out = []
+    for n in notes:
+        c = int(n.col)
+        if mirror:
+            c = 3 - c
+        c = (c + rotate) % 4
+        out.append(_N(n.start, c, n.end, n.ln))
+    return out
+
+
+def _shifted(timing_points, ms: int):
+    from ..hybrid.beatmap import RawTimingPoint as _R
+
+    return [_R(tp.time - ms, tp.beat_len, tp.meter, tp.sample_set, tp.sample_index, tp.volume, tp.uninherited, tp.effects)
+            for tp in timing_points]
+
+
+def hide_frames(W: int, ratio: float, rng: random.Random) -> np.ndarray:
+    """[W] bool: frames under the mask - at random or (half the time) as spans of 0.2 - 3 s (inpainting a phrase)."""
+    k = int(round(min(1.0, max(0.0, ratio)) * W))
+    hidden = np.zeros(W, dtype=bool)
+    if k <= 0:
+        return hidden
+    if rng.random() < 0.5:
+        hidden[np.array(rng.sample(range(W), k))] = True
+        return hidden
+    while hidden.sum() < k:
+        L = rng.randint(20, 300)
+        a = rng.randint(0, max(0, W - 1))
+        hidden[a:a + L] = True
+    return hidden
+
+
+def canvas_item(cache: "SongCache", entry: Dict, notes, timing_points, start_frame: int, W: int, rng: random.Random,
+                style_known: bool, frame_ms: int = 10, mirror: bool = False, rotate: int = 0, shift_ms: int = 0,
+                p_empty: float = 0.1, p_fix: float = 0.25, seam: bool = False) -> Dict[str, torch.Tensor]:
+    """One training window of the canvas (as the v4 canvas): the human map as frames x lanes, part of it hidden (random
+    frames or whole phrases, any share from 5 to 100 %, "restore what is missing"), or - ``p_fix`` - a damaged copy of
+    it visible ("find and fix": the loss counts every frame, the error head learns which visible frames are wrong), or
+    - ``p_empty`` - nothing visible (a map from scratch). Augmentations: mirrored lanes, rotated lanes (tagged: the
+    condition knows; generation never rotates), a shift of 0-9 ms inside the frame (features interpolated between
+    frames, notes moved by the same milliseconds: every millisecond of a song can start a window).
+    ``seam``: also the earlier of two windows that overlap by half, as in generation (``seam_feats`` / ``seam_beat``:
+    the half window before this one; ``seam_state`` / ``seam_start`` / ``seam_end``: the human map of the earlier
+    window), for learning the overlap zones (train_v5.seam_batch)."""
+    from . import frames as fr
+
+    start_ms = start_frame * frame_ms + shift_ms
+    end_ms = start_ms + W * frame_ms
+    win = [n for n in notes if (n.end if n.ln else n.start) >= start_ms - frame_ms and n.start < end_ms]
+    win = augment_notes(win, mirror, rotate)
+    st, so, eo, _ = fr.encode(win, start_ms, W, frame_ms)
+    tps = _shifted(timing_points, shift_ms) if shift_ms else timing_points
+    if shift_ms:
+        rows = cache.window(entry["song_id"], start_frame, W + 1, timing_points)
+        a = shift_ms / float(frame_ms)
+        feats = (rows[:-1] * (1.0 - a) + rows[1:] * a).astype(np.float32)
+    else:
+        feats = cache.window(entry["song_id"], start_frame, W, timing_points)
+    beat = beat_features(tps, start_frame, W, frame_ms) if tps else np.zeros((W, BEAT_DIM), np.float32)
+    # what is visible: masked frames / a damaged copy / nothing
+    u = rng.random()
+    err = np.zeros(W, dtype=np.float32)
+    err_mask = np.zeros(W, dtype=np.float32)
+    if u < p_empty:
+        hidden = np.ones(W, dtype=bool)
+        vis = (st, so, eo)
+        loss = np.ones(W, dtype=np.float32)
+    elif u < p_empty + p_fix:
+        dmg = make_draft(win, timing_points, rng)
+        dst, dso, deo, _ = fr.encode(dmg, start_ms, W, frame_ms)
+        vis = (dst, dso, deo)
+        hidden = hide_frames(W, rng.uniform(0.0, 0.3), rng)
+        loss = np.ones(W, dtype=np.float32)
+        err = fr.frame_differs(vis, (st, so, eo)).astype(np.float32)
+        err_mask = (~hidden).astype(np.float32)
+    else:
+        r = max(0.05, float(np.cos(np.pi / 2 * rng.random())))
+        hidden = hide_frames(W, r, rng)
+        vis = (st, so, eo)
+        loss = hidden.astype(np.float32)
+        err_mask = (~hidden).astype(np.float32)                 # visible frames are the truth here: "no error"
+    s_in, a_in, e_in = fr.inputs(*vis, hidden)
+    cause = np.full(W, -1, dtype=np.int64)
+    ev = np.flatnonzero(((st == fr.TAP) | (st == fr.HEAD)).any(axis=1))
+    if ev.size:
+        t_ev = start_ms + ev * frame_ms + np.where(so[ev] >= 0, so[ev], 99).min(axis=1)
+        cause[ev] = note_causes(t_ev, cache.attacks(entry["song_id"]), frame_ms)
+    style = np.asarray(entry["style"], dtype=np.float32)
+    smask = np.asarray(entry["style_mask"], dtype=np.float32) if style_known else np.zeros_like(style)
+    item = {
+        "feats": torch.from_numpy(np.ascontiguousarray(feats)), "beat": torch.from_numpy(beat.astype(np.float32)),
+        "cv_state": torch.from_numpy(s_in), "cv_start": torch.from_numpy(a_in), "cv_end": torch.from_numpy(e_in),
+        "cv_hidden": torch.from_numpy(hidden.astype(np.int64)),
+        "cv_tgt_state": torch.from_numpy(st.astype(np.int64)), "cv_tgt_start": torch.from_numpy(so.astype(np.int64)),
+        "cv_tgt_end": torch.from_numpy(eo.astype(np.int64)),
+        "cv_loss": torch.from_numpy(loss), "cv_err": torch.from_numpy(err), "cv_err_mask": torch.from_numpy(err_mask),
+        "cause": torch.from_numpy(cause),
+        "sr": torch.tensor([float(entry.get("sr", 0.0))], dtype=torch.float32),
+        "style": torch.from_numpy(style), "style_mask": torch.from_numpy(smask),
+        "aug": torch.tensor([1 if rotate else 0], dtype=torch.int64),
+    }
+    if seam:
+        # the earlier window [start - W/2, start + W/2): same augmentation, its own human map
+        H2 = W // 2
+        s0 = start_ms - H2 * frame_ms
+        win_e = [n for n in notes if (n.end if n.ln else n.start) >= s0 - frame_ms and n.start < s0 + W * frame_ms]
+        ste, soe, eoe, _ = fr.encode(augment_notes(win_e, mirror, rotate), s0, W, frame_ms)
+        if shift_ms:
+            rows = cache.window(entry["song_id"], start_frame - H2, H2 + 1, timing_points)
+            a = shift_ms / float(frame_ms)
+            pre = (rows[:-1] * (1.0 - a) + rows[1:] * a).astype(np.float32)
+        else:
+            pre = cache.window(entry["song_id"], start_frame - H2, H2, timing_points)
+        pre_beat = beat_features(tps, start_frame - H2, H2, frame_ms) if tps else np.zeros((H2, BEAT_DIM), np.float32)
+        item.update(seam_feats=torch.from_numpy(np.ascontiguousarray(pre)),
+                    seam_beat=torch.from_numpy(pre_beat.astype(np.float32)),
+                    seam_state=torch.from_numpy(ste.astype(np.int64)), seam_start=torch.from_numpy(soe.astype(np.int64)),
+                    seam_end=torch.from_numpy(eoe.astype(np.int64)))
+    return item
+
+
 def collate(items: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
+    if "tokens" not in items[0]:                       # canvas windows: every tensor has the same shape
+        return {k: torch.stack([it[k] for it in items]) for k in items[0]}
     L = max(int(it["tokens"].shape[0]) for it in items)
     for k in items[0]:
         if k in ("tokens", "phase", "tok_frame", "is_time"):
@@ -193,8 +357,16 @@ class V5Dataset(Dataset):
     def __init__(self, index: HybridIndex, map_indices: Sequence[int], vocab: Vocab, window_frames: int,
                  samples: int, seed: int = 0, train: bool = True, sr_balance: float = 0.5, hard_tilt: float = 0.0,
                  hard_share: float = 0.0, style_known_prob: float = 0.5, fixed: Optional[List[Tuple[int, int]]] = None,
-                 max_tokens: int = 1536, sections: bool = True, highlight=None):
+                 max_tokens: int = 1536, sections: bool = True, highlight=None, draft_prob: float = 0.0,
+                 decoder: str = "ar", mirror: float = 0.5, rotate: float = 0.25, shift: float = 0.5,
+                 seam: float = 0.0, sync_seed: int = 0):
         self.index = index
+        # seam batches (canvas): a share of the batches also carries the earlier of two overlapping windows; decided
+        # per batch from a seed every GPU shares, so all of them take the slower step together
+        self.p_seam, self.sync_seed, self.batch_size = float(seam), int(sync_seed), 1
+        self.draft_prob = float(draft_prob)
+        self.decoder = decoder
+        self.p_mirror, self.p_rotate, self.p_shift = float(mirror), float(rotate), float(shift)
         self.cache = SongCache(index, sections, highlight)
         self.map_indices = list(map_indices)
         self.vocab = vocab
@@ -247,6 +419,12 @@ class V5Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.fixed) if self.fixed is not None else self.samples
 
+    def is_seam_batch(self, i: int) -> bool:
+        if not (self.train and self.fixed is None and self.decoder == "canvas" and self.p_seam > 0):
+            return False
+        b = i // max(1, self.batch_size)
+        return random.Random(self.sync_seed * 1_000_003 + self.epoch * 7919 + b * 31 + 17).random() < self.p_seam
+
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         rng = random.Random(self.seed * 1_000_003 + self.epoch * 7919 + i)
         if self.fixed is not None:
@@ -257,8 +435,29 @@ class V5Dataset(Dataset):
             a, b = self.spans[k]
             start = rng.randint(a - self.W // 4, max(a - self.W // 4 + 1, b - self.W // 2))
         start = max(0, start)
+        if self.decoder == "canvas":
+            aug = self.train and self.fixed is None
+            item = canvas_item(self.cache, self.entries[k], self.notes[k], self.tps[k], start, self.W, rng,
+                               style_known=self.train and rng.random() < self.style_known_prob,
+                               mirror=aug and rng.random() < self.p_mirror,
+                               rotate=rng.randint(1, 3) if aug and rng.random() < self.p_rotate else 0,
+                               shift_ms=rng.randint(1, 9) if aug and rng.random() < self.p_shift else 0,
+                               seam=self.is_seam_batch(i))
+            item["map_k"] = torch.tensor([k], dtype=torch.int64)
+            item["item_weight"] = torch.tensor([1.0], dtype=torch.float32)
+            return item
         item = window_item(self.cache, self.entries[k], self.notes[k], self.tps[k], start, self.vocab, self.W,
                            style_known=self.train and rng.random() < self.style_known_prob)
+        if self.draft_prob > 0:
+            # re-mapping: in a share of the windows the encoder also sees a damaged draft of the map (the target is
+            # still the human map); in the others the draft input is empty (the first pass)
+            from .critic import MAP_DIM
+            if rng.random() < self.draft_prob:
+                s_ms, e_ms = start * 10, (start + self.W) * 10
+                win = [n for n in self.notes[k] if s_ms - 2000 <= n.start < e_ms]
+                item["draft"] = torch.from_numpy(draft_frames(make_draft(win, self.tps[k], rng), s_ms, self.W))
+            else:
+                item["draft"] = torch.zeros(self.W, MAP_DIM + 1)
         if item["tokens"].shape[0] > self.max_tokens:            # extremely dense window: keep the first part
             for key in ("tokens", "phase", "tok_frame", "is_time"):
                 item[key] = item[key][: self.max_tokens]

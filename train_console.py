@@ -218,9 +218,10 @@ V5_PRESETS = [("Маленькая", "быстро, для проверки", "t
 
 def step_v5(last: Dict[str, object], resume: bool = False) -> Optional[List[str]]:
     title("Дообучение v5" if resume else "Обучение v5")
-    print("v5: сеть ставит ноты по очереди, как пишут текст (авторегрессия), а не решает за каждый кадр отдельно по порогу;")
-    print("слышит дорожки отдельно и учит, за каким звуком идёт каждая нота; лучший чекпойнт выбирается по F1 и")
-    print("выразительности (рис/вспышки, ритм, плотность по тактам). Подробности: HYBRID_GUIDE.md, раздел v5.")
+    print("v5 (холст, как в v4): карта — кадры × дорожки, часть закрыта маской, сеть восстанавливает её, видя всё")
+    print("остальное с обеих сторон; слышит дорожки отдельно, знает части песни, учится на своих ошибках и на стыках окон")
+    print("(голова швов); при обучении зеркалит и сдвигает дорожки. Лучший чекпойнт — по F1 и выразительности.")
+    print("Подробности: HYBRID_GUIDE.md, 4.10.")
     data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
     warn_no_stems(data)
     ckdir = ask_folder("Папка для чекпойнтов", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
@@ -261,7 +262,8 @@ def step_meta(last: Dict[str, object]) -> Optional[List[str]]:
 def step_critic(last: Dict[str, object]) -> Optional[List[str]]:
     title("Критик v5")
     print("Сеть-оценщик «похоже на работу человека?» для поиска при генерации (generate_v5.py --search 4).")
-    print("Учится отличать карты людей от «пресных» (всё на 1/2, рис срезан), испорченных и карт самой сети.")
+    print("Учится оценивать окно карты: у людей 1, у «пресных» (всё на 1/2, рис срезан), испорченных и карт самой сети —")
+    print("их фактическое качество против карты человека (совпадение нот + выразительность): так он знает настоящие ошибки сети.")
     data = ask_folder("Папка датасета", str(last.get("data", "dataset_hybrid")), must_exist=False)
     ckdir = ask_folder("Папка чекпойнтов v5", str(last.get("ckdir_v5", "checkpoints/v5")), must_exist=False)
     last.update(data=data, ckdir_v5=ckdir)
