@@ -20,6 +20,7 @@ import math
 import os
 import random
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +36,59 @@ INDEX_VERSION = "hybrid-dataset-v1"
 # by rosu-pp at the clock rate (Peter on Crack 5.38* -> x1.2 6.31* -> x1.5 7.70*)
 RATES: Tuple[float, ...] = (1.1, 1.2, 1.3, 1.4, 1.5)
 LOSS_MARGIN_FRAMES = 200  # frames before the first / after the last note that still count as "no note here"
+
+
+class MappedCache:
+    """A dict of arrays that keeps at most ``limit`` memory-mapped ones open (the least recently used are dropped and
+    simply mapped again when asked for - a fraction of a millisecond). Every open np.memmap holds a file descriptor
+    (CPython's mmap keeps a duplicate of it), so caching every song a DataLoader worker ever drew ran a big dataset
+    out of them: "Too many open files" after ~100 steps with 4 workers x 3 GPUs. Arrays in memory and None are kept
+    without a limit."""
+
+    def __init__(self, limit: int = 64):
+        self.limit = int(limit)
+        self._d: "OrderedDict[str, Any]" = OrderedDict()
+
+    def __contains__(self, key) -> bool:
+        return key in self._d
+
+    def __getitem__(self, key):
+        self._d.move_to_end(key)
+        return self._d[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._d.pop(key, None)
+        self._d[key] = value
+        if isinstance(value, np.memmap):
+            mapped = [k for k, v in self._d.items() if isinstance(v, np.memmap)]
+            for k in mapped[: max(0, len(mapped) - self.limit)]:
+                del self._d[k]
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def open_files(self) -> int:
+        return sum(isinstance(v, np.memmap) for v in self._d.values())
+
+
+def raise_open_files_limit(want: int = 65536) -> Optional[Tuple[int, int]]:
+    """Lifts the soft limit of open files towards the hard one (at most ``want``): DataLoader workers hand every tensor
+    of a batch over as a file descriptor, and memory-mapped arrays hold one each; the usual soft limit is 1024.
+    Returns (old, new) soft limit, or None where it cannot be changed (Windows)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        inf = resource.RLIM_INFINITY
+        target = want if hard == inf else min(hard, want)
+        if soft != inf and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            return soft, target
+        return soft, soft
+    except (ValueError, OSError):
+        return None
 
 
 class HybridIndex:
@@ -53,13 +107,13 @@ class HybridIndex:
         self.feature_config = FeatureConfig.from_dict(data["feature_config"])
         self.songs: Dict[str, Dict[str, Any]] = data["songs"]
         self.maps: List[Dict[str, Any]] = [m for m in data["maps"] if m.get("roundtrip_exact", False)]
-        self._feat_cache: Dict[str, np.ndarray] = {}
+        self._feat_cache = MappedCache()               # memory-mapped: a bounded number stays open
         self._coarse_cache: Dict[str, np.ndarray] = {}
 
     def __getstate__(self) -> Dict[str, Any]:
         # DataLoader workers (spawned on Windows) must not receive memory-mapped arrays: they re-open lazily
         state = dict(self.__dict__)
-        state["_feat_cache"] = {}
+        state["_feat_cache"] = MappedCache()
         state["_coarse_cache"] = {}
         return state
 

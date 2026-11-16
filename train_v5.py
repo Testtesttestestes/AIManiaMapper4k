@@ -36,7 +36,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 from osu_mapper.hybrid.audio_features import beat_features
-from osu_mapper.hybrid.dataset import HybridIndex
+from osu_mapper.hybrid.dataset import HybridIndex, raise_open_files_limit
 from osu_mapper.hybrid.metrics import expressive_score, per_ms_report, summarize_reports
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.v5.data import SongCache, V5Dataset, collate, group_columns, song_inputs
@@ -442,6 +442,9 @@ def main() -> None:
     is_main = rank == 0
     if not is_main:
         sys.stdout = open(os.devnull, "w")
+    lim = raise_open_files_limit()                   # DataLoader workers pass tensors as file descriptors
+    if lim and lim[1] > lim[0]:
+        print(f"[sys] open files limit {lim[0]} -> {lim[1]}")
     torch.manual_seed(args.seed + rank)
     ck_dir = Path(args.checkpoint_dir)
     ck_dir.mkdir(parents=True, exist_ok=True)

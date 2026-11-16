@@ -34,7 +34,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from osu_mapper.hybrid.dataset import HybridCropDataset, HybridIndex, collate_hybrid
+from osu_mapper.hybrid.dataset import HybridCropDataset, HybridIndex, collate_hybrid, raise_open_files_limit
 from osu_mapper.hybrid.inference import CHECKPOINT_FORMAT, HybridPredictor, SongInputs, resolve_device, star_rating_of
 from osu_mapper.hybrid.calibration import calibrate
 from osu_mapper.hybrid.losses import LossWeights, compute_losses, crop_metrics
@@ -373,6 +373,7 @@ def main() -> None:
             str(ck_dir / "hybrid_last.pt") if args.eval_only == "last" else args.eval_only)
 
     distributed, rank, world, dev = init_distributed(args.device)
+    raise_open_files_limit()                         # DataLoader workers pass tensors as file descriptors
     is_main = rank == 0
     if not is_main:  # only rank 0 prints and writes checkpoints
         import builtins
