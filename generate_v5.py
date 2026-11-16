@@ -170,10 +170,16 @@ def main(argv=None) -> None:
     cfg = V5Config.from_dict(ck["config"])
     model = V5Net(cfg)
     model.load_state_dict(ck.get("ema") or ck["model"])
-    hold_wait = args.hold_wait if args.hold_wait is not None else ck.get("hold_wait")
-    hold_wait = hold_wait if hold_wait else None
-    if hold_wait is not None and getattr(cfg, "decoder", "ar") == "canvas":
-        print(f"[canvas] long notes: lanes {hold_wait:.2f}+ likely to hold wait for their left neighbour")
+    hold_table = ck.get("hold_wait_by_ln") if args.hold_wait is None else None
+
+    def hold_wait_for(ln_ratio):
+        """The calibrated value for the share of long notes asked for (None = unknown share: the general value)."""
+        if hold_table and ln_ratio is not None:
+            import bisect
+            v = hold_table["values"][bisect.bisect_right(hold_table["edges"], float(ln_ratio))]
+        else:
+            v = args.hold_wait if args.hold_wait is not None else ck.get("hold_wait")
+        return v if v else None
     model.to(dev).eval()
     from osu_mapper.hybrid.audio_features import FeatureConfig
     fcfg = FeatureConfig.from_dict(ck["feature_config"])
@@ -274,6 +280,9 @@ def main(argv=None) -> None:
                 print(f"[style] LN share from the music at {target:.2f}*: {st_t[j_ln]:.2f} "
                       "(--style ln_ratio=... sets it, --no_ln_guess leaves it to the network)")
             lp_pass = LanePredictor.cached(lib, target) if lib is not None else None
+            hold_wait = hold_wait_for(float(st_t[j_ln]) if sm_t[j_ln] > 0 else None)
+            if hold_wait is not None and getattr(cfg, "decoder", "ar") == "canvas":
+                print(f"[canvas] long notes: lanes {hold_wait:.2f}+ likely to hold wait for their left neighbour")
             is_canvas = getattr(cfg, "decoder", "ar") == "canvas"
             notes = generate_map(model, feats_all, beat_all, timing, target, passes=args.passes, style=st_t,
                                  style_mask=sm_t, candidates=args.search, score_fn=score_fn,
