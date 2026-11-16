@@ -1,6 +1,7 @@
 """Tests of the v5 network: tokens, model (cache = full pass), sampling grammar, critic negatives, hard mining."""
 
 import random
+import os
 import unittest
 from pathlib import Path
 
@@ -445,6 +446,48 @@ class TestSongCacheOnDisk(unittest.TestCase):
             other = [RawTimingPoint(time=0.0, beat_len=400.0, meter=4, uninherited=True)]
             b.window("s1", 0, 100, other)                          # other red lines -> their own sections file
             self.assertEqual(len(list((Path(d) / "v5_song_cache").glob("sec_*.npy"))), 2)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "counts open file descriptors through /proc")
+    def test_open_files_stay_bounded(self):
+        """Every open memmap holds a file descriptor: a worker that draws many songs must not keep them all open
+        ("Too many open files" after ~100 steps on the full dataset)."""
+        import tempfile
+        from pathlib import Path
+        from osu_mapper.hybrid.dataset import MappedCache
+        from osu_mapper.v5.data import SongCache
+
+        rng = np.random.default_rng(0)
+        n_songs = 150
+        with tempfile.TemporaryDirectory() as d:
+            for k in range(n_songs):
+                np.save(Path(d) / f"s{k}.npy", rng.random((600, 160)).astype(np.float32))
+
+            class FakeIndex:
+                def __init__(self, root):
+                    self.root = Path(root)
+                    self.data = {"feature_slices": {"onset": (0, 32), "demucs_stems": (32, 160)}}
+                    self.songs = {f"s{k}": {"features": [f"s{k}.npy"]} for k in range(n_songs)}
+                    self._feat = MappedCache(limit=8)
+
+                def features(self, song_id, variant=0):
+                    if song_id not in self._feat:
+                        self._feat[song_id] = np.load(self.root / self.songs[song_id]["features"][0], mmap_mode="r")
+                    return self._feat[song_id]
+
+            tps = [RawTimingPoint(time=0.0, beat_len=500.0, meter=4, uninherited=True)]
+            idx = FakeIndex(d)
+            SongCache(idx).window("s0", 0, 10, tps)                  # files of the cache made once
+            fds0 = len(os.listdir("/proc/self/fd"))
+            c = SongCache(idx)
+            c._att.limit = c._sec.limit = 8
+            for rep in range(2):
+                for k in range(n_songs):
+                    c.window(f"s{k}", 100, 50, tps)
+            grew = len(os.listdir("/proc/self/fd")) - fds0
+            self.assertLessEqual(grew, 3 * 8 + 4)                    # 3 caches x 8 open, not 3 x 150
+            self.assertLessEqual(c._att.open_files(), 8)
+            self.assertLessEqual(idx._feat.open_files(), 8)
+            np.testing.assert_allclose(c.window("s3", 100, 50, tps), SongCache(idx, disk=False).window("s3", 100, 50, tps))
 
 
 class TestCanvas(unittest.TestCase):

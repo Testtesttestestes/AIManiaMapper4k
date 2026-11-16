@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from osu_mapper.hybrid.audio_features import beat_features
-from osu_mapper.hybrid.dataset import HybridIndex, _crop_rows
+from osu_mapper.hybrid.dataset import HybridIndex, _crop_rows, raise_open_files_limit
 from osu_mapper.hybrid.inference import resolve_device
 from osu_mapper.hybrid.renderer import render_track
 from osu_mapper.v5.critic import CriticConfig, CriticNet, blandify, corrupt, map_frames
@@ -155,6 +155,7 @@ def main() -> None:
     args = ap.parse_args()
 
     dev = resolve_device(args.device)
+    raise_open_files_limit()                         # DataLoader workers pass tensors as file descriptors
     index = HybridIndex(args.data)
     cache = SongCache(index)
     tr_idx, va_idx = index.split(0.1, args.seed)

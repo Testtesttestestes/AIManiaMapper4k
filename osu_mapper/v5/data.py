@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 
 from ..hybrid.audio_features import BEAT_DIM, beat_features
 from ..hybrid.causes import STEMS, note_causes, stem_attacks
-from ..hybrid.dataset import HybridIndex, _crop_rows
+from ..hybrid.dataset import HybridIndex, MappedCache, _crop_rows
 from ..hybrid.metrics import SUBDIV_NAMES, subdivision_classes
 from ..hybrid.renderer import render_track
 from .sections import SECTION_DIM, find_sections, section_features
@@ -77,13 +77,14 @@ class SongCache:
         self.slices = {k: tuple(v) for k, v in (index.data.get("feature_slices") or index.feature_config.slices()).items()}
         self.use_sections = bool(sections)
         self.disk = bool(disk)
-        self._att: Dict[str, Optional[np.ndarray]] = {}
-        self._sec: Dict[str, np.ndarray] = {}
+        # memory-mapped arrays hold a file descriptor each: only a bounded number stays open (MappedCache)
+        self._att = MappedCache()
+        self._sec = MappedCache()
 
     def __getstate__(self):
         d = dict(self.__dict__)
-        d["_att"] = {}
-        d["_sec"] = {}
+        d["_att"] = MappedCache()
+        d["_sec"] = MappedCache()
         return d
 
     def _file(self, song_id: str, kind: str, extra: str = "") -> Optional[Path]:
