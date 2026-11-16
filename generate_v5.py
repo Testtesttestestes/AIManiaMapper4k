@@ -117,6 +117,10 @@ def main(argv=None) -> None:
     ap.add_argument("--refine", type=int, default=1,
                     help="canvas networks: self-correction passes (the error head marks frames, they are restored again; "
                          "a change is kept only if the error head then finds fewer errors)")
+    ap.add_argument("--hold_wait", type=float, default=None,
+                    help="canvas networks: a lane at least this likely to hold waits for the frame before it, so long "
+                         "notes are not cut before their head is revealed (default: the value calibrate_v5.py stored "
+                         "in the checkpoint; none stored = off; 0 = off)")
     ap.add_argument("--no_overlap", action="store_true",
                     help="canvas networks: do not let the next window propose its own version of the end of the previous "
                          "one (by default differing stretches of the overlaps are decided by the error head)")
@@ -166,6 +170,10 @@ def main(argv=None) -> None:
     cfg = V5Config.from_dict(ck["config"])
     model = V5Net(cfg)
     model.load_state_dict(ck.get("ema") or ck["model"])
+    hold_wait = args.hold_wait if args.hold_wait is not None else ck.get("hold_wait")
+    hold_wait = hold_wait if hold_wait else None
+    if hold_wait is not None and getattr(cfg, "decoder", "ar") == "canvas":
+        print(f"[canvas] long notes: lanes {hold_wait:.2f}+ likely to hold wait for their left neighbour")
     model.to(dev).eval()
     from osu_mapper.hybrid.audio_features import FeatureConfig
     fcfg = FeatureConfig.from_dict(ck["feature_config"])
@@ -274,7 +282,7 @@ def main(argv=None) -> None:
                                  log=print if (args.passes > 1 or is_canvas) else None,
                                  keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
                                  steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen,
-                                 overlap=not args.no_overlap)
+                                 overlap=not args.no_overlap, hold_wait=hold_wait)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

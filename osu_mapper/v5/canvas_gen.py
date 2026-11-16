@@ -172,7 +172,8 @@ _CONT = (fr.HOLD, fr.TAIL)
 
 
 def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: np.ndarray, pick: np.ndarray,
-                     prev_open: np.ndarray, rng: np.random.Generator, final: bool) -> np.ndarray:
+                     prev_open: np.ndarray, rng: np.random.Generator, final: bool,
+                     hold_wait: Optional[float] = None) -> np.ndarray:
     """Commits the sampled states of the ``pick`` [K, W] frames in time order, so a long note is always HEAD,
     HOLD..., TAIL: a lane holds (HOLD / TAIL) only right after an open long note - known, or committed just before in
     this pass - and must hold then; a long note known to be held further on (the next known frame holds the lane) is
@@ -195,6 +196,13 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
     st_n = st[np.arange(K)[:, None], np.clip(nxt_after, 0, W - 1)]
     held_later = (nxt_after < W)[..., None] & ((st_n == HL) | (st_n == TL))                      # [K, W, 4]
     next_is_next = nxt_after == np.arange(W)[None] + 1
+    # a lane that may well be held here (HOLD / TAIL likely) decides only once the frame before it is known: committing
+    # it empty early would cut a long note whose head is not revealed yet - and forbid that head later
+    # (``hold_wait``: that likelihood; None = off. calibrate_v5.py picks it per checkpoint on the validation songs)
+    if hold_wait is None:
+        may_hold = np.zeros((K, W), dtype=bool)
+    else:
+        may_hold = (np.exp(lp[..., HL]) + np.exp(lp[..., TL]) > float(hold_wait)).any(-1)      # [K, W]
     for r in range(K):
         frames = np.flatnonzero(pick[r])
         if not frames.size:
@@ -212,7 +220,8 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
 
         for f in frames.tolist():
             row = sp[f]
-            if not final and f > 0 and not kn[f - 1] and (any(v in (HL, TL) for v in row) or any(held[f])):
+            if not final and f > 0 and not kn[f - 1] and (any(v in (HL, TL) for v in row) or any(held[f])
+                                                           or may_hold[r, f]):
                 # a hold - or a frame before a known hold (carry on the long note from before, or start one?) -
                 # waits until the frame before it is known
                 continue
@@ -257,7 +266,7 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
 @torch.no_grad()
 def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, steps: int = 8, temperature: float = 1.0,
                    cfg_scale: float = 1.0, rng: Optional[np.random.Generator] = None, prev_open=None,
-                   before=None, after=None):
+                   before=None, after=None, hold_wait: Optional[float] = None):
     """Reveals the ``hidden`` [K, W] frames of K rows of one window in ``steps`` rounds; returns (st, so, eo) [K, W, 4].
     The song around the window, so long notes and the 30 ms gaps glue across its edges: ``before`` / ``after``
     [K, n, 4] states of the known frames right before / after it (``after`` may hold -1 for unknown frames);
@@ -308,7 +317,7 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
         pad = lambda a, v: np.concatenate([np.full((K, B_) + a.shape[2:], v, a.dtype), a,
                                            np.full((K, A_) + a.shape[2:], v, a.dtype)], axis=1)
         done = _commit_in_order(st_x, hid_x, pad(lp, -1e9), pad(samp, fr.EMPTY), pad(pick, False), no_open, rng,
-                                last)[:, win]
+                                last, hold_wait)[:, win]
         st[:] = st_x[:, win]
         hidden &= ~done
         so = np.where(done[..., None], np.where((st == fr.TAP) | (st == fr.HEAD), a_off, -1), so).astype(so.dtype)
@@ -376,6 +385,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
                     score_fn: Optional[Callable[[List[Note], List[Note], int, int], float]] = None,
                     refine_passes: int = 1, refine_frac: float = 0.1, fixed: Optional[Sequence[Note]] = None,
                     regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = True,
+                    hold_wait: Optional[float] = None,
                     device: Optional[torch.device] = None, log: Optional[Callable[[str], None]] = None,
                     stats: Optional[dict] = None) -> List[Note]:
     """Notes of the whole song (see the module docstring). ``fixed``: notes kept as they are (with ``regen``: the notes
@@ -434,7 +444,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
         mem, cond, cnull = encode_window(s, K)
         rs, ro, re_ = restore_window(model, mem, cond, cnull, np.repeat(st[None], K, 0), np.repeat(so[None], K, 0),
                                      np.repeat(eo[None], K, 0), np.repeat(hidden[None], K, 0), steps, temperature,
-                                     cfg_scale, rng, before=np.repeat(bef[None], K, 0), after=np.repeat(aft[None], K, 0))
+                                     cfg_scale, rng, before=np.repeat(bef[None], K, 0), after=np.repeat(aft[None], K, 0), hold_wait=hold_wait)
         best = 0
         if K > 1 and score_fn is not None:
             ctx = max(0, s - hop)
@@ -496,7 +506,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
             before = float(err[hide].sum())
             bef, aft = canvas.context(s, W)
             rs, ro, re_ = restore_window(model, mem, cond, cnull, st[None], so[None], eo[None], hide[None],
-                                         max(2, steps // 2), temperature, cfg_scale, rng, before=bef[None], after=aft[None])
+                                         max(2, steps // 2), temperature, cfg_scale, rng, before=bef[None], after=aft[None], hold_wait=hold_wait)
             out2 = _decode_logits(model, mem, cond, cnull, rs, ro, re_, none, cfg_scale)
             err2 = torch.sigmoid(out2["error"].float())[0].cpu().numpy()
             after = float(err2[hide].sum())

@@ -28,7 +28,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -205,7 +205,7 @@ def val_style(entry: Dict[str, Any], keys: str):
 
 def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[int], dev, temperature: float,
              cfg_scale: float, max_sec: float, style_keys: str = "ln", passes: int = 1, canvas_steps: int = 8,
-             refine: int = 1) -> Dict[str, float]:
+             refine: int = 1, hold_wait: Optional[float] = None) -> Dict[str, float]:
     reps = []
     seams: Dict[str, int] = {}
     for i in map_idx:
@@ -220,7 +220,8 @@ def val_maps(model: V5Net, index: HybridIndex, cache: SongCache, map_idx: List[i
         st, sm = val_style(e, style_keys)
         notes = generate_map(model, fa, ba, tr.timing_points, float(e.get("sr", 0.0)), passes=passes, style=st,
                              style_mask=sm, temperature=temperature, cfg_scale=cfg_scale, device=dev,
-                             steps=canvas_steps, refine_passes=refine, stats=seams)
+                             steps=canvas_steps, refine_passes=refine, stats=seams,
+                             hold_wait=hold_wait)
         ref = [n for n in ref if n.start < F * 10]
         rep = per_ms_report(notes, ref, timing_points=tr.timing_points)
         rep["expressive"] = expressive_score(rep)
@@ -421,6 +422,9 @@ def main() -> None:
     ap.add_argument("--event_weight", type=float, default=4.0, help="canvas: weight of frames with a note in the loss")
     ap.add_argument("--error_weight", type=float, default=0.3, help="canvas: loss of the error head")
     ap.add_argument("--canvas_steps", type=int, default=8, help="canvas: rounds of revealing a window (validation maps)")
+    ap.add_argument("--hold_wait", type=float, default=None,
+                    help="canvas validation maps: lanes at least this likely to hold wait for their left neighbour "
+                         "(long notes not cut before their head is revealed); calibrate_v5.py picks it; default off")
     ap.add_argument("--refine", type=int, default=1, help="canvas: self-correction passes of the validation maps")
     ap.add_argument("--draft_prob", type=float, default=0.5,
                     help="share of training windows where the encoder also sees a damaged draft of the map (bursts made "
@@ -732,7 +736,8 @@ def main() -> None:
                 if val_full:
                     t1 = time.time()
                     summary = val_maps(em, index, cache, val_full, dev, args.temperature, args.cfg_scale, args.val_max_sec,
-                                       args.val_style, args.passes if cfg.draft else 1, args.canvas_steps, args.refine)
+                                       args.val_style, args.passes if cfg.draft else 1, args.canvas_steps, args.refine,
+                                       args.hold_wait)
                     rec.update({f"map_{k}": v for k, v in summary.items()})
                     print(f"[epoch {epoch}] GENERATED MAPS vs human ({len(val_full)} songs, {time.time() - t1:.0f}s): event F1 "
                           f"@16ms {summary.get('event_f1@16', 0):.3f} @64ms {summary.get('event_f1@64', 0):.3f} | density "
