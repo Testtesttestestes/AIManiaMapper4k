@@ -45,7 +45,11 @@ def proposals(index: HybridIndex, maps: List[int], cache: SongCache, highlight, 
     for i in maps:
         by_song.setdefault(index.maps[i]["song_id"], []).append(i)
     out = []
-    for sid, ids in by_song.items():
+    for si, (sid, ids) in enumerate(by_song.items()):
+        if si and si % 20 == 0:
+            el = time.time() - t0
+            print(f"[meta] {tag}{si}/{len(by_song)} songs ({el / 60:.0f} min, ~{el / si * (len(by_song) - si) / 60:.0f} min "
+                  "left)", flush=True)
         notes = {i: sorted(render_track(index.track(i))) for i in ids}
         tps0 = list(index.track(ids[0]).timing_points)
         feats_all = song_inputs(np.asarray(index.features(sid, 0)), cache.slices, tps0, highlight=highlight)
@@ -65,7 +69,7 @@ def proposals(index: HybridIndex, maps: List[int], cache: SongCache, highlight, 
                 t = np.array(sorted({n.start for n in gen}), dtype=np.float64)
                 props += [(sp, [n for n in gen if sp[0] <= n.start <= sp[1]], "network") for sp in bursts(t, tps0)]
                 done += 1
-                if done % 10 == 0 or done == len(net_set):
+                if done % 5 == 0 or done == len(net_set):
                     el = time.time() - t0
                     print(f"[meta] {tag}the v5 network mapped {done}/{len(net_set)} difficulties "
                           f"({el / 60:.0f} min, ~{el / done * (len(net_set) - done) / 60:.0f} min left)", flush=True)
