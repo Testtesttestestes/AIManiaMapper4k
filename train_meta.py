@@ -35,14 +35,21 @@ from osu_mapper.v5.meta import BurstMeta, MetaConfig, burst_inputs, input_column
 
 
 def proposals(index: HybridIndex, maps: List[int], cache: SongCache, highlight, v5=None, dev=None, max_sec: float = 90.0,
-              per_song: int = 40, seed: int = 0):
-    """(frames, shape, label, source) of every proposed burst (at most ``per_song`` per song, drawn at random)."""
+              per_song: int = 40, seed: int = 0, network_maps: int = 150, tag: str = ""):
+    """(frames, shape, label, source) of every proposed burst (at most ``per_song`` per song, drawn at random); the v5
+    network maps ``network_maps`` target difficulties drawn at random (each takes seconds: all of them took hours)."""
     rng = random.Random(seed)
+    net_set = set(rng.sample(list(maps), min(len(maps), network_maps))) if v5 is not None else set()
+    t0, done = time.time(), 0
     by_song: Dict[str, List[int]] = {}
     for i in maps:
         by_song.setdefault(index.maps[i]["song_id"], []).append(i)
     out = []
-    for sid, ids in by_song.items():
+    for si, (sid, ids) in enumerate(by_song.items()):
+        if si and si % 20 == 0:
+            el = time.time() - t0
+            print(f"[meta] {tag}{si}/{len(by_song)} songs ({el / 60:.0f} min, ~{el / si * (len(by_song) - si) / 60:.0f} min "
+                  "left)", flush=True)
         notes = {i: sorted(render_track(index.track(i))) for i in ids}
         tps0 = list(index.track(ids[0]).timing_points)
         feats_all = song_inputs(np.asarray(index.features(sid, 0)), cache.slices, tps0, highlight=highlight)
@@ -55,12 +62,17 @@ def proposals(index: HybridIndex, maps: List[int], cache: SongCache, highlight, 
             for j in ids:
                 if j != i:
                     props += [(sp, [n for n in notes[j] if sp[0] <= n.start <= sp[1]], "sibling") for sp in bursts_of[j]]
-            if v5 is not None:
+            if i in net_set:
                 from osu_mapper.v5.infer import generate_map
                 F_ = min(feats_all.shape[0], int(max_sec * 100))
                 gen = generate_map(v5, feats_all[:F_], beat_all[:F_], tps0, sr, device=dev)
                 t = np.array(sorted({n.start for n in gen}), dtype=np.float64)
                 props += [(sp, [n for n in gen if sp[0] <= n.start <= sp[1]], "network") for sp in bursts(t, tps0)]
+                done += 1
+                if done % 5 == 0 or done == len(net_set):
+                    el = time.time() - t0
+                    print(f"[meta] {tag}the v5 network mapped {done}/{len(net_set)} difficulties "
+                          f"({el / 60:.0f} min, ~{el / done * (len(net_set) - done) / 60:.0f} min left)", flush=True)
             song_props.extend((i, sp, members, src, sr) for sp, members, src in props)
         cols = input_columns(cache.slices, feats_all.shape[1])
         if len(song_props) > per_song:
@@ -81,6 +93,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--threshold", type=float, default=0.35)
     ap.add_argument("--per_song", type=int, default=40, help="proposals per song at most (memory)")
+    ap.add_argument("--network_maps", type=int, default=150, help="training difficulties the v5 network maps (--v5)")
+    ap.add_argument("--network_val", type=int, default=40, help="validation difficulties the v5 network maps (--v5)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -100,8 +114,13 @@ def main() -> None:
         highlight = v5.cfg.highlight
     cache = SongCache(index, highlight=highlight)
     t0 = time.time()
-    tr, cols = proposals(index, tr_idx, cache, highlight, v5, dev, per_song=args.per_song, seed=args.seed)
-    va, _ = proposals(index, va_idx, cache, highlight, v5, dev, per_song=args.per_song, seed=args.seed + 1)
+    print(f"[meta] collecting burst proposals of {len(tr_idx)} training / {len(va_idx)} validation maps"
+          + (f"; the v5 network maps {min(len(tr_idx), args.network_maps)} + {min(len(va_idx), args.network_val)} of them"
+             if v5 is not None else ""), flush=True)
+    tr, cols = proposals(index, tr_idx, cache, highlight, v5, dev, per_song=args.per_song, seed=args.seed,
+                         network_maps=args.network_maps, tag="training: ")
+    va, _ = proposals(index, va_idx, cache, highlight, v5, dev, per_song=args.per_song, seed=args.seed + 1,
+                      network_maps=args.network_val, tag="validation: ")
     if not tr:
         raise SystemExit("no burst proposals: the dataset needs songs with several difficulties that have bursts")
     pos = np.mean([y for _, _, y, _ in tr])

@@ -126,7 +126,13 @@ def network_maps(index: HybridIndex, cache: SongCache, maps: List[int], ckpt: st
     net.load_state_dict(ck["ema"] or ck["model"])
     net.to(dev).eval()
     out = {}
-    for mi in maps[:n_maps]:
+    todo = maps[:n_maps]
+    t0 = time.time()
+    for k, mi in enumerate(todo):
+        if k and (k % 10 == 0 or k == len(todo) - 1):
+            el = time.time() - t0
+            print(f"[critic] the v5 network maps songs for negatives: {k}/{len(todo)} "
+                  f"({el / 60:.0f} min, ~{el / k * (len(todo) - k) / 60:.0f} min left)", flush=True)
         e = index.maps[mi]
         tr = index.track(mi)
         fa = song_inputs(np.asarray(index.features(e["song_id"], 0)), cache.slices, tr.timing_points,
@@ -143,6 +149,7 @@ def main() -> None:
     ap.add_argument("--checkpoint_dir", default="checkpoints/v5")
     ap.add_argument("--v5", default=None, help="v5 checkpoint whose own maps become negatives")
     ap.add_argument("--network_windows", type=int, default=200, help="songs the v5 network maps for negatives")
+    ap.add_argument("--network_val", type=int, default=40, help="validation maps the v5 network maps (correlation)")
     ap.add_argument("--network_max_sec", type=float, default=90.0)
     ap.add_argument("--per_map", type=int, default=6, help="windows per map and epoch")
     ap.add_argument("--epochs", type=int, default=8)
@@ -165,7 +172,10 @@ def main() -> None:
     network: Dict[int, list] = {}
     if args.v5:
         t0 = time.time()
-        pick = random.Random(args.seed).sample(tr_idx, min(len(tr_idx), args.network_windows)) + va_idx
+        pick = (random.Random(args.seed).sample(tr_idx, min(len(tr_idx), args.network_windows))
+                + random.Random(args.seed + 1).sample(va_idx, min(len(va_idx), args.network_val)))
+        print(f"[critic] the v5 network maps {len(pick)} songs (first {args.network_max_sec:.0f} s) for negatives: "
+              "a few seconds each, progress below", flush=True)
         network = network_maps(index, cache, pick, args.v5, len(pick), dev, args.network_max_sec)
         print(f"[critic] the v5 network mapped {len(network)} songs for negatives ({time.time() - t0:.0f}s)")
     probe = cache.window(index.maps[tr_idx[0]]["song_id"], 0, 4, None, sections=False)
