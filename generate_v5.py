@@ -181,9 +181,11 @@ def main(argv=None) -> None:
 
     def hold_wait_for(ln_ratio):
         """The calibrated value for the share of long notes asked for (None = unknown share: the general value)."""
-        if hold_table and ln_ratio is not None:
+        if hold_table:
             import bisect
-            v = hold_table["values"][bisect.bisect_right(hold_table["edges"], float(ln_ratio))]
+            # share unknown (no --style ln_ratio, LN model not used): the dataset average share (~18 %)
+            share = float(ln_ratio) if ln_ratio is not None else 0.175
+            v = hold_table["values"][bisect.bisect_right(hold_table["edges"], share)]
         else:
             v = args.hold_wait if args.hold_wait is not None else ck.get("hold_wait")
         return v if v else None
