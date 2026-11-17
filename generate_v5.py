@@ -137,7 +137,8 @@ def main(argv=None) -> None:
     ap.add_argument("--search", type=int, default=1, help="continuations sampled per phrase; the best is kept")
     ap.add_argument("--critic_weight", type=float, default=1.0)
     ap.add_argument("--reward_weight", type=float, default=0.5)
-    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--temperature", type=float, default=0.9,
+                    help="sampling temperature (canvas networks: default the one calibrate_v5.py stored, else 1.0)")
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--cfg", type=float, default=1.0, help="classifier-free guidance on the star rating / style")
     ap.add_argument("--output", "-o", default="output_beatmaps/v5_map.osz")
@@ -286,7 +287,7 @@ def main(argv=None) -> None:
             is_canvas = getattr(cfg, "decoder", "ar") == "canvas"
             notes = generate_map(model, feats_all, beat_all, timing, target, passes=args.passes, style=st_t,
                                  style_mask=sm_t, candidates=args.search, score_fn=score_fn,
-                                 temperature=args.temperature if not is_canvas or args.temperature != 0.9 else 1.0,
+                                 temperature=args.temperature if not is_canvas or args.temperature != 0.9 else float(ck.get("temperature") or 1.0),
                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev,
                                  log=print if (args.passes > 1 or is_canvas) else None,
                                  keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
