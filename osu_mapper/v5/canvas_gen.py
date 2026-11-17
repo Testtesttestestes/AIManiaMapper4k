@@ -191,6 +191,8 @@ def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:
     return ok
 
 
+NOTE_GAP_FRAMES = 12     # last rounds: notes closer than this (120 ms) are decided one after another, not at once
+EXTRA_ROUNDS = 24        # rounds after the schedule for them (then the rest at once)
 MIN_LN_FRAMES = 5        # shortest long note revealed: head + 4 frames (~40-50 ms)
 _OPEN = (fr.HEAD, fr.HOLD)
 _CONT = (fr.HOLD, fr.TAIL)
@@ -297,7 +299,7 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
 @torch.no_grad()
 def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, steps: int = 8, temperature: float = 1.0,
                    cfg_scale: float = 1.0, rng: Optional[np.random.Generator] = None, prev_open=None,
-                   before=None, after=None, hold_wait: Optional[float] = None):
+                   before=None, after=None, hold_wait: Optional[float] = None, note_gap: int = NOTE_GAP_FRAMES):
     """Reveals the ``hidden`` [K, W] frames of K rows of one window in ``steps`` rounds; returns (st, so, eo) [K, W, 4].
     The song around the window, so long notes and the 30 ms gaps glue across its edges: ``before`` / ``after``
     [K, n, 4] states of the known frames right before / after it (``after`` may hold -1 for unknown frames);
@@ -317,7 +319,9 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
     win = slice(B_, B_ + W)
     no_open = np.zeros((K, fr.NUM_LANES), dtype=bool)
     todo = hidden.sum(axis=1)
-    for t in range(max(1, steps)):
+    steps = max(1, steps)
+    rounds = steps + (EXTRA_ROUNDS if note_gap > 0 else 0)
+    for t in range(rounds):
         if not hidden.any():
             break
         out = _decode_logits(model, memory, cond, cond_null, st, so, eo, hidden, cfg_scale)
@@ -332,23 +336,38 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
         u = rng.random(p.shape[:-1])[..., None]
         samp = (p.cumsum(-1) < u).sum(-1).clip(0, fr.N_STATES - 1)                                    # [K, W, 4]
         conf = np.take_along_axis(lp, samp[..., None], -1)[..., 0].sum(-1)                            # [K, W]
-        conf = conf + rng.gumbel(size=conf.shape) * temperature * (1.0 - (t + 1) / steps)             # MaskGIT noise
+        conf = conf + rng.gumbel(size=conf.shape) * temperature * max(0.0, 1.0 - (t + 1) / steps)     # MaskGIT noise
         a_off = out["start"].float().argmax(-1).cpu().numpy()
         e_off = out["end"].float().argmax(-1).cpu().numpy()
-        frac = 1.0 - math.cos(math.pi / 2 * (t + 1) / steps)                                        # cumulative share
-        last = t == max(1, steps) - 1
+        frac = 1.0 - math.cos(math.pi / 2 * min(1.0, (t + 1) / steps))                              # cumulative share
+        sched_last = t >= steps - 1
+        last = t == rounds - 1
         pick = np.zeros((K, W), dtype=bool)
+        starts = ((samp == fr.TAP) | (samp == fr.HEAD)).any(-1)                                     # [K, W]
         for r in range(K):
             h = np.flatnonzero(hidden[r])
             if not h.size:
                 continue
             want = int(math.ceil(todo[r] * frac)) - int(todo[r] - h.size)
-            n = h.size if last else max(1, min(h.size, want))
-            pick[r, h[np.argsort(-conf[r, h])[:n]]] = True
+            n = h.size if sched_last else max(1, min(h.size, want))
+            chosen = h[np.argsort(-conf[r, h])[:n]]
+            if sched_last and not last and note_gap > 0:
+                # the rest of the notes: not all at once (each would be placed without seeing its neighbours: random
+                # lanes, jacks, notes off the sound) - in a round only notes at least note_gap frames apart, the most
+                # confident first; the others wait and are decided with these in view
+                kept, taken = [], []
+                for f in chosen:                                   # by confidence
+                    if starts[r, f]:
+                        if any(abs(f - g) < note_gap for g in taken):
+                            continue
+                        taken.append(f)
+                    kept.append(f)
+                chosen = np.asarray(kept, dtype=np.int64)
+            pick[r, chosen] = True
         pad = lambda a, v: np.concatenate([np.full((K, B_) + a.shape[2:], v, a.dtype), a,
                                            np.full((K, A_) + a.shape[2:], v, a.dtype)], axis=1)
         done = _commit_in_order(st_x, hid_x, pad(lp, -1e9), pad(samp, fr.EMPTY), pad(pick, False), no_open, rng,
-                                last, hold_wait)[:, win]
+                                last or (sched_last and note_gap <= 0), hold_wait)[:, win]
         st[:] = st_x[:, win]
         hidden &= ~done
         so = np.where(done[..., None], np.where((st == fr.TAP) | (st == fr.HEAD), a_off, -1), so).astype(so.dtype)
