@@ -114,7 +114,22 @@ def _decode_logits(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, cf
     if cfg_scale != 1.0:
         un = model.canvas_decode(memory, cond_null, s_in, a_in, e_in, h)
         out = {k: (un[k] + cfg_scale * (out[k] - un[k])) if k not in ("error", "seam") else out[k] for k in out}
+    shift = note_shift(model)
+    if shift:
+        out = dict(out)
+        st_l = out["state"].float().clone()
+        st_l[..., 1:] -= shift
+        out["state"] = st_l
     return out
+
+
+def note_shift(model) -> float:
+    """The training loss weighs frames with a note ``event_weight`` x (4 by default): the optimum of that loss is the
+    true probability of every non-empty state times the weight (odds). Generation samples states from the network's
+    probabilities, so the odds are divided back (log-space shift); without this the maps had ~2x the notes of the human
+    ones (1* asked -> 3.2*). ``model.note_shift_scale`` (calibrate_v5.py) scales the correction; 1 = exact."""
+    w = getattr(model, "event_weight", 4.0)
+    return float(getattr(model, "note_shift_scale", 1.0)) * math.log(max(1.0, float(w)))
 
 
 def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:

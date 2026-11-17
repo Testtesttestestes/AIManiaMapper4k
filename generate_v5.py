@@ -117,6 +117,9 @@ def main(argv=None) -> None:
     ap.add_argument("--refine", type=int, default=1,
                     help="canvas networks: self-correction passes (the error head marks frames, they are restored again; "
                          "a change is kept only if the error head then finds fewer errors)")
+    ap.add_argument("--note_scale", type=float, default=None,
+                    help="canvas networks: correction of the note weight of the training loss (1 = exact, 0 = none; "
+                         "default: calibrated in the checkpoint, else 1). Lower = more notes")
     ap.add_argument("--hold_wait", type=float, default=None,
                     help="canvas networks: a lane at least this likely to hold waits for the frame before it, so long "
                          "notes are not cut before their head is revealed (default: the value calibrate_v5.py stored "
@@ -171,6 +174,9 @@ def main(argv=None) -> None:
     cfg = V5Config.from_dict(ck["config"])
     model = V5Net(cfg)
     model.load_state_dict(ck.get("ema") or ck["model"])
+    # notes weighed in the training loss: generation divides those odds back (calibrate_v5.py scales it)
+    model.event_weight = float((ck.get("args") or {}).get("event_weight", 4.0))
+    model.note_shift_scale = float(args.note_scale if args.note_scale is not None else ck.get("note_shift_scale", 1.0))
     hold_table = ck.get("hold_wait_by_ln") if args.hold_wait is None else None
 
     def hold_wait_for(ln_ratio):

@@ -500,6 +500,7 @@ def main() -> None:
         cfg.draft = True                     # re-mapping input added to a checkpoint made without it (starts at zero)
         new_parts = resume is not None
     model = V5Net(cfg).to(dev)
+    model.event_weight = args.event_weight            # generation divides the note weight of the loss back
     if resume:
         missing, unexpected = model.load_state_dict(resume["model"], strict=False)
         if unexpected or any(not k.startswith("draft_in.") for k in missing):
