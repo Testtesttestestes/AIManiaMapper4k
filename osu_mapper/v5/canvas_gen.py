@@ -191,6 +191,7 @@ def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:
     return ok
 
 
+JOINT_LANES = True       # a frame's notes drawn together: how many, then which lanes (sample_frames)
 NOTE_GAP_FRAMES = 12     # last rounds: notes closer than this (120 ms) are decided one after another, not at once
 EXTRA_ROUNDS = 24        # rounds after the schedule for them (then the rest at once)
 MIN_LN_FRAMES = 5        # shortest long note revealed: head + 4 frames (~40-50 ms)
@@ -296,6 +297,33 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
     return committed
 
 
+def sample_frames(p: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """States [K, W, 4] sampled from per-lane probabilities p [K, W, 4, 5] - the frame as a whole, the way a mapper
+    thinks: how many notes start here, then on which lanes. The network gives each lane's probability separately;
+    drawing every lane on its own turned "one note, lane not sure" (25 % on each lane) into none, one or a 2-3 note
+    chord, so streams and jumptrills collapsed into walls of chords. Here a lane first may go on holding (HOLD / TAIL,
+    long notes are per lane); among the others the number of new notes is the sum of their start probabilities
+    (rounded at random: 1.3 -> 1 or 2), placed without repeats in proportion to them (Gumbel top-k), each a tap or a
+    head by its own odds. Chords stay where the network gives several lanes high probability at once."""
+    K, W, L, _ = p.shape
+    p_ht = p[..., fr.HOLD] + p[..., fr.TAIL]
+    cont = rng.random((K, W, L)) < p_ht
+    tail = rng.random((K, W, L)) * np.maximum(p_ht, 1e-12) < p[..., fr.TAIL]
+    q = np.where(cont, 0.0, (p[..., fr.TAP] + p[..., fr.HEAD]) / np.maximum(1.0 - p_ht, 1e-9))
+    q = np.clip(q, 0.0, 1.0)
+    E = q.sum(-1)
+    k = np.floor(E) + (rng.random((K, W)) < E - np.floor(E))
+    k = np.minimum(k, (q > 0).sum(-1)).astype(np.int64)                                       # [K, W]
+    keys = np.where(q > 0, np.log(np.maximum(q, 1e-30)) + rng.gumbel(size=q.shape), -np.inf)
+    rank = (-keys).argsort(-1).argsort(-1)                                                    # 0 = first lane
+    start = rank < k[..., None]
+    head = rng.random((K, W, L)) * np.maximum(p[..., fr.TAP] + p[..., fr.HEAD], 1e-12) < p[..., fr.HEAD]
+    out = np.full((K, W, L), fr.EMPTY, dtype=np.int64)
+    out = np.where(start, np.where(head, fr.HEAD, fr.TAP), out)
+    out = np.where(cont, np.where(tail, fr.TAIL, fr.HOLD), out)
+    return out
+
+
 @torch.no_grad()
 def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, steps: int = 8, temperature: float = 1.0,
                    cfg_scale: float = 1.0, rng: Optional[np.random.Generator] = None, prev_open=None,
@@ -332,9 +360,8 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
         lp = np.where(ok, lp, -1e9)
         lp = lp - np.logaddexp.reduce(lp, axis=-1, keepdims=True)
         p = np.exp(lp)
-        # sample a state for every lane of every frame
-        u = rng.random(p.shape[:-1])[..., None]
-        samp = (p.cumsum(-1) < u).sum(-1).clip(0, fr.N_STATES - 1)                                    # [K, W, 4]
+        samp = sample_frames(p, rng) if JOINT_LANES else \
+            (p.cumsum(-1) < rng.random(p.shape[:-1])[..., None]).sum(-1).clip(0, fr.N_STATES - 1)
         conf = np.take_along_axis(lp, samp[..., None], -1)[..., 0].sum(-1)                            # [K, W]
         conf = conf + rng.gumbel(size=conf.shape) * temperature * max(0.0, 1.0 - (t + 1) / steps)     # MaskGIT noise
         a_off = out["start"].float().argmax(-1).cpu().numpy()
