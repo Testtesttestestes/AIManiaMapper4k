@@ -114,7 +114,22 @@ def _decode_logits(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, cf
     if cfg_scale != 1.0:
         un = model.canvas_decode(memory, cond_null, s_in, a_in, e_in, h)
         out = {k: (un[k] + cfg_scale * (out[k] - un[k])) if k not in ("error", "seam") else out[k] for k in out}
+    shift = note_shift(model)
+    if shift:
+        out = dict(out)
+        st_l = out["state"].float().clone()
+        st_l[..., 1:] -= shift
+        out["state"] = st_l
     return out
+
+
+def note_shift(model) -> float:
+    """The training loss weighs frames with a note ``event_weight`` x (4 by default): the optimum of that loss is the
+    true probability of every non-empty state times the weight (odds). Generation samples states from the network's
+    probabilities, so the odds are divided back (log-space shift); without this the maps had ~2x the notes of the human
+    ones (1* asked -> 3.2*). ``model.note_shift_scale`` (calibrate_v5.py) scales the correction; 1 = exact."""
+    w = getattr(model, "event_weight", 4.0)
+    return float(getattr(model, "note_shift_scale", 1.0)) * math.log(max(1.0, float(w)))
 
 
 def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:
@@ -162,11 +177,24 @@ def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:
         nxt_note = nk & ((n_ == fr.TAP) | (n_ == fr.HEAD))
         for s_ in states:
             ok[..., s_] &= ~nxt_note
+    # a long note lasts at least MIN_LN_FRAMES: no tail right after a known head, no head without room before a note
+    for d in range(1, min(MIN_LN_FRAMES, W)):
+        p_ = np.concatenate([np.full((K, d, L), -1, st.dtype), st[:, :-d]], axis=1)
+        pk = np.concatenate([np.zeros((K, d, 1), bool), known[:, :-d]], axis=1)
+        ok[..., fr.TAIL] &= ~(pk & (p_ == fr.HEAD))
+    for d in range(4, min(MIN_LN_FRAMES + 3, W)):
+        n_ = np.concatenate([st[:, d:], np.full((K, d, L), -1, st.dtype)], axis=1)
+        nk = np.concatenate([known[:, d:], np.zeros((K, d, 1), bool)], axis=1)
+        ok[..., fr.HEAD] &= ~(nk & ((n_ == fr.TAP) | (n_ == fr.HEAD)))
     none = ~ok.any(-1)
     ok[none] = True
     return ok
 
 
+JOINT_LANES = True       # a frame's notes drawn together: how many, then which lanes (sample_frames)
+NOTE_GAP_FRAMES = 12     # last rounds: notes closer than this (120 ms) are decided one after another, not at once
+EXTRA_ROUNDS = 24        # rounds after the schedule for them (then the rest at once)
+MIN_LN_FRAMES = 5        # shortest long note revealed: head + 4 frames (~40-50 ms)
 _OPEN = (fr.HEAD, fr.HOLD)
 _CONT = (fr.HOLD, fr.TAIL)
 
@@ -237,7 +265,12 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
                 a1, a2, a3 = state(f + 1, c), state(f + 2, c), state(f + 3, c)
                 na1, na2, na3 = a1 in (TP, HD), a2 in (TP, HD), a3 in (TP, HD)
                 if open_before[c]:                      # the long note goes on: hold or end
-                    if held[f][c]:
+                    # how long it has been held: no tail before MIN_LN_FRAMES (a 10-20 ms long note looks like a
+                    # head without a body in the game; < 1 % of human long notes are under 40 ms)
+                    young = any(state(f - d, c) == HD for d in range(1, MIN_LN_FRAMES))
+                    if a1 in (E, TP, HD):
+                        allowed = (TL,)                 # the next frame is known free: it ends here
+                    elif held[f][c] or (young and not (na1 or na2 or na3)):
                         allowed = (HL,)
                     else:
                         allowed = ((HL,) if not (na1 or na2 or na3) else ()) + ((TL,) if not (na1 or na2) else ())
@@ -248,7 +281,8 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
                     b1, b2, b3 = state(f - 1, c), state(f - 2, c), state(f - 3, c)
                     start_ok = (b1 not in (TP, TL) and b2 not in (TP, HD, HL, TL) and b3 not in (HD, HL)
                                 and not (na1 or na2))
-                    allowed = (E,) + ((TP,) if start_ok and not held[f][c] else ()) + ((HD,) if start_ok and not na3 else ())
+                    room = not any(state(f + d, c) in (TP, HD) for d in range(1, MIN_LN_FRAMES + 3))
+                    allowed = (E,) + ((TP,) if start_ok and not held[f][c] else ()) + ((HD,) if start_ok and room else ())
                 if s_ not in allowed:
                     if gum is None:
                         gum = rng.gumbel(size=(W, L, fr.N_STATES))
@@ -263,10 +297,37 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
     return committed
 
 
+def sample_frames(p: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """States [K, W, 4] sampled from per-lane probabilities p [K, W, 4, 5] - the frame as a whole, the way a mapper
+    thinks: how many notes start here, then on which lanes. The network gives each lane's probability separately;
+    drawing every lane on its own turned "one note, lane not sure" (25 % on each lane) into none, one or a 2-3 note
+    chord, so streams and jumptrills collapsed into walls of chords. Here a lane first may go on holding (HOLD / TAIL,
+    long notes are per lane); among the others the number of new notes is the sum of their start probabilities
+    (rounded at random: 1.3 -> 1 or 2), placed without repeats in proportion to them (Gumbel top-k), each a tap or a
+    head by its own odds. Chords stay where the network gives several lanes high probability at once."""
+    K, W, L, _ = p.shape
+    p_ht = p[..., fr.HOLD] + p[..., fr.TAIL]
+    cont = rng.random((K, W, L)) < p_ht
+    tail = rng.random((K, W, L)) * np.maximum(p_ht, 1e-12) < p[..., fr.TAIL]
+    q = np.where(cont, 0.0, (p[..., fr.TAP] + p[..., fr.HEAD]) / np.maximum(1.0 - p_ht, 1e-9))
+    q = np.clip(q, 0.0, 1.0)
+    E = q.sum(-1)
+    k = np.floor(E) + (rng.random((K, W)) < E - np.floor(E))
+    k = np.minimum(k, (q > 0).sum(-1)).astype(np.int64)                                       # [K, W]
+    keys = np.where(q > 0, np.log(np.maximum(q, 1e-30)) + rng.gumbel(size=q.shape), -np.inf)
+    rank = (-keys).argsort(-1).argsort(-1)                                                    # 0 = first lane
+    start = rank < k[..., None]
+    head = rng.random((K, W, L)) * np.maximum(p[..., fr.TAP] + p[..., fr.HEAD], 1e-12) < p[..., fr.HEAD]
+    out = np.full((K, W, L), fr.EMPTY, dtype=np.int64)
+    out = np.where(start, np.where(head, fr.HEAD, fr.TAP), out)
+    out = np.where(cont, np.where(tail, fr.TAIL, fr.HOLD), out)
+    return out
+
+
 @torch.no_grad()
 def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, steps: int = 8, temperature: float = 1.0,
                    cfg_scale: float = 1.0, rng: Optional[np.random.Generator] = None, prev_open=None,
-                   before=None, after=None, hold_wait: Optional[float] = None):
+                   before=None, after=None, hold_wait: Optional[float] = None, note_gap: int = NOTE_GAP_FRAMES):
     """Reveals the ``hidden`` [K, W] frames of K rows of one window in ``steps`` rounds; returns (st, so, eo) [K, W, 4].
     The song around the window, so long notes and the 30 ms gaps glue across its edges: ``before`` / ``after``
     [K, n, 4] states of the known frames right before / after it (``after`` may hold -1 for unknown frames);
@@ -286,7 +347,9 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
     win = slice(B_, B_ + W)
     no_open = np.zeros((K, fr.NUM_LANES), dtype=bool)
     todo = hidden.sum(axis=1)
-    for t in range(max(1, steps)):
+    steps = max(1, steps)
+    rounds = steps + (EXTRA_ROUNDS if note_gap > 0 else 0)
+    for t in range(rounds):
         if not hidden.any():
             break
         out = _decode_logits(model, memory, cond, cond_null, st, so, eo, hidden, cfg_scale)
@@ -297,27 +360,41 @@ def restore_window(model: V5Net, memory, cond, cond_null, st, so, eo, hidden, st
         lp = np.where(ok, lp, -1e9)
         lp = lp - np.logaddexp.reduce(lp, axis=-1, keepdims=True)
         p = np.exp(lp)
-        # sample a state for every lane of every frame
-        u = rng.random(p.shape[:-1])[..., None]
-        samp = (p.cumsum(-1) < u).sum(-1).clip(0, fr.N_STATES - 1)                                    # [K, W, 4]
+        samp = sample_frames(p, rng) if JOINT_LANES else \
+            (p.cumsum(-1) < rng.random(p.shape[:-1])[..., None]).sum(-1).clip(0, fr.N_STATES - 1)
         conf = np.take_along_axis(lp, samp[..., None], -1)[..., 0].sum(-1)                            # [K, W]
-        conf = conf + rng.gumbel(size=conf.shape) * temperature * (1.0 - (t + 1) / steps)             # MaskGIT noise
+        conf = conf + rng.gumbel(size=conf.shape) * temperature * max(0.0, 1.0 - (t + 1) / steps)     # MaskGIT noise
         a_off = out["start"].float().argmax(-1).cpu().numpy()
         e_off = out["end"].float().argmax(-1).cpu().numpy()
-        frac = 1.0 - math.cos(math.pi / 2 * (t + 1) / steps)                                        # cumulative share
-        last = t == max(1, steps) - 1
+        frac = 1.0 - math.cos(math.pi / 2 * min(1.0, (t + 1) / steps))                              # cumulative share
+        sched_last = t >= steps - 1
+        last = t == rounds - 1
         pick = np.zeros((K, W), dtype=bool)
+        starts = ((samp == fr.TAP) | (samp == fr.HEAD)).any(-1)                                     # [K, W]
         for r in range(K):
             h = np.flatnonzero(hidden[r])
             if not h.size:
                 continue
             want = int(math.ceil(todo[r] * frac)) - int(todo[r] - h.size)
-            n = h.size if last else max(1, min(h.size, want))
-            pick[r, h[np.argsort(-conf[r, h])[:n]]] = True
+            n = h.size if sched_last else max(1, min(h.size, want))
+            chosen = h[np.argsort(-conf[r, h])[:n]]
+            if sched_last and not last and note_gap > 0:
+                # the rest of the notes: not all at once (each would be placed without seeing its neighbours: random
+                # lanes, jacks, notes off the sound) - in a round only notes at least note_gap frames apart, the most
+                # confident first; the others wait and are decided with these in view
+                kept, taken = [], []
+                for f in chosen:                                   # by confidence
+                    if starts[r, f]:
+                        if any(abs(f - g) < note_gap for g in taken):
+                            continue
+                        taken.append(f)
+                    kept.append(f)
+                chosen = np.asarray(kept, dtype=np.int64)
+            pick[r, chosen] = True
         pad = lambda a, v: np.concatenate([np.full((K, B_) + a.shape[2:], v, a.dtype), a,
                                            np.full((K, A_) + a.shape[2:], v, a.dtype)], axis=1)
         done = _commit_in_order(st_x, hid_x, pad(lp, -1e9), pad(samp, fr.EMPTY), pad(pick, False), no_open, rng,
-                                last, hold_wait)[:, win]
+                                last or (sched_last and note_gap <= 0), hold_wait)[:, win]
         st[:] = st_x[:, win]
         hidden &= ~done
         so = np.where(done[..., None], np.where((st == fr.TAP) | (st == fr.HEAD), a_off, -1), so).astype(so.dtype)
@@ -384,7 +461,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
                     temperature: float = 1.0, cfg_scale: float = 1.0, candidates: int = 1,
                     score_fn: Optional[Callable[[List[Note], List[Note], int, int], float]] = None,
                     refine_passes: int = 1, refine_frac: float = 0.1, fixed: Optional[Sequence[Note]] = None,
-                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = True,
+                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = False,
                     hold_wait: Optional[float] = None,
                     device: Optional[torch.device] = None, log: Optional[Callable[[str], None]] = None,
                     stats: Optional[dict] = None) -> List[Note]:
@@ -523,4 +600,6 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
             log(f"  self-correction pass {p + 1}: {changed} frames changed")
         if not changed:
             break
-    return canvas.notes()
+    # a long note shorter than 40 ms (a contradiction the rules could not avoid) is a tap: in the game it is a head
+    # without a body
+    return sorted(Note(n.start, n.col, n.start, False) if n.ln and n.end - n.start < 40 else n for n in canvas.notes())

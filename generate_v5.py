@@ -117,10 +117,16 @@ def main(argv=None) -> None:
     ap.add_argument("--refine", type=int, default=1,
                     help="canvas networks: self-correction passes (the error head marks frames, they are restored again; "
                          "a change is kept only if the error head then finds fewer errors)")
+    ap.add_argument("--note_scale", type=float, default=None,
+                    help="canvas networks: correction of the note weight of the training loss (1 = exact, 0 = none; "
+                         "default: calibrated in the checkpoint, else 1). Lower = more notes")
     ap.add_argument("--hold_wait", type=float, default=None,
                     help="canvas networks: a lane at least this likely to hold waits for the frame before it, so long "
                          "notes are not cut before their head is revealed (default: the value calibrate_v5.py stored "
                          "in the checkpoint; none stored = off; 0 = off)")
+    ap.add_argument("--overlap", action="store_true",
+                    help="canvas networks: let the next window propose its own version of the end of the previous one, "
+                         "decided by the seam head (off by default: as in v4, each window continues what is placed)")
     ap.add_argument("--no_overlap", action="store_true",
                     help="canvas networks: do not let the next window propose its own version of the end of the previous "
                          "one (by default differing stretches of the overlaps are decided by the error head)")
@@ -137,7 +143,8 @@ def main(argv=None) -> None:
     ap.add_argument("--search", type=int, default=1, help="continuations sampled per phrase; the best is kept")
     ap.add_argument("--critic_weight", type=float, default=1.0)
     ap.add_argument("--reward_weight", type=float, default=0.5)
-    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--temperature", type=float, default=0.9,
+                    help="sampling temperature (canvas networks: default the one calibrate_v5.py stored, else 1.0)")
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--cfg", type=float, default=1.0, help="classifier-free guidance on the star rating / style")
     ap.add_argument("--output", "-o", default="output_beatmaps/v5_map.osz")
@@ -156,7 +163,9 @@ def main(argv=None) -> None:
                     help="without --style ln_ratio, do not estimate the LN share from the music (the network decides)")
     ap.add_argument("--style_from", default=None, help="take the style of an existing map (.osz/.osu): LN share, chords...")
     ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from")
-    ap.add_argument("--meta", default=None, help="meta model of bursts (train_meta.py; default: meta.pt next to the checkpoint)")
+    ap.add_argument("--meta", nargs="?", const="auto", default=None,
+                    help="optional: check bursts with the meta model (train_meta.py; '--meta' = meta.pt next to the "
+                         "checkpoint). Off by default: the network maps on its own")
     ap.add_argument("--no_meta", action="store_true", help="keep every burst the network makes")
     ap.add_argument("--meta_threshold", type=float, default=None)
     ap.add_argument("--no_kiai", action="store_true",
@@ -170,13 +179,18 @@ def main(argv=None) -> None:
     cfg = V5Config.from_dict(ck["config"])
     model = V5Net(cfg)
     model.load_state_dict(ck.get("ema") or ck["model"])
+    # notes weighed in the training loss: generation divides those odds back (calibrate_v5.py scales it)
+    model.event_weight = float((ck.get("args") or {}).get("event_weight", 4.0))
+    model.note_shift_scale = float(args.note_scale if args.note_scale is not None else ck.get("note_shift_scale", 1.0))
     hold_table = ck.get("hold_wait_by_ln") if args.hold_wait is None else None
 
     def hold_wait_for(ln_ratio):
         """The calibrated value for the share of long notes asked for (None = unknown share: the general value)."""
-        if hold_table and ln_ratio is not None:
+        if hold_table:
             import bisect
-            v = hold_table["values"][bisect.bisect_right(hold_table["edges"], float(ln_ratio))]
+            # share unknown (no --style ln_ratio, LN model not used): the dataset average share (~18 %)
+            share = float(ln_ratio) if ln_ratio is not None else 0.175
+            v = hold_table["values"][bisect.bisect_right(hold_table["edges"], share)]
         else:
             v = args.hold_wait if args.hold_wait is not None else ck.get("hold_wait")
         return v if v else None
@@ -212,8 +226,9 @@ def main(argv=None) -> None:
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, features in {time.time() - t0:.1f}s")
 
         meta_filter = None
-        mpath = Path(args.meta) if args.meta else Path(args.checkpoint).with_name("meta.pt")
-        if not args.no_meta and mpath.exists():
+        # the network maps on its own: the burst meta model only on request (--meta [path])
+        mpath = Path(args.meta) if args.meta and args.meta != "auto" else Path(args.checkpoint).with_name("meta.pt")
+        if args.meta and not args.no_meta and mpath.exists():
             from osu_mapper.v5.meta import MetaFilter
             mck = torch.load(mpath, map_location="cpu", weights_only=False)
             meta_filter = MetaFilter.load(mpath, dev, args.meta_threshold if args.meta_threshold is not None else mck.get("threshold", 0.35))
@@ -286,12 +301,12 @@ def main(argv=None) -> None:
             is_canvas = getattr(cfg, "decoder", "ar") == "canvas"
             notes = generate_map(model, feats_all, beat_all, timing, target, passes=args.passes, style=st_t,
                                  style_mask=sm_t, candidates=args.search, score_fn=score_fn,
-                                 temperature=args.temperature if not is_canvas or args.temperature != 0.9 else 1.0,
+                                 temperature=args.temperature if not is_canvas or args.temperature != 0.9 else float(ck.get("temperature") or 1.0),
                                  top_p=args.top_p, cfg_scale=args.cfg, seed=args.seed, device=dev,
                                  log=print if (args.passes > 1 or is_canvas) else None,
                                  keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
                                  steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen,
-                                 overlap=not args.no_overlap, hold_wait=hold_wait)
+                                 overlap=args.overlap and not args.no_overlap, hold_wait=hold_wait)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

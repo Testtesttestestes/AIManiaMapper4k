@@ -7,9 +7,12 @@ long note has not started yet could be committed empty early - and then the long
 nor start before it: long notes get cut and mostly vanish (validation showed 2-3 % long notes against 21 % in the
 human maps). With ``hold_wait`` such a lane waits for the frame before it. How likely is "may be held" depends on the
 network, so this script tries several values on the validation songs, prints long-note share, F1 and expressiveness
-for each, and stores the best (F1@16 + 0.3 x expressiveness, as the training picks checkpoints) in the checkpoint -
+for each, and stores the best (F1@16 + 0.3 x expressiveness, plus how right the long notes are: F1 of note starts
+alone does not see a long note turned into a tap) in the checkpoint -
 separately for maps with few, some and many long notes (one value for all helped long-note maps and cost rice maps):
-generate_v5.py picks it by the share of long notes it is asked for (--hold_wait overrides).
+generate_v5.py picks it by the share of long notes it is asked for (--hold_wait overrides). Before that it picks how
+strongly the note weight of the training loss is divided back (it doubled the notes: 1* asked gave 3.2*) and the
+temperature of revealing, stored too.
 
     python calibrate_v5.py --data dataset_hybrid --checkpoint checkpoints/v5/v5_best.pt
     python calibrate_v5.py ... --values 0,0.5,0.3,0.2,0.1 --val_maps 16 --val_max_sec 60 --no_write
@@ -40,6 +43,13 @@ def main() -> None:
     ap.add_argument("--checkpoint", default="checkpoints/v5/v5_best.pt")
     ap.add_argument("--values", default="0,0.5,0.35,0.25,0.15,0.1", help="hold_wait values to try (0 = off)")
     ap.add_argument("--val_maps", type=int, default=40)
+    ap.add_argument("--note_scales", default="0,0.5,0.75,1",
+                    help="corrections of the note weight of the training loss to try first (1 = exact, 0 = none)")
+    ap.add_argument("--temperatures", default="1.0",
+                    help="temperatures of revealing to try with them (e.g. 1.0,0.85)")
+    ap.add_argument("--ln_weight", type=float, default=0.5,
+                    help="choosing hold_wait: score + ln_weight x (LN F1 - |LN share - human LN share|); F1 of note "
+                         "starts alone does not see a long note turned into a tap")
     ap.add_argument("--groups", default="0.1,0.3", help="edges of the groups by the human share of long notes")
     ap.add_argument("--min_maps", type=int, default=4, help="fewer maps in a group: no choice there (off)")
     ap.add_argument("--val_max_sec", type=float, default=60.0)
@@ -59,6 +69,7 @@ def main() -> None:
     model = V5Net(cfg)
     model.load_state_dict(ck.get("ema") or ck["model"])
     model.to(dev).eval()
+    model.event_weight = float((ck.get("args") or {}).get("event_weight", 4.0))
     index = HybridIndex(args.data)
     _, val_idx = index.split(args.val_fraction, args.seed)
     val_idx = [i for i in val_idx if not index.maps[i].get("derived") and not index.maps[i].get("self")]
@@ -80,6 +91,45 @@ def main() -> None:
         + [f">= {100 * edges[-1]:.0f}%"]
     print(f"[calibrate] {len(val)} validation maps, first {args.val_max_sec:.0f} s each, device {dev}; groups by the human "
           "share of long notes: " + ", ".join(f"{n_}: {len(g)}" for n_, g in zip(names, groups)))
+    def run(maps, T, hw):
+        t0 = time.time()
+        with torch.no_grad():
+            s = val_maps(model, index, cache, maps, dev, T, 1.0, args.val_max_sec, "ln", 1, args.steps, args.refine,
+                         hold_wait=hw if hw and hw > 0 else None)
+        s["_sec"] = time.time() - t0
+        return s
+
+    def base_score(s):
+        return s.get("event_f1@16", 0.0) + 0.3 * s.get("expressive", 0.0)
+
+    def ln_score(s):
+        """+ long notes: placed where the human placed them (LN F1) and as many of them (share)."""
+        return base_score(s) + args.ln_weight * (s.get("ln_f1", 0.0)
+                                                 - abs(s.get("ln_share_pred", 0.0) - s.get("ln_share_ref", 0.0)))
+
+    def line(head, s, score):
+        return (f"  {head}: long notes {100 * s.get('ln_share_pred', 0):.0f}% vs {100 * s.get('ln_share_ref', 0):.0f}% | "
+                f"LN F1 {s.get('ln_f1', 0):.3f} | F1@16 {s.get('event_f1@16', 0):.3f} | density "
+                f"x{s.get('density_ratio', float('nan')):.2f} | expressiveness {s.get('expressive', 0):.3f} | score "
+                f"{score:.4f} ({s['_sec']:.0f}s)")
+
+    # 1. how many notes: the training loss weighs note frames event_weight x, generation divides those odds back
+    #    (scale 1 = exact); then the temperature of revealing
+    T_best, sc_best, best = 1.0, 1.0, -1e9
+    scales = [float(x) for x in args.note_scales.split(",")]
+    temps = [float(x) for x in args.temperatures.split(",")]
+    if len(scales) > 1 or len(temps) > 1:
+        print(f"[calibrate] number of notes, all {len(val)} maps, long-note wait off (event weight of the training "
+              f"{model.event_weight:g}):")
+        for sc in scales:
+            for T in temps:
+                model.note_shift_scale = sc
+                s = run(val, T, None)
+                print(line(f"note correction {sc:.2f}, temperature {T:.2f}", s, base_score(s)), flush=True)
+                if base_score(s) > best:
+                    best, T_best, sc_best = base_score(s), T, sc
+        print(f"  -> note correction {sc_best:.2f}, temperature {T_best:.2f}")
+    model.note_shift_scale = sc_best
     values = [float(x) for x in args.values.split(",")]
     by_group = []
     for name, g in zip(names, groups):
@@ -87,18 +137,12 @@ def main() -> None:
             print(f"[calibrate] {name}: {len(g)} maps, too few to choose (--min_maps {args.min_maps}): off")
             by_group.append(0.0)
             continue
-        print(f"[calibrate] {name} ({len(g)} maps):")
+        print(f"[calibrate] {name} ({len(g)} maps, temperature {T_best:.2f}):")
         best, best_v = -1e9, 0.0
         for v in values:
-            t0 = time.time()
-            with torch.no_grad():
-                s = val_maps(model, index, cache, g, dev, 1.0, 1.0, args.val_max_sec, "ln", 1, args.steps, args.refine,
-                             hold_wait=v if v > 0 else None)
-            score = s.get("event_f1@16", 0.0) + 0.3 * s.get("expressive", 0.0)
-            print(f"  hold_wait {('off' if v <= 0 else f'{v:.2f}'):>5}: long notes {100 * s.get('ln_share_pred', 0):.0f}% vs "
-                  f"{100 * s.get('ln_share_ref', 0):.0f}% | LN F1 {s.get('ln_f1', 0):.3f} | F1@16 {s.get('event_f1@16', 0):.3f} "
-                  f"| density x{s.get('density_ratio', float('nan')):.2f} | expressiveness {s.get('expressive', 0):.3f} "
-                  f"| score {score:.4f} ({time.time() - t0:.0f}s)", flush=True)
+            s = run(g, T_best, v)
+            score = ln_score(s)
+            print(line(f"hold_wait {('off' if v <= 0 else f'{v:.2f}'):>5}", s, score), flush=True)
             if score > best:
                 best, best_v = score, v
         print(f"  -> {'off' if best_v <= 0 else f'{best_v:.2f}'}")
@@ -108,11 +152,13 @@ def main() -> None:
     if not args.no_write:
         ck["hold_wait"] = None
         ck["hold_wait_by_ln"] = table
+        ck["temperature"] = T_best
+        ck["note_shift_scale"] = sc_best
         path = Path(args.checkpoint)
         tmp = path.with_name(path.name + ".tmp")
         torch.save(ck, tmp)
         os.replace(tmp, path)
-        print(f"[calibrate] stored in {path}: generate_v5.py picks the value by the share of long notes it is asked for "
+        print(f"[calibrate] stored in {path} (temperature {T_best:.2f}): generate_v5.py picks the value by the share of long notes it is asked for "
               "(--style ln_ratio=..., or the one the LN model guesses from the music); --hold_wait overrides")
 
 
