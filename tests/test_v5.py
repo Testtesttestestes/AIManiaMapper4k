@@ -532,7 +532,7 @@ class TestCanvas(unittest.TestCase):
         hidden = np.ones((1, 6), bool)
         hidden[0, 0] = False
         ok = allowed_states(st, hidden)
-        self.assertTrue(ok[0, 1, 0, fr.HOLD] and ok[0, 1, 0, fr.TAIL])          # after a head: hold or tail
+        self.assertTrue(ok[0, 1, 0, fr.HOLD] and not ok[0, 1, 0, fr.TAIL])      # after a head: held (no 10 ms LN)
         self.assertFalse(ok[0, 1, 0, fr.TAP] or ok[0, 1, 0, fr.EMPTY])
         self.assertFalse(ok[0, 1, 1, fr.HOLD])                                   # known empty frame before: no hold
         st[0, 0, 1] = fr.TAP

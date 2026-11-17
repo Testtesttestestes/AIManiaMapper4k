@@ -177,11 +177,21 @@ def allowed_states(st: np.ndarray, hidden: np.ndarray) -> np.ndarray:
         nxt_note = nk & ((n_ == fr.TAP) | (n_ == fr.HEAD))
         for s_ in states:
             ok[..., s_] &= ~nxt_note
+    # a long note lasts at least MIN_LN_FRAMES: no tail right after a known head, no head without room before a note
+    for d in range(1, min(MIN_LN_FRAMES, W)):
+        p_ = np.concatenate([np.full((K, d, L), -1, st.dtype), st[:, :-d]], axis=1)
+        pk = np.concatenate([np.zeros((K, d, 1), bool), known[:, :-d]], axis=1)
+        ok[..., fr.TAIL] &= ~(pk & (p_ == fr.HEAD))
+    for d in range(4, min(MIN_LN_FRAMES + 3, W)):
+        n_ = np.concatenate([st[:, d:], np.full((K, d, L), -1, st.dtype)], axis=1)
+        nk = np.concatenate([known[:, d:], np.zeros((K, d, 1), bool)], axis=1)
+        ok[..., fr.HEAD] &= ~(nk & ((n_ == fr.TAP) | (n_ == fr.HEAD)))
     none = ~ok.any(-1)
     ok[none] = True
     return ok
 
 
+MIN_LN_FRAMES = 5        # shortest long note revealed: head + 4 frames (~40-50 ms)
 _OPEN = (fr.HEAD, fr.HOLD)
 _CONT = (fr.HOLD, fr.TAIL)
 
@@ -252,7 +262,12 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
                 a1, a2, a3 = state(f + 1, c), state(f + 2, c), state(f + 3, c)
                 na1, na2, na3 = a1 in (TP, HD), a2 in (TP, HD), a3 in (TP, HD)
                 if open_before[c]:                      # the long note goes on: hold or end
-                    if held[f][c]:
+                    # how long it has been held: no tail before MIN_LN_FRAMES (a 10-20 ms long note looks like a
+                    # head without a body in the game; < 1 % of human long notes are under 40 ms)
+                    young = any(state(f - d, c) == HD for d in range(1, MIN_LN_FRAMES))
+                    if a1 in (E, TP, HD):
+                        allowed = (TL,)                 # the next frame is known free: it ends here
+                    elif held[f][c] or (young and not (na1 or na2 or na3)):
                         allowed = (HL,)
                     else:
                         allowed = ((HL,) if not (na1 or na2 or na3) else ()) + ((TL,) if not (na1 or na2) else ())
@@ -263,7 +278,8 @@ def _commit_in_order(st: np.ndarray, hidden: np.ndarray, lp: np.ndarray, samp: n
                     b1, b2, b3 = state(f - 1, c), state(f - 2, c), state(f - 3, c)
                     start_ok = (b1 not in (TP, TL) and b2 not in (TP, HD, HL, TL) and b3 not in (HD, HL)
                                 and not (na1 or na2))
-                    allowed = (E,) + ((TP,) if start_ok and not held[f][c] else ()) + ((HD,) if start_ok and not na3 else ())
+                    room = not any(state(f + d, c) in (TP, HD) for d in range(1, MIN_LN_FRAMES + 3))
+                    allowed = (E,) + ((TP,) if start_ok and not held[f][c] else ()) + ((HD,) if start_ok and room else ())
                 if s_ not in allowed:
                     if gum is None:
                         gum = rng.gumbel(size=(W, L, fr.N_STATES))
@@ -538,4 +554,6 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
             log(f"  self-correction pass {p + 1}: {changed} frames changed")
         if not changed:
             break
-    return canvas.notes()
+    # a long note shorter than 40 ms (a contradiction the rules could not avoid) is a tap: in the game it is a head
+    # without a body
+    return sorted(Note(n.start, n.col, n.start, False) if n.ln and n.end - n.start < 40 else n for n in canvas.notes())
