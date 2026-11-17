@@ -461,7 +461,7 @@ def generate_canvas(model: V5Net, feats_all: np.ndarray, beat_all: np.ndarray, t
                     temperature: float = 1.0, cfg_scale: float = 1.0, candidates: int = 1,
                     score_fn: Optional[Callable[[List[Note], List[Note], int, int], float]] = None,
                     refine_passes: int = 1, refine_frac: float = 0.1, fixed: Optional[Sequence[Note]] = None,
-                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = True,
+                    regen: Optional[Sequence[Tuple[float, float]]] = None, seed: int = 0, overlap: bool = False,
                     hold_wait: Optional[float] = None,
                     device: Optional[torch.device] = None, log: Optional[Callable[[str], None]] = None,
                     stats: Optional[dict] = None) -> List[Note]:

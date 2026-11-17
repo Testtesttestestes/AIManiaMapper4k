@@ -413,10 +413,11 @@ def main() -> None:
     ap.add_argument("--self_correct", type=float, default=0.25,
                     help="canvas: share of steps that learn from the network's own errors: it restores the hidden frames "
                          "itself first, then fixes its own version (the error head gets the real errors)")
-    ap.add_argument("--seam", type=float, default=0.1,
+    ap.add_argument("--seam", type=float, default=0.0,
                     help="canvas: share of steps that learn the overlap zones of generation windows: the network maps a "
                          "window's end without seeing what follows and again with it in view; the seam head learns which "
-                         "version is wrong where (generation: it decides differing overlaps). Slower steps; 0 = off")
+                         "version is wrong where (generation with --overlap). Off by default: generation continues windows as v4 "
+                         "did; slower steps")
     ap.add_argument("--seam_steps", type=int, default=4, help="canvas: rounds of revealing in the seam steps")
     ap.add_argument("--seam_weight", type=float, default=0.3, help="canvas: loss of the seam head")
     ap.add_argument("--event_weight", type=float, default=4.0, help="canvas: weight of frames with a note in the loss")

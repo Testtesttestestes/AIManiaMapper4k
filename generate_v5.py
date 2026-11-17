@@ -124,6 +124,9 @@ def main(argv=None) -> None:
                     help="canvas networks: a lane at least this likely to hold waits for the frame before it, so long "
                          "notes are not cut before their head is revealed (default: the value calibrate_v5.py stored "
                          "in the checkpoint; none stored = off; 0 = off)")
+    ap.add_argument("--overlap", action="store_true",
+                    help="canvas networks: let the next window propose its own version of the end of the previous one, "
+                         "decided by the seam head (off by default: as in v4, each window continues what is placed)")
     ap.add_argument("--no_overlap", action="store_true",
                     help="canvas networks: do not let the next window propose its own version of the end of the previous "
                          "one (by default differing stretches of the overlaps are decided by the error head)")
@@ -160,7 +163,9 @@ def main(argv=None) -> None:
                     help="without --style ln_ratio, do not estimate the LN share from the music (the network decides)")
     ap.add_argument("--style_from", default=None, help="take the style of an existing map (.osz/.osu): LN share, chords...")
     ap.add_argument("--style_diff", default="", help="difficulty name (substring) inside --style_from")
-    ap.add_argument("--meta", default=None, help="meta model of bursts (train_meta.py; default: meta.pt next to the checkpoint)")
+    ap.add_argument("--meta", nargs="?", const="auto", default=None,
+                    help="optional: check bursts with the meta model (train_meta.py; '--meta' = meta.pt next to the "
+                         "checkpoint). Off by default: the network maps on its own")
     ap.add_argument("--no_meta", action="store_true", help="keep every burst the network makes")
     ap.add_argument("--meta_threshold", type=float, default=None)
     ap.add_argument("--no_kiai", action="store_true",
@@ -221,8 +226,9 @@ def main(argv=None) -> None:
         print(f"[audio] {audio_path.name}: {inputs.duration_ms / 1000:.1f}s, features in {time.time() - t0:.1f}s")
 
         meta_filter = None
-        mpath = Path(args.meta) if args.meta else Path(args.checkpoint).with_name("meta.pt")
-        if not args.no_meta and mpath.exists():
+        # the network maps on its own: the burst meta model only on request (--meta [path])
+        mpath = Path(args.meta) if args.meta and args.meta != "auto" else Path(args.checkpoint).with_name("meta.pt")
+        if args.meta and not args.no_meta and mpath.exists():
             from osu_mapper.v5.meta import MetaFilter
             mck = torch.load(mpath, map_location="cpu", weights_only=False)
             meta_filter = MetaFilter.load(mpath, dev, args.meta_threshold if args.meta_threshold is not None else mck.get("threshold", 0.35))
@@ -300,7 +306,7 @@ def main(argv=None) -> None:
                                  log=print if (args.passes > 1 or is_canvas) else None,
                                  keep_better=not args.no_keep_better, lane_predictor=lp_pass, power=power,
                                  steps=args.steps, refine_passes=args.refine, fixed=fixed_notes, regen=regen,
-                                 overlap=not args.no_overlap, hold_wait=hold_wait)
+                                 overlap=args.overlap and not args.no_overlap, hold_wait=hold_wait)
             meta_info = ""
             if meta_filter is not None:
                 notes, rep = meta_filter.apply(feats_all, beat_all, notes, timing, target)

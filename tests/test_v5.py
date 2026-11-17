@@ -795,7 +795,7 @@ class TestCanvas(unittest.TestCase):
         ba = np.zeros((F, 13), np.float32)
         logs, stats = [], {}
         out = generate_canvas(m, fa, ba, tps, 4.0, steps=3, candidates=2, score_fn=lambda c, a, s, e: -len(c),
-                              log=logs.append, stats=stats)
+                              log=logs.append, stats=stats, overlap=True)
         self.assertGreater(stats["windows"], 0)
         self.assertEqual(stats["kept_earlier"] + stats["took_later"] >= stats["differed"], True)
         if stats["differed"]:
