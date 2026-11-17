@@ -652,6 +652,7 @@ class TestCanvas(unittest.TestCase):
         m = V5Net(cfg).eval()
         with torch.no_grad():
             m.state_head.bias.view(4, 5)[:] = torch.tensor([1.5, -2.5, -0.5, 1.8, -1.2])     # long notes everywhere
+        m.note_shift_scale = 0.0                       # gluing is tested here, not how many notes
         F = 700
         fa = np.random.default_rng(1).normal(0, 1, (F, 6)).astype(np.float32)
         ba = np.zeros((F, 13), np.float32)
